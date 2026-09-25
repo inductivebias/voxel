@@ -1,12 +1,14 @@
 <script lang="ts">
   import { watch } from 'runed';
   import { onMount } from 'svelte';
+  import { SvelteMap } from 'svelte/reactivity';
 
-  import { clampTopLeft } from '$lib/core/utils';
+  import { clampTopLeft, displayName, pref } from '$lib/core/utils';
+  import { RadioBar } from '$lib/kit';
 
   import PreviewChannels from './PreviewChannels.svelte';
   import PreviewNavigationControls from './PreviewNavigationControls.svelte';
-  import { type PreviewSession, wheelZoomFactor } from './session.svelte';
+  import { type PreviewChannel, type PreviewSession, wheelZoomFactor } from './session.svelte';
 
   interface Props {
     previewer: PreviewSession;
@@ -16,14 +18,22 @@
 
   let { previewer, fov }: Props = $props();
 
-  let canvasEl: HTMLCanvasElement;
-  let canvasContainerEl: HTMLDivElement;
+  const cameraLayout = pref<'separate' | 'overlay'>('preview:camera-layout', 'separate');
+  const visibleChannels = $derived(previewer.channels.filter((channel) => channel.name && channel.visible));
+  // Channels sharing one sensor remain composited; independent cameras get individual canvases.
+  const hasMultipleCameras = $derived(
+    new Set(visibleChannels.map((channel) => channel.config?.detection).filter(Boolean)).size > 1
+  );
+  const showSeparate = $derived(hasMultipleCameras && cameraLayout.get() === 'separate');
+
+  let canvasEl = $state<HTMLCanvasElement | null>(null);
+  const separateCanvases = new SvelteMap<number, HTMLCanvasElement>();
   let isRendering = false;
   let needsRedraw = false;
   let drawPending = false;
   let animFrameId: number | null = null;
 
-  // Live container size, measured from the DOM each frame (see syncSize).
+  // Live image size, measured from the active canvas each frame (see syncSize).
   let viewW = $state(0);
   let viewH = $state(0);
 
@@ -37,18 +47,28 @@
   // Measure the container from the DOM and keep the backing store + model aspect in sync. A ResizeObserver
   // can latch a 0 size when this canvas remounts inside the mode-switch fade; clientWidth never does.
   function syncSize() {
-    if (!canvasContainerEl || !canvasEl) return;
-    const w = canvasContainerEl.clientWidth;
-    const h = canvasContainerEl.clientHeight;
-    if (w === viewW && h === viewH) return;
-    viewW = w;
-    viewH = h;
-    if (w <= 0 || h <= 0) return;
-    previewer.setDisplayAspect(w / h);
+    const canvases = showSeparate ? [...separateCanvases.values()] : canvasEl ? [canvasEl] : [];
+    if (!canvases.length) return;
     const dpr = devicePixelRatio;
-    canvasEl.width = Math.round(w * dpr);
-    canvasEl.height = Math.round(h * dpr);
-    needsRedraw = true;
+    for (const canvas of canvases) {
+      const w = canvas.clientWidth;
+      const h = canvas.clientHeight;
+      if (w <= 0 || h <= 0) continue;
+      const width = Math.round(w * dpr);
+      const height = Math.round(h * dpr);
+      if (canvas.width !== width || canvas.height !== height) {
+        canvas.width = width;
+        canvas.height = height;
+        needsRedraw = true;
+      }
+    }
+    const w = canvases[0].clientWidth;
+    const h = canvases[0].clientHeight;
+    if (w !== viewW || h !== viewH) {
+      viewW = w;
+      viewH = h;
+      if (w > 0 && h > 0) previewer.setDisplayAspect(w / h);
+    }
   }
 
   // Pan/zoom on the canvas element itself, so overlay siblings (controls, navigator) never trip it.
@@ -106,6 +126,23 @@
     };
   }
 
+  function panZoomAction(el: HTMLCanvasElement) {
+    const teardown = setupPanZoom(el);
+    return { destroy: teardown };
+  }
+
+  function registerChannelCanvas(el: HTMLCanvasElement, channel: PreviewChannel) {
+    separateCanvases.set(channel.idx, el);
+    needsRedraw = true;
+    const teardown = setupPanZoom(el);
+    return {
+      destroy() {
+        separateCanvases.delete(channel.idx);
+        teardown();
+      }
+    };
+  }
+
   function frameLoop() {
     if (!isRendering) return;
     syncSize();
@@ -118,7 +155,14 @@
     try {
       do {
         needsRedraw = false;
-        await previewer.render(canvasEl);
+        if (showSeparate) {
+          for (const channel of visibleChannels) {
+            const canvas = separateCanvases.get(channel.idx);
+            if (canvas && channel.name) await previewer.renderChannel(canvas, channel.name);
+          }
+        } else if (canvasEl) {
+          await previewer.render(canvasEl);
+        }
       } while (needsRedraw && isRendering);
     } catch (error) {
       console.error('[preview] WebGPU render failed:', error);
@@ -132,11 +176,9 @@
     isRendering = true;
     frameLoop();
 
-    const teardown = setupPanZoom(canvasEl);
     return () => {
       isRendering = false;
       if (animFrameId !== null) cancelAnimationFrame(animFrameId);
-      teardown();
     };
   });
 
@@ -175,8 +217,34 @@
   <div class="h-2 rounded-full bg-fg" style:width="{bar?.barPx ?? 0}px"></div>
 {/snippet}
 
-<div class="relative size-full" bind:this={canvasContainerEl}>
-  <canvas bind:this={canvasEl} class="size-full"></canvas>
+<div class="relative size-full">
+  {#if showSeparate}
+    <div class="grid size-full grid-cols-2 gap-2 p-2">
+      {#each visibleChannels as channel (channel.idx)}
+        <div class="relative min-h-0 min-w-0 overflow-hidden rounded-md bg-black">
+          <canvas use:registerChannelCanvas={channel} class="size-full"></canvas>
+          <div class="pointer-events-none absolute top-2 left-2 rounded bg-canvas/80 px-2 py-1 text-sm text-fg">
+            {displayName(channel.config?.detection ?? channel.name ?? '')} · {channel.label}
+          </div>
+        </div>
+      {/each}
+    </div>
+  {:else}
+    <canvas bind:this={canvasEl} use:panZoomAction class="size-full"></canvas>
+  {/if}
+
+  {#if hasMultipleCameras}
+    <div class="pointer-events-auto absolute top-3 left-1/2 z-20 -translate-x-1/2 frame-floating">
+      <RadioBar
+        value={showSeparate ? 'separate' : 'overlay'}
+        options={['separate', 'overlay'] as const}
+        formatLabel={(layout) => (layout === 'separate' ? 'Side by side' : 'Overlay')}
+        onChange={(layout) => cameraLayout.set(layout)}
+        size="sm"
+        aria-label="Camera layout"
+      />
+    </div>
+  {/if}
 
   {#if previewer.error}
     <div

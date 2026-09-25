@@ -280,6 +280,10 @@ export class PreviewSession {
     return this.#renderer.render(canvas, this.channels, viewport, this.catalog);
   }
 
+  renderChannel(canvas: HTMLCanvasElement, channelName: string, viewport = this.viewport): Promise<void> {
+    return this.#renderer.renderChannel(canvas, this.channels, viewport, this.catalog, channelName);
+  }
+
   renderFull(canvas: HTMLCanvasElement, channel?: PreviewChannel): Promise<void> {
     return this.#renderer.renderFull(canvas, this.channels, this.catalog, channel?.name);
   }

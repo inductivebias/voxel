@@ -242,6 +242,16 @@ export class PreviewGpuRenderer {
     await this.#render(canvas, channels, viewport, catalog);
   }
 
+  async renderChannel(
+    canvas: HTMLCanvasElement,
+    channels: readonly PreviewRenderChannel[],
+    viewport: PreviewViewport,
+    catalog: ColormapCatalog,
+    channelName: string
+  ): Promise<void> {
+    await this.#render(canvas, channels, viewport, catalog, channelName);
+  }
+
   async renderFull(
     canvas: HTMLCanvasElement,
     channels: readonly PreviewRenderChannel[],
