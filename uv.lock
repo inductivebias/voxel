@@ -2377,6 +2377,18 @@ wheels = [
 ]
 
 [[package]]
+name = "reactivex"
+version = "4.1.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b6/af/38a4b62468e4c5bd50acf511d86fe62e65a466aa6abb55b1d59a4a9e57f3/reactivex-4.1.0.tar.gz", hash = "sha256:c7499e3c802bccaa20839b3e17355a7d939573fded3f38ba3d4796278a169a3d", size = 113482, upload-time = "2025-11-05T21:44:24.557Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ba/9e/3c2f5d3abb6c5d82f7696e1e3c69b7279049e928596ce82ed25ca97a08f3/reactivex-4.1.0-py3-none-any.whl", hash = "sha256:485750ec8d9b34bcc8ff4318971d234dc4f595058a1b4435a74aefef4b2bc9bd", size = 218588, upload-time = "2025-11-05T21:44:23.015Z" },
+]
+
+[[package]]
 name = "referencing"
 version = "0.37.0"
 source = { registry = "https://pypi.org/simple" }
@@ -3009,6 +3021,9 @@ vortran-laser = [
 ximea-camera = [
     { name = "ximea-python" },
 ]
+zaber = [
+    { name = "zaber-motion" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -3031,8 +3046,9 @@ requires-dist = [
     { name = "vxl", editable = "." },
     { name = "vxlib", editable = "vxlib" },
     { name = "ximea-python", marker = "extra == 'ximea-camera'", url = "https://github.com/adamkglaser/ximea-python/releases/download/v4.29.10/ximea_python-4.29.10-py3-none-any.whl" },
+    { name = "zaber-motion", marker = "extra == 'zaber'", specifier = ">=10.1.0" },
 ]
-provides-extras = ["thorlabs", "opto-icc", "opto-kummenberg", "thorlabs-power-meter", "mpds-calibration", "coherent-laser", "obis-laser", "vortran-laser", "pycobolt-laser", "egrabber-camera", "ximea-camera"]
+provides-extras = ["thorlabs", "opto-icc", "opto-kummenberg", "zaber", "thorlabs-power-meter", "mpds-calibration", "coherent-laser", "obis-laser", "vortran-laser", "pycobolt-laser", "egrabber-camera", "ximea-camera"]
 
 [[package]]
 name = "vxl-records"
@@ -3139,6 +3155,23 @@ version = "4.29.10"
 source = { url = "https://github.com/adamkglaser/ximea-python/releases/download/v4.29.10/ximea_python-4.29.10-py3-none-any.whl" }
 wheels = [
     { url = "https://github.com/adamkglaser/ximea-python/releases/download/v4.29.10/ximea_python-4.29.10-py3-none-any.whl", hash = "sha256:90433e1d60a289203bd4721f1433ec09beb7ccca317a7a75a5a3a0c4263911b4" },
+]
+
+[[package]]
+name = "zaber-motion"
+version = "10.2.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "reactivex" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/61/be/ad301d430bae3c513481d088880bd89daf9d5aea8f05fee4f17bf1827309/zaber_motion-10.2.0.tar.gz", hash = "sha256:51f77bf35cc2be22549cd830fc6a9115f876a5a85f5c6b2837b6537796d87757", size = 324851, upload-time = "2026-10-09T22:42:28.161Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/64/1b/4f3af47080def132351f7c3820bf124e3fc53bc5b6a47af598163d6e114a/zaber_motion-10.2.0-py3-none-macosx_10_4_universal2.whl", hash = "sha256:cab222df5603f44de86eca06e66680891035d77aa789fed7cff4e6059f481258", size = 14525205, upload-time = "2026-10-09T22:42:12.868Z" },
+    { url = "https://files.pythonhosted.org/packages/26/a1/aa16ea3c623f855ae67616b88cd1840f54fefa54aeb11febb70dfb9ea60d/zaber_motion-10.2.0-py3-none-manylinux_2_35_aarch64.whl", hash = "sha256:a102826bd85a9708267d785ff6dd5c5e5341dbd51a3a0f27b2b6d718ca1d2f82", size = 7350711, upload-time = "2026-10-09T22:42:15.564Z" },
+    { url = "https://files.pythonhosted.org/packages/b9/f2/2f52d18dd1664c43effe99de9a3049034b7199a90bba88d19755636409b9/zaber_motion-10.2.0-py3-none-manylinux_2_35_x86_64.whl", hash = "sha256:4c2e12f7ab5aefa20f342c72f094c5f44c1022489bc22403e3e0123a0eb32a6a", size = 8102800, upload-time = "2026-10-09T22:42:19.807Z" },
+    { url = "https://files.pythonhosted.org/packages/bc/af/ba9805d8b177d40458516dfb0c234ec11eff7c478c0c6ba978dbb1b8bd56/zaber_motion-10.2.0-py3-none-win32.whl", hash = "sha256:a850e73d420591141e19f3d8dd0d2365fafe01ba51bc95116255be8f6ab1b92c", size = 7672295, upload-time = "2026-10-09T22:42:21.856Z" },
+    { url = "https://files.pythonhosted.org/packages/32/63/001af06335e5680cb88cb5d35050de075b091502185ed7b21d3e9f1a5567/zaber_motion-10.2.0-py3-none-win_amd64.whl", hash = "sha256:3d3562e0c093419c7eca32e8571f076890f223c0b722a7930ed09150a9c37fb5", size = 7857139, upload-time = "2026-10-09T22:42:24.153Z" },
+    { url = "https://files.pythonhosted.org/packages/3c/f3/7c2e106a5edc6ffcc83ab2a7ac28b30b752cf3ccf0db8872054ea0e21118/zaber_motion-10.2.0-py3-none-win_arm64.whl", hash = "sha256:b22085b8540d321183addeab5b5d662f926e74f165b9228b5fa7418d86726c11", size = 7118546, upload-time = "2026-10-09T22:42:26.532Z" },
 ]
 
 [[package]]

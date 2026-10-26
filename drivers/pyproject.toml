@@ -26,6 +26,8 @@ vxl-calibrate-mpds = "vxl_drivers.lasers.mpds.cli:main"
 thorlabs = ["pylablib>=1.4.5"]
 opto-icc = ["optoICC"]
 opto-kummenberg = ["optoKummenberg"]
+# Stage drivers
+zaber = ["zaber-motion>=10.1.0"]
 # Power meter drivers
 thorlabs-power-meter = ["pyvisa>=1.16.2"]
 # Laser drivers
