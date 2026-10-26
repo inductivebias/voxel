@@ -118,6 +118,7 @@ See the [driver module](src/vxl_drivers/power_meters/thorlabs.py) for setup note
 | Micronix MMC-100 controller | `vxl_drivers.axes.mmc.MMCHub` | Serial support included |
 | Micronix MMC-100 linear axis | `vxl_drivers.axes.mmc.MMCLinearAxis` | Configured with an `MMCHub` |
 | Thorlabs MFF101 flip mount | `vxl_drivers.axes.thorlabs.MFF101` | `thorlabs` extra |
+| Thorlabs FW212C filter wheel | `vxl_drivers.axes.fw212c.FW212C` | Serial support included; found by USB serial |
 
 ## Install vendor support
 
