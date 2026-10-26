@@ -37,6 +37,8 @@ obis-laser = ["obis-laser"]
 vortran-laser = ["vortran-laser"]
 pycobolt-laser = ["pycobolt"]
 # Camera drivers
+# PyVCAM ships manylinux and Windows wheels only; the driver imports it lazily.
+pvcam-camera = ["pyvcam>=2.3.2; sys_platform != 'darwin'"]
 egrabber-camera = ["egrabber"]
 ximea-camera = ["ximea-python"]
 # pco-camera = ["pco"]

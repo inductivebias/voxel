@@ -2253,6 +2253,21 @@ wheels = [
 ]
 
 [[package]]
+name = "pyvcam"
+version = "2.3.2"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/7b/c9/777f702636241177ef89af5f8c60990533f8cd62304519b3642e442b779e/pyvcam-2.3.2.tar.gz", hash = "sha256:9be199526db5984430e4aff48e98c642df8b2d61818f921f04aac518c933f9f0", size = 39146, upload-time = "2026-03-03T09:39:53.199Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/4e/a8/370d21ba8e9f0377a1c7bb2a560d520077d57f90c3c00724230744ff1222/pyvcam-2.3.2-cp313-cp313-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:e99e06ed9a529978fec8fed076098c753dc9f60f49b7f8cd150e92a934df87c7", size = 347891, upload-time = "2026-03-03T09:39:46.212Z" },
+    { url = "https://files.pythonhosted.org/packages/fb/96/052151696bc952f323a87eed27d186e4c8681727ad938d68337348b34b2e/pyvcam-2.3.2-cp313-cp313-win_amd64.whl", hash = "sha256:8bebf491af899eee713d497823927b1954a4217293e6f3f955cb983639d2b59b", size = 63419, upload-time = "2026-03-03T09:39:47.347Z" },
+    { url = "https://files.pythonhosted.org/packages/91/d5/5fe9610598e9c379a61f5824bd8c6a2719700dfc83533717aba9a59669f4/pyvcam-2.3.2-cp314-cp314-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:1c568419615406914ad5dac51b2def6644c0dcb36d5bff0d7dc8bb945b95b28e", size = 348142, upload-time = "2026-03-03T09:39:48.672Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/df/759e887dd8d1a9ce232a764d630fb07ef9ebcea13d9c48e5bc90e88d6dca/pyvcam-2.3.2-cp314-cp314-win_amd64.whl", hash = "sha256:016de692d45619a52ad87d2e66e0a6dae897f9ee96929acde1b94c4aa472431d", size = 64103, upload-time = "2026-03-03T09:39:49.869Z" },
+]
+
+[[package]]
 name = "pyvisa"
 version = "1.16.2"
 source = { registry = "https://pypi.org/simple" }
@@ -3006,6 +3021,9 @@ opto-icc = [
 opto-kummenberg = [
     { name = "optokummenberg" },
 ]
+pvcam-camera = [
+    { name = "pyvcam", marker = "sys_platform != 'darwin'" },
+]
 pycobolt-laser = [
     { name = "pycobolt" },
 ]
@@ -3039,6 +3057,7 @@ requires-dist = [
     { name = "pydantic", specifier = ">=2.11.9" },
     { name = "pylablib", marker = "extra == 'thorlabs'", specifier = ">=1.4.5" },
     { name = "pyserial", specifier = ">=3.5" },
+    { name = "pyvcam", marker = "sys_platform != 'darwin' and extra == 'pvcam-camera'", specifier = ">=2.3.2" },
     { name = "pyvisa", marker = "extra == 'thorlabs-power-meter'", specifier = ">=1.16.2" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=15.0.0" },
@@ -3048,7 +3067,7 @@ requires-dist = [
     { name = "ximea-python", marker = "extra == 'ximea-camera'", url = "https://github.com/adamkglaser/ximea-python/releases/download/v4.29.10/ximea_python-4.29.10-py3-none-any.whl" },
     { name = "zaber-motion", marker = "extra == 'zaber'", specifier = ">=10.1.0" },
 ]
-provides-extras = ["thorlabs", "opto-icc", "opto-kummenberg", "zaber", "thorlabs-power-meter", "mpds-calibration", "coherent-laser", "obis-laser", "vortran-laser", "pycobolt-laser", "egrabber-camera", "ximea-camera"]
+provides-extras = ["thorlabs", "opto-icc", "opto-kummenberg", "zaber", "thorlabs-power-meter", "mpds-calibration", "coherent-laser", "obis-laser", "vortran-laser", "pycobolt-laser", "pvcam-camera", "egrabber-camera", "ximea-camera"]
 
 [[package]]
 name = "vxl-records"

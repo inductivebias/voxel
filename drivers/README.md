@@ -69,6 +69,7 @@ firmware, operating-system drivers, and vendor runtimes.
 | Hamamatsu DCAM cameras | `vxl_drivers.cameras.dcam.hamamatsu.HamamatsuCamera` | Bundled Python wrapper; native DCAM runtime required |
 | PCO sCMOS cameras | `vxl_drivers.cameras.pco.PCOCamera` | `pco` package installed separately |
 | Ximea cameras | `vxl_drivers.cameras.ximea.XimeaCamera` | `ximea-camera` extra |
+| Teledyne Photometrics Kinetix (PVCAM) | `vxl_drivers.cameras.teledyne.Kinetix` | `pvcam-camera` extra; Linux with the PVCAM runtime and `pvcam_pcie` module |
 
 ### Lasers and AOTFs
 
