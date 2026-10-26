@@ -84,6 +84,7 @@ The package cutover is complete; instrument, template, and UI integration is sti
 | Oxxius LCX with linked AOM | `vxl_drivers.lasers.oxxius.lcx.OxxiusLCXLaser` | Serial support included |
 | MPDS controller | `vxl_drivers.lasers.mpds.controller.MPDS` | Serial support included |
 | Source with MPDS modulation | `vxl_drivers.lasers.mpds.laser.MPDSLaser` | Configured with a source and MPDS controller |
+| Coherent OBIS source (LX/LS, for example in a LightHUB) | `vxl_drivers.lasers.obis.ObisSource` | Serial support included; found by internal serial |
 
 Wrap standalone sources with `vxl.devices.laser.source_only.SourceOnlyLaser` to expose the complete `Laser` API.
 Driver module docstrings contain configuration examples and pending hardware checks. The MPDS calibration CLI is
