@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import getpass
+import json
 import logging
 import math
 import uuid
@@ -12,6 +13,7 @@ from functools import partial
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, Self
 
+from cloudpathlib import S3Path
 from pydantic import BaseModel, Field, ValidationError
 from vxl_records import (
     AcquisitionManifest,
@@ -32,7 +34,8 @@ from rigup import DeviceHandle, DeviceInterface, DeviceProps, PropResults, Resul
 from vxl.devices.axes import ContinuousAxisHandle, StepMode, TTLStepperConfig
 from vxl.devices.camera import CameraHandle, CaptureState, SensorROI
 from vxl.devices.daq.clocked import Signals
-from vxl.hal import HAL, HardwareTopology
+from vxl.devices.daq.recording import RecorderArm
+from vxl.hal import HAL, ContinuousScan, HardwareTopology
 from vxl.preview import PreviewLayer, PreviewSourceEmission, PreviewViewport, preview_source_header
 from vxl.preview.protocol import StagePosition
 from vxl.system import Remote, System, remote_store_fingerprint
@@ -64,6 +67,7 @@ from .errors import (
 )
 from .metadata import ExperimentMetadata, resolve_metadata_class
 from .planning import resolve_xy, resolve_z
+from .scanning import ContinuousPass, plan_continuous_pass
 from .store import PROMOTABLE_FIELDS, InstrumentStore
 
 logger = logging.getLogger(__name__)
@@ -75,6 +79,46 @@ async def _gather_hardware[T](*calls: Awaitable[T]) -> list[T]:
     if errors := [result for result in results if isinstance(result, BaseException)]:
         raise BaseExceptionGroup("Hardware operations failed", errors)
     return [result for result in results if not isinstance(result, BaseException)]
+
+
+# How long a continuous pass may sit stopped short of its frames before it fails.
+_PASS_STOP_GRACE_S = 1.0
+_RECORDER_FINISH_TIMEOUT_S = 5.0
+
+
+@dataclass
+class _PassProgress:
+    """What a continuous pass has armed so far, so teardown undoes exactly that."""
+
+    prepared: bool = False
+    recording: bool = False
+    moving: bool = False
+    finished: bool = False
+
+
+def _write_json(target: Path | S3Path, payload: Mapping[str, Any]) -> None:
+    if isinstance(target, Path):
+        target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(f"{json.dumps(payload, indent=2)}\n", encoding="utf-8")
+
+
+async def _disable_lasers_and_halt(
+    chans: list["Channel"], axis: ContinuousAxisHandle, *, halt: bool
+) -> tuple[list[Any], list[Exception]]:
+    """Disable every laser output, halting the scan axis in the same moment when ``halt`` is set.
+
+    Returns the per-channel results and any halt failure.
+    """
+    disabling = asyncio.gather(*(ch.disable_laser_output() for ch in chans), return_exceptions=True)
+    if not halt:
+        return await disabling, []
+    results, halted = await asyncio.gather(disabling, axis.halt(), return_exceptions=True)
+    if isinstance(results, BaseException):
+        raise results
+    if isinstance(halted, BaseException):
+        logger.error("cleanup: halting the scan axis failed", exc_info=halted)
+        return results, [halted if isinstance(halted, Exception) else RuntimeError(str(halted))]
+    return results, []
 
 
 class AcquisitionRequest(BaseModel):
@@ -314,6 +358,7 @@ class Instrument:
                     for device_id, handle in self._hal.devices.items()
                 ]
                 await self._refresh_device_props()
+                await self._validate_continuous_scan()
                 self._validate_startup()
                 self._channels = self._build_channels()
                 await self._inhibit_laser_outputs()
@@ -693,6 +738,8 @@ class Instrument:
             ]
             if not volumes:
                 raise OperationRejectedError("No tasks planned — add tasks before acquiring")
+            if self._hal.topology.continuous_scan is not None and (violations := await self._pass_violations(volumes)):
+                raise OperationRejectedError("; ".join(violations))
             await self._stop_preview()
             await self._activity.set(CaptureActivity())
         try:
@@ -964,6 +1011,70 @@ class Instrument:
             check(volume.z_start, "z", (*task_loc, "z", "start"), f"{label} z start")
             check(volume.z_end, "z", (*task_loc, "z", "end"), f"{label} z end")
         return violations
+
+    async def _validate_continuous_scan(self) -> None:
+        """Check the continuous-scan devices can pace, scan, and record every profile's pass."""
+        if (scan := self._hal.topology.continuous_scan) is None:
+            return
+        loc: ViolationLoc = ("hal", "continuous_scan")
+        violations: list[Violation] = []
+
+        def violation(code: str, msg: str, at: ViolationLoc) -> None:
+            violations.append(Violation(code=f"hal.continuous_scan.{code}", msg=msg, loc=at))
+
+        generator = self._hal.signal_generators.get(scan.generator)
+        pacing = None if generator is None else await generator.get_edge_pacing()
+        if generator is None:
+            violation("generator", f"'{scan.generator}' is not a signal generator.", (*loc, "generator"))
+        elif pacing is None:
+            violation("edge_pacing", f"Signal generator '{scan.generator}' has no edge source.", (*loc, "generator"))
+        recorder = self._hal.recorders.get(scan.recorder)
+        markers: dict[str, str] = {}
+        if recorder is None:
+            violation("recorder", f"'{scan.recorder}' is not a position recorder.", (*loc, "recorder"))
+        else:
+            markers = await recorder.get_markers()
+            # Both devices filter the same encoder terminal, and NI keeps one filter per terminal.
+            if pacing is not None and (await recorder.get_encoder_a()).lower() == pacing.source.lower():
+                if await recorder.get_filter_s() != pacing.filter_s:
+                    violation(
+                        "filter_mismatch",
+                        f"Recorder '{scan.recorder}' and generator '{scan.generator}' filter encoder "
+                        f"'{pacing.source}' differently.",
+                        loc,
+                    )
+            elif pacing is not None:
+                violation(
+                    "encoder_source",
+                    f"Generator '{scan.generator}' divides '{pacing.source}', not the encoder "
+                    f"recorder '{scan.recorder}' records.",
+                    loc,
+                )
+        if await self._hal.stage.scanning_axis.get_continuous_scan_info() is None:
+            violation(
+                "scanner",
+                f"Stage z axis '{self._hal.topology.stage.z}' cannot scan continuously.",
+                ("hal", "stage", "z"),
+            )
+
+        imaging = self._store.value.imaging
+        for profile_id, profile in imaging.profiles.items():
+            at: ViolationLoc = ("state", "imaging", "profiles", profile_id)
+            if set(profile.sync) != {scan.generator}:
+                violation(
+                    "profile_sync",
+                    f"Profile '{profile_id}' must sync exactly the scan generator '{scan.generator}'.",
+                    (*at, "sync"),
+                )
+            cameras = {imaging.channels[ch].detection for ch in profile.channels if ch in imaging.channels}
+            if recorder is not None and (unmarked := sorted(cameras - set(markers))):
+                violation(
+                    "markers",
+                    f"Profile '{profile_id}' images {', '.join(unmarked)} without a recorder marker.",
+                    (*at, "channels"),
+                )
+        if violations:
+            raise StartupError(violations)
 
     async def _refresh_device_props(self) -> None:
         """Best-effort hydration of every device's latest-successful property cache."""
@@ -1583,7 +1694,9 @@ class Instrument:
         )
         frames_done = 0
         capture_error: BaseException | None = None
+        progress = _PassProgress() if self._hal.topology.continuous_scan is not None else None
         try:
+            planned = await self._plan_pass(volume) if progress is not None else None
             await self._inhibit_laser_outputs()
             await self._apply_profile(volume.profile)
             await _gather_hardware(*(ch.prepare_laser() for ch in channels.values()))
@@ -1591,63 +1704,47 @@ class Instrument:
             await _gather_hardware(
                 self._hal.stage.x.move_abs(volume.x, wait=True),
                 self._hal.stage.y.move_abs(volume.y, wait=True),
-                self._hal.stage.z.move_abs(volume.z_start, wait=True),
+                # A continuous pass starts its lead-in before the first plane.
+                self._hal.stage.z.move_abs(volume.z_start if planned is None else planned.start, wait=True),
             )
             await self._update_acquisition(manifest, phase=AcquisitionPhase.CONFIGURING)
             async with self._lock:
                 await self._ensure_routes(volume.routes)
-            await scanning_axis.configure_ttl_stepper(TTLStepperConfig(step_mode=StepMode.RELATIVE))
-            await scanning_axis.queue_relative_move(volume.z_step)
-            init_coros = []
-            for ch_id, ch in channels.items():
-                config = self._channel_config(ch_id)
-                init_coros.append(
-                    ch.camera.open_stack(
-                        storage=manifest.storage,
-                        subpath=subpath / ch_id,
-                        num_frames=num_frames,
-                        z_step=volume.z_step,
-                        magnification=self._hal.topology.detection[config.detection].magnification,
-                        settings=settings,
-                    )
-                )
-            opened = await _gather_hardware(*init_coros)
-            locations = dict(zip(channels, opened, strict=True))
-            await self._activity.set(self._capture_activity().model_copy(update={"channels": tuple(channels)}))
-            await self._reset_preview()
-            manifest = await self._records.acquisitions.register_datasets(
-                manifest.id,
-                volume_index=volume_index,
-                locations=locations,
-            )
-            await self._update_acquisition(manifest)
-
+            if planned is None:
+                await scanning_axis.configure_ttl_stepper(TTLStepperConfig(step_mode=StepMode.RELATIVE))
+                await scanning_axis.queue_relative_move(volume.z_step)
+            manifest = await self._open_stacks(manifest, volume_index, subpath, channels)
             await self._update_acquisition(manifest, phase=AcquisitionPhase.CAPTURING)
 
-            for batch_idx in range(math.ceil(num_frames / batch_z)):
-                frames_in_batch = min(batch_z, num_frames - batch_idx * batch_z)
-                # begin_batch waits for a free writer slot and arms the camera before returning,
-                # so the signal generator is safe to fire once these resolve.
-                await _gather_hardware(*(ch.camera.begin_batch(frames_in_batch) for ch in channels.values()))
-                if batch_idx == 0:
-                    await _gather_hardware(*(ch.enable_laser_output() for ch in channels.values()))
-                await self._start_signal_generators()
-                while True:
-                    states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
-                    if all(state is CaptureState.DONE for state in states):
-                        break
-                    await asyncio.sleep(0.05)
-                await self._stop_signal_generators()
-                done = min((batch_idx + 1) * batch_z, num_frames)
-                frames_done = done
-                await self._update_acquisition(manifest, frames_captured=done)
+            if planned is not None and progress is not None:
+                await self._capture_continuous(manifest, volume, subpath, channels, planned, progress)
+                frames_done = num_frames
+                await self._update_acquisition(manifest, frames_captured=num_frames)
+            else:
+                for batch_idx in range(math.ceil(num_frames / batch_z)):
+                    frames_in_batch = min(batch_z, num_frames - batch_idx * batch_z)
+                    # begin_batch waits for a free writer slot and arms the camera before returning,
+                    # so the signal generator is safe to fire once these resolve.
+                    await _gather_hardware(*(ch.camera.begin_batch(frames_in_batch) for ch in channels.values()))
+                    if batch_idx == 0:
+                        await _gather_hardware(*(ch.enable_laser_output() for ch in channels.values()))
+                    await self._start_signal_generators()
+                    while True:
+                        states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
+                        if all(state is CaptureState.DONE for state in states):
+                            break
+                        await asyncio.sleep(0.05)
+                    await self._stop_signal_generators()
+                    done = min((batch_idx + 1) * batch_z, num_frames)
+                    frames_done = done
+                    await self._update_acquisition(manifest, frames_captured=done)
         except BaseException as error:
             capture_error = error
 
         active = self._capture_activity().acquisition
         if active is not None and active.phase is not AcquisitionPhase.STOPPING:
             await self._update_acquisition(manifest, phase=AcquisitionPhase.FINALIZING)
-        cleanup_errors = await self._teardown_capture(list(channels.values()), scanning_axis)
+        cleanup_errors = await self._teardown_capture(list(channels.values()), scanning_axis, progress)
         if capture_error is None and not cleanup_errors:
             manifest = await self._records.acquisitions.complete_volume(manifest.id, volume_index=volume_index)
             await self._update_acquisition(manifest)
@@ -1655,7 +1752,9 @@ class Instrument:
             return manifest
 
         location_status = LocationStatus.FAILED if cleanup_errors else LocationStatus.AVAILABLE
-        dataset_status = DatasetStatus.PARTIAL if frames_done else DatasetStatus.FAILED
+        # A continuous pass that started moving has written frames even if it failed before counting them.
+        moved = progress is not None and progress.moving
+        dataset_status = DatasetStatus.PARTIAL if frames_done or moved else DatasetStatus.FAILED
         try:
             terminalize = (
                 self._records.acquisitions.cancel_volume
@@ -1682,8 +1781,196 @@ class Instrument:
             f"capture cleanup failed for task {volume.task} / profile {volume.profile}", cleanup_errors
         )
 
-    async def _teardown_capture(self, chans: list[Channel], scanning_axis: ContinuousAxisHandle) -> list[Exception]:
+    async def _open_stacks(
+        self,
+        manifest: AcquisitionManifest,
+        volume_index: int,
+        subpath: PurePosixPath,
+        channels: Mapping[str, Channel],
+    ) -> AcquisitionManifest:
+        """Open every channel's dataset for the volume and register where each is written."""
+        volume = manifest.volumes[volume_index]
+        settings = self._store.value.output
+        opened = await _gather_hardware(
+            *(
+                ch.camera.open_stack(
+                    storage=manifest.storage,
+                    subpath=subpath / ch_id,
+                    num_frames=volume.frames_total,
+                    z_step=volume.z_step,
+                    magnification=self._hal.topology.detection[self._channel_config(ch_id).detection].magnification,
+                    settings=settings,
+                )
+                for ch_id, ch in channels.items()
+            )
+        )
+        locations = dict(zip(channels, opened, strict=True))
+        await self._activity.set(self._capture_activity().model_copy(update={"channels": tuple(channels)}))
+        await self._reset_preview()
+        manifest = await self._records.acquisitions.register_datasets(
+            manifest.id,
+            volume_index=volume_index,
+            locations=locations,
+        )
+        await self._update_acquisition(manifest)
+        return manifest
+
+    async def _plan_pass(self, volume: PlannedVolume) -> ContinuousPass:
+        planned, violations = await self._plan_volume_pass(volume)
+        if planned is None:
+            raise OperationRejectedError("; ".join(violations))
+        return planned
+
+    async def _pass_violations(self, volumes: Sequence[PlannedVolume]) -> list[str]:
+        """Every reason a planned volume's continuous pass cannot run, once per task and profile."""
+        found: dict[str, None] = {}
+        for volume in volumes:
+            _, violations = await self._plan_volume_pass(volume)
+            for violation in violations:
+                found[f"Task '{volume.task}' / profile '{volume.profile}': {violation}"] = None
+        return list(found)
+
+    async def _plan_volume_pass(self, volume: PlannedVolume) -> tuple[ContinuousPass | None, list[str]]:
+        scan = self._continuous_scan()
+        axis = self._hal.stage.scanning_axis
+        info = await axis.get_continuous_scan_info()
+        pacing = await self._hal.signal_generators[scan.generator].get_edge_pacing()
+        if info is None or pacing is None:
+            raise RuntimeError("the continuous-scan axis and generator lost the capabilities checked at startup")
+        return plan_continuous_pass(
+            z_start=volume.z_start,
+            z_step=volume.z_step,
+            frames=volume.frames_total,
+            signals=self._store.value.imaging.profiles[volume.profile].sync[scan.generator],
+            scan=scan,
+            info=info,
+            pacing=pacing,
+            limits=(await axis.get_lower_limit(), await axis.get_upper_limit()),
+        )
+
+    def _continuous_scan(self) -> ContinuousScan:
+        if (scan := self._hal.topology.continuous_scan) is None:
+            raise RuntimeError("this instrument has no continuous scan configured")
+        return scan
+
+    async def _capture_continuous(
+        self,
+        manifest: AcquisitionManifest,
+        volume: PlannedVolume,
+        subpath: PurePosixPath,
+        channels: Mapping[str, Channel],
+        planned: ContinuousPass,
+        progress: "_PassProgress",
+    ) -> None:
+        """Capture every frame of the volume in one constant-speed pass and record where each was taken.
+
+        Recording and the cameras are armed before the generator, and the generator before motion, so the
+        first encoder edge after the move starts is the first edge everything counts. ``progress`` tells
+        teardown what to undo if any step fails.
+        """
+        scan = self._continuous_scan()
+        axis = self._hal.stage.scanning_axis
+        generator = self._hal.signal_generators[scan.generator]
+        recorder = self._hal.recorders[scan.recorder]
+        info = await axis.get_continuous_scan_info()
+        if info is None:
+            raise RuntimeError(f"stage z axis '{self._hal.topology.stage.z}' cannot scan continuously")
+
+        progress.prepared = True
+        prepared = await axis.prepare_continuous_scan(planned.start, planned.speed)
+        progress.recording = True
+        await recorder.arm(
+            RecorderArm(
+                origin=prepared["origin"],
+                edge_spacing=info.edge_spacing,
+                frames=planned.division.cycles,
+                spacing=volume.z_step,
+                first_exposure=planned.first_exposure,
+                speed=planned.speed,
+            )
+        )
+        await _gather_hardware(*(ch.camera.begin_batch(planned.division.cycles) for ch in channels.values()))
+        await _gather_hardware(*(ch.enable_laser_output() for ch in channels.values()))
+        pacing = await generator.start_paced(planned.division)
+        await recorder.mark_motion()
+        progress.moving = True
+        await axis.start_continuous_scan(planned.end)
+        await self._await_pass(channels, axis, planned)
+
+        await generator.wait_until_done(planned.timeout_s)
+        recorded = await recorder.finish(_RECORDER_FINISH_TIMEOUT_S)
+        progress.recording = False
+        final = await axis.finish_continuous_scan(planned.end)
+        progress.finished = True
+        record = {
+            "task": volume.task,
+            "profile": volume.profile,
+            "axis": self._hal.topology.stage.z,
+            "plan": {
+                "z_start": volume.z_start,
+                "z_step": volume.z_step,
+                "start": planned.start,
+                "end": planned.end,
+                "speed": planned.speed,
+                "division": planned.division.model_dump(),
+                "first_exposure": planned.first_exposure,
+            },
+            "scan_info": info.model_dump(),
+            "pacing": pacing,
+            "prepared": prepared,
+            "final": final,
+            "recorded": recorded.model_dump(mode="json"),
+        }
+        target = self._system.resolve_storage(manifest.storage, subpath).target / "scan.json"
+        await asyncio.to_thread(_write_json, target, record)
+
+    async def _await_pass(
+        self, channels: Mapping[str, Channel], axis: ContinuousAxisHandle, planned: ContinuousPass
+    ) -> None:
+        """Wait until the axis has stopped and every camera has all its frames, within the pass timeout."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + planned.timeout_s
+        stopped_at: float | None = None
+        while True:
+            states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
+            moving = await axis.continuous_scan_moving()
+            if not moving and all(state is CaptureState.DONE for state in states):
+                return
+            now = loop.time()
+            if not moving:
+                stopped_at = now if stopped_at is None else stopped_at
+                if now - stopped_at > _PASS_STOP_GRACE_S:
+                    raise RuntimeError(
+                        f"the scan axis stopped before every camera had its {planned.division.cycles} frames"
+                    )
+            if now > deadline:
+                raise TimeoutError(f"the continuous pass did not finish within {planned.timeout_s:g} s")
+            await asyncio.sleep(0.05)
+
+    async def _abort_pass(self, progress: "_PassProgress", axis: ContinuousAxisHandle) -> list[Exception]:
+        """Discard an unfinished pass's recording and restore the scan axis, attempting both."""
+        errors: list[Exception] = []
+        if progress.recording:
+            try:
+                await self._hal.recorders[self._continuous_scan().recorder].abort()
+            except Exception as error:
+                logger.exception("cleanup: aborting the position recorder failed")
+                errors.append(error)
+        if progress.prepared:
+            try:
+                await axis.reset_continuous_scan()
+            except Exception as error:
+                logger.exception("cleanup: resetting the continuous scan failed")
+                errors.append(error)
+        return errors
+
+    async def _teardown_capture(
+        self, chans: list[Channel], scanning_axis: ContinuousAxisHandle, progress: "_PassProgress | None" = None
+    ) -> list[Exception]:
         """Inhibit output, stop DAQ, reset the stepper, then drain and close every writer.
+
+        After a continuous pass that did not finish, the scan axis also halts together with the laser outputs,
+        and the recorder and the axis's scan settings are reset once the DAQ has stopped.
 
         Attempt every cleanup step and report failures so the caller cannot mark the volume complete.
 
@@ -1701,16 +1988,17 @@ class Instrument:
                         errors.append(result if isinstance(result, Exception) else RuntimeError(str(result)))
             return errors
 
-        errors = _report(
-            "disable_laser_output",
-            await asyncio.gather(*(ch.disable_laser_output() for ch in chans), return_exceptions=True),
-            collect=True,
-        )
+        unfinished = progress is not None and not progress.finished
+        halt = unfinished and progress is not None and progress.moving
+        laser_results, errors = await _disable_lasers_and_halt(chans, scanning_axis, halt=halt)
+        errors[:0] = _report("disable_laser_output", laser_results, collect=True)
         try:
             await self._stop_signal_generators()
         except Exception as error:
             logger.exception("cleanup: stopping signal generators failed")
             errors.append(error)
+        if unfinished and progress is not None:
+            errors.extend(await self._abort_pass(progress, scanning_axis))
         with suppress(NotImplementedError, RuntimeError):
             await scanning_axis.reset_ttl_stepper()
         close_results = await asyncio.gather(*(ch.camera.close_stack() for ch in chans), return_exceptions=True)

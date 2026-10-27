@@ -3,6 +3,7 @@
 from .core import HAL, Stage
 from .errors import HALError, HALStartupError, Violation, ViolationLoc, assignment_violations
 from .topology import (
+    ContinuousScan,
     DetectionAssembly,
     DiscreteAxisPositions,
     HardwareTopology,
@@ -16,6 +17,7 @@ from .topology import (
 
 __all__ = [
     "HAL",
+    "ContinuousScan",
     "DetectionAssembly",
     "DiscreteAxisPositions",
     "HALError",

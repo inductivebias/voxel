@@ -118,6 +118,25 @@ class OpticalRouting(RootModel[dict[Annotated[str, identifier("Routing dimension
     model_config = ConfigDict(frozen=True)
 
 
+class ContinuousScan(FrozenModel):
+    """Acquire each volume in one constant-speed pass of the stage's z (scan) axis instead of stepping it.
+
+    The axis exports its encoder, ``generator`` starts one waveform cycle per ``z_step`` of travel by
+    dividing the encoder edges, and ``recorder`` records the encoder position of every exposure. The
+    profile sets the speed: one ``z_step`` per ``duration + rest_time``.
+    """
+
+    generator: str = Field(description="Signal generator that divides the scan axis's encoder edges")
+    recorder: str = Field(description="Position recorder that latches the encoder position of each exposure")
+    lead_in_edges: int = Field(
+        default=4, ge=2, description="Fewest encoder edges between the pass start and the first cycle"
+    )
+    rearm_margin_s: float = Field(default=0.001, ge=0, description="Idle time each cycle needs before the next trigger")
+    speed_tolerance: float = Field(
+        default=0.05, ge=0, lt=1, description="Fraction by which the axis may run faster than the planned speed"
+    )
+
+
 class HardwareTopology(RigConfig, frozen=True):
     """The hardware blueprint: a rig (``devices`` + ``nodes``, inherited) plus the microscope wiring
     (stage axes, optical assemblies, and routing). Immutable — loaded once, never edited at runtime."""
@@ -126,6 +145,7 @@ class HardwareTopology(RigConfig, frozen=True):
     detection: dict[str, DetectionAssembly]
     illumination: dict[str, IlluminationAssembly]
     optical_routing: OpticalRouting = Field(default_factory=lambda: OpticalRouting({}))
+    continuous_scan: ContinuousScan | None = None
 
     @property
     def device_uids(self) -> set[str]:
@@ -198,6 +218,21 @@ class HardwareTopology(RigConfig, frozen=True):
             *self._stage_violations(loc),
             *self._assembly_violations(loc),
             *self._optical_routing_violations(loc),
+            *self._continuous_scan_violations(loc),
+        ]
+
+    def _continuous_scan_violations(self, loc: ViolationLoc) -> list[Violation]:
+        if (scan := self.continuous_scan) is None:
+            return []
+        devices = self.device_uids
+        return [
+            Violation(
+                code="hal.continuous_scan.device_missing",
+                msg=f"Continuous scan {role} '{uid}' is not a configured device.",
+                loc=(*loc, "continuous_scan", role),
+            )
+            for role, uid in (("generator", scan.generator), ("recorder", scan.recorder))
+            if uid not in devices
         ]
 
     def _stage_violations(self, loc: ViolationLoc) -> list[Violation]:
