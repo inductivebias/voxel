@@ -110,12 +110,14 @@ markers = [
 [tool.pyright]
 typeCheckingMode = "standard"
 include = ["src", "rigup", "drivers", "vxlib", "omezarr", "records", "tests", "scripts", "bench"]
-# SDK-specific entry points are checked separately with pyrightconfig.optional.json on a host
-# providing those extras. Missing imports remain errors in both configurations.
+# Optional GUI, benchmark, and SDK entry points are checked with pyrightconfig.optional.json
+# in their corresponding environments. Missing imports remain errors in both configurations.
 exclude = [
     "**/node_modules",
     "**/__pycache__",
     "**/.*",
+    "src/vxl/qt",
+    "bench",
     "drivers/src/vxl_drivers/axes/thorlabs.py",
     "drivers/src/vxl_drivers/cameras/egrabber.py",
     "drivers/src/vxl_drivers/cameras/ximea.py",

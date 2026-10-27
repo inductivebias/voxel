@@ -1,6 +1,8 @@
 {
   "typeCheckingMode": "standard",
   "include": [
+    "src/vxl/qt",
+    "bench",
     "drivers/src/vxl_drivers/axes/thorlabs.py",
     "drivers/src/vxl_drivers/cameras/egrabber.py",
     "drivers/src/vxl_drivers/cameras/ximea.py",
@@ -16,5 +18,5 @@
     "omezarr/src/ome_zarr_writer/viewer/ng_view.py",
     "scripts/generate_gradients.py"
   ],
-  "ignore": ["**/sdk/**", "**/vendor/**"]
+  "ignore": ["**/sdk/**", "**/vendor/**", "**/bench/**/analysis.py"]
 }
