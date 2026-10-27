@@ -1,6 +1,6 @@
 import pytest
 
-from vxl.devices.daq.clocked import SignalGeneratorController
+from vxl.devices.daq.clocked import EdgeDivision, SignalGeneratorController
 from vxl.devices.daq.clocked.waveform import validate_waveform
 
 from .helpers import _make_generator, _signals, _triangle
@@ -145,6 +145,42 @@ class TestControllerStateMachine:
         assert ctrl.loaded is None
         # Restore for further assertions
         generator.write = original_write  # type: ignore[method-assign]
+
+
+class TestControllerStartPaced:
+    async def test_start_paced_fresh_or_running_raises(self):
+        _, generator = _make_generator(edge_source="pfi1")
+        ctrl = SignalGeneratorController(generator)
+        division = EdgeDivision(cycles=3, divider=5, initial_delay=10)
+        with pytest.raises(RuntimeError, match="ready state, got fresh"):
+            await ctrl.start_paced(division)
+        await ctrl.load(_signals())
+        await ctrl.start()
+        with pytest.raises(RuntimeError, match="ready state, got running"):
+            await ctrl.start_paced(division)
+        assert generator.last_division is None, "the driver must not be called outside ready"
+
+    async def test_start_paced_ready_runs_then_stop_returns_to_ready(self):
+        _, generator = _make_generator(edge_source="pfi1")
+        ctrl = SignalGeneratorController(generator)
+        division = EdgeDivision(cycles=3, divider=5, initial_delay=10)
+        await ctrl.load(_signals())
+        readback = await ctrl.start_paced(division)
+        assert readback == {"source": "pfi1"}
+        assert ctrl.state == "running"
+        assert generator.last_division == division
+        await ctrl.wait_until_done(timeout_s=1.0)
+        await ctrl.stop()
+        assert ctrl.state == "ready"
+        assert generator.last_division is None
+
+    async def test_start_paced_unsupported_driver_stays_ready(self):
+        _, generator = _make_generator()
+        ctrl = SignalGeneratorController(generator)
+        await ctrl.load(_signals())
+        with pytest.raises(RuntimeError, match="edge_source"):
+            await ctrl.start_paced(EdgeDivision(cycles=1, divider=4, initial_delay=2))
+        assert ctrl.state == "ready"
 
 
 class TestControllerValidation:

@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from typing import ClassVar, Literal
 
 import numpy as np
-from pydantic import TypeAdapter
+from pydantic import BaseModel, Field, TypeAdapter
 from rigup.device.handle import Adapter, DeviceProperty
 from vxlib.quantity import QuantityRange, VoltageRange
 
@@ -15,6 +15,22 @@ from .waveform import Signals
 
 GeneratorState = Literal["fresh", "ready", "running"]
 _PORTS_ADAPTER = TypeAdapter(dict[str, str])
+
+
+class EdgeDivision(BaseModel, frozen=True):
+    """One edge-paced run: play ``cycles`` cycles, each after ``divider`` rising edges on the edge source,
+    the first after ``initial_delay`` edges."""
+
+    cycles: int = Field(ge=1, le=2**32 - 1)
+    divider: int = Field(ge=4, le=2**32 - 1)
+    initial_delay: int = Field(ge=2, le=2**32 - 1)
+
+
+class EdgePacing(BaseModel, frozen=True):
+    """A generator's ability to pace cycles by external edges."""
+
+    source: str  # terminal that supplies the edges, as configured (e.g. "pfi1")
+    filter_s: float  # requested minimum pulse width of the source's digital filter; 0 = unfiltered
 
 
 class SignalGeneratorController(DeviceController["SignalGenerator"]):
@@ -94,6 +110,14 @@ class SignalGeneratorController(DeviceController["SignalGenerator"]):
         await self._run_sync(self.device.start, repeat)
         self._state = "running"
 
+    @describe(label="Start Edge-Paced Output", desc="Play a finite run of cycles paced by external edges")
+    async def start_paced(self, division: EdgeDivision) -> dict[str, float | int | str]:
+        if self._state != "ready":
+            raise RuntimeError(f"start_paced requires ready state, got {self._state}")
+        readback = await self._run_sync(self.device.start_paced, division)
+        self._state = "running"
+        return readback
+
     @describe(label="Stop Output", desc="Halt signal generation; outputs settle to rest voltages")
     async def stop(self) -> None:
         if self._state != "running":
@@ -132,6 +156,11 @@ class SignalGenerator(Device):
     @describe(label="AO Voltage Range", units="V", desc="Hardware AO voltage range")
     def voltage_range(self) -> VoltageRange: ...
 
+    @property
+    @describe(label="Edge Pacing", desc="External edge source that can pace cycles; None if unsupported")
+    def edge_pacing(self) -> EdgePacing | None:
+        return None
+
     @abstractmethod
     def setup(self, signals: Signals) -> None:
         """Reserve hardware resources and configure output from ``signals``.
@@ -161,6 +190,21 @@ class SignalGenerator(Device):
     @abstractmethod
     def start(self, repeat: int | None = None) -> None:
         """Begin output. ``repeat=None`` runs until ``stop``; ``repeat=N`` stops after N cycles."""
+
+    def start_paced(self, division: EdgeDivision) -> dict[str, float | int | str]:
+        """Begin a finite run of ``division.cycles`` cycles paced by the ``edge_pacing`` source.
+
+        ``wait_until_done`` waits for the run; ``stop`` ends it and restores periodic
+        ``start`` behavior.
+
+        Returns:
+            Hardware readbacks of the pacing configuration, keyed by name.
+
+        Raises:
+            NotImplementedError: The generator cannot pace cycles by external edges.
+        """
+        del division
+        raise NotImplementedError(f"{self.uid}: edge-paced output is not supported")
 
     @abstractmethod
     def stop(self) -> None:
@@ -192,9 +236,11 @@ class SignalGenerator(Device):
     def wait_until_done(self, timeout_s: float) -> None:
         """Block until the current finite acquisition completes.
 
-        Only valid after ``start(repeat=N)`` — raises ``RuntimeError`` if no finite
-        acquisition is active (e.g. ``start(repeat=None)`` was used, or the task was
-        never started). Raises on timeout via the underlying driver.
+        Only valid after ``start(repeat=N)`` or ``start_paced`` — raises ``RuntimeError``
+        if no finite acquisition is active (e.g. ``start(repeat=None)`` was used, or the
+        task was never started). Raises on timeout via the underlying driver. Drivers
+        that count generated samples also raise ``RuntimeError`` when the run did not
+        play exactly the requested number of cycles.
         """
 
     def resolve_signals(self, signals: Signals) -> dict[str, np.ndarray]:
@@ -246,6 +292,10 @@ class SignalGeneratorHandle(DeviceHandle["SignalGenerator"]):
     async def start(self, repeat: int | None = None) -> None:
         await self.call("start", repeat)
 
+    async def start_paced(self, division: EdgeDivision) -> dict[str, float | int | str]:
+        """Start a finite edge-paced run and return the driver's hardware readbacks."""
+        return await self.call("start_paced", division)
+
     async def stop(self) -> None:
         await self.call("stop")
 
@@ -259,6 +309,14 @@ class SignalGeneratorHandle(DeviceHandle["SignalGenerator"]):
         if isinstance(val, Signals):
             return val
         return Signals.model_validate(val)
+
+    async def get_edge_pacing(self) -> EdgePacing | None:
+        val = await self.props.get_value("edge_pacing")
+        if val is None:
+            return None
+        if isinstance(val, EdgePacing):
+            return val
+        return EdgePacing.model_validate(val)
 
     async def get_state(self) -> GeneratorState:
         return await self.props.get_value("state")
@@ -274,6 +332,8 @@ class SignalGeneratorHandle(DeviceHandle["SignalGenerator"]):
 
 
 __all__ = [
+    "EdgeDivision",
+    "EdgePacing",
     "GeneratorState",
     "SignalGenerator",
     "SignalGeneratorController",

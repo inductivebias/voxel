@@ -12,14 +12,15 @@ from vxlib.quantity import VoltageRange
 
 from vxl.devices.daq.hub_sim import SimulatedDaqmx
 
-from .base import GeneratorState, SignalGenerator, Signals
+from .base import EdgeDivision, EdgePacing, GeneratorState, SignalGenerator, Signals
 
 
 class SimulatedSignalGenerator(SignalGenerator):
     """In-memory ``SignalGenerator`` implementation for tests + simulated rigs.
 
     Records the last-written arrays, last-applied ``Signals``, and the current
-    state so tests can assert what the controller dispatched.
+    state so tests can assert what the controller dispatched. ``edge_source``
+    enables ``start_paced``, which records its division and completes at once.
     """
 
     def __init__(
@@ -28,9 +29,13 @@ class SimulatedSignalGenerator(SignalGenerator):
         *,
         hub: SimulatedDaqmx,
         ports: Mapping[str, str],
+        edge_source: str | None = None,
+        edge_filter_us: float = 0.0,
     ) -> None:
         super().__init__(uid=uid, ports=ports)
         self._hub = hub
+        self._edge_source = edge_source
+        self._edge_filter_us = edge_filter_us
         self._log = logging.getLogger(f"{uid}.SimulatedSignalGenerator")
 
         # Driver-local state
@@ -38,6 +43,7 @@ class SimulatedSignalGenerator(SignalGenerator):
         self._last_arrays: dict[str, np.ndarray] = {}
         self._finite_repeat: int | None = None  # last start()'s repeat arg; None = continuous
         self._counter_reserved: str | None = None
+        self._last_division: EdgeDivision | None = None
 
     # ---- introspection ----
 
@@ -52,6 +58,17 @@ class SimulatedSignalGenerator(SignalGenerator):
     @property
     def running(self) -> bool:
         return self._sim_state == "running"
+
+    @property
+    def edge_pacing(self) -> EdgePacing | None:
+        if self._edge_source is None:
+            return None
+        return EdgePacing(source=self._edge_source, filter_s=self._edge_filter_us * 1e-6)
+
+    @property
+    def last_division(self) -> EdgeDivision | None:
+        """Division of the current edge-paced run; None when not edge-paced."""
+        return self._last_division
 
     # ---- hardware primitives ----
 
@@ -83,6 +100,7 @@ class SimulatedSignalGenerator(SignalGenerator):
         self._last_arrays = {}
         self._counter_reserved = None
         self._finite_repeat = None
+        self._last_division = None
         self._sim_state = "fresh"
 
     def start(self, repeat: int | None = None) -> None:
@@ -90,6 +108,16 @@ class SimulatedSignalGenerator(SignalGenerator):
             raise RuntimeError("start() requires setup()+write()")
         self._finite_repeat = repeat
         self._sim_state = "running"
+
+    def start_paced(self, division: EdgeDivision) -> dict[str, float | int | str]:
+        if self._sim_state == "fresh":
+            raise RuntimeError("start_paced() requires setup()+write()")
+        if self._edge_source is None:
+            raise RuntimeError(f"{self.uid}: start_paced requires an edge_source")
+        self._last_division = division
+        self._finite_repeat = division.cycles
+        self._sim_state = "running"
+        return {"source": self._edge_source}
 
     def wait_until_done(self, timeout_s: float) -> None:
         del timeout_s  # simulated tasks complete instantly
@@ -101,6 +129,7 @@ class SimulatedSignalGenerator(SignalGenerator):
 
     def stop(self) -> None:
         self._finite_repeat = None
+        self._last_division = None
         if self._sim_state == "running":
             self._sim_state = "ready"
 

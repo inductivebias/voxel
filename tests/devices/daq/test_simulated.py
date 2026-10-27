@@ -2,6 +2,8 @@ import numpy as np
 import pytest
 
 from vxl.devices.daq import SimulatedDaqmx
+from vxl.devices.daq.clocked import EdgeDivision, EdgePacing
+from vxl.devices.daq.clocked.simulated import SimulatedSignalGenerator
 from vxl.devices.daq.clocked.waveform import validate_waveform
 
 from .helpers import _make_generator, _signals, _triangle
@@ -139,6 +141,42 @@ class TestSimulatedSignalGenerator:
         generator.stop()
         with pytest.raises(RuntimeError, match="finite acquisition"):
             generator.wait_until_done(timeout_s=1.0)
+
+    def test_edge_pacing_reports_configured_source(self):
+        _, generator = _make_generator()
+        assert generator.edge_pacing is None
+        hub = SimulatedDaqmx()
+        paced = SimulatedSignalGenerator(
+            "ao_paced", hub=hub, ports={"galvo": "ao0"}, edge_source="pfi1", edge_filter_us=2.5
+        )
+        pacing = paced.edge_pacing
+        assert isinstance(pacing, EdgePacing)
+        assert pacing.source == "pfi1"
+        assert pacing.filter_s == pytest.approx(2.5e-6)
+
+    def test_start_paced_before_setup_raises(self):
+        _, generator = _make_generator(edge_source="pfi1")
+        with pytest.raises(RuntimeError, match="requires setup"):
+            generator.start_paced(EdgeDivision(cycles=2, divider=4, initial_delay=2))
+
+    def test_start_paced_without_edge_source_raises(self):
+        _, generator = _make_generator()
+        generator.setup(_signals())
+        with pytest.raises(RuntimeError, match="edge_source"):
+            generator.start_paced(EdgeDivision(cycles=2, divider=4, initial_delay=2))
+        assert not generator.running
+
+    def test_start_paced_records_division_until_stop(self):
+        _, generator = _make_generator(edge_source="pfi1")
+        generator.setup(_signals())
+        division = EdgeDivision(cycles=2, divider=4, initial_delay=2)
+        assert generator.start_paced(division) == {"source": "pfi1"}
+        assert generator.running
+        assert generator.last_division == division
+        generator.wait_until_done(timeout_s=1.0)  # sim returns immediately
+        generator.stop()
+        assert not generator.running
+        assert generator.last_division is None
 
     def test_can_hotswap_true_when_only_waveforms_change(self):
         _, generator = _make_generator()

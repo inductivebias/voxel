@@ -1,8 +1,9 @@
 """NI-DAQmx clocked analog signal generator.
 
 ``NiSignalGenerator`` (clocked) owns a single NI AO task. A ``CounterTrigger`` adds a
-counter-output task whose pulses retrigger finite AO cycles; an ``InputTrigger``
-restarts a cycle for each edge received from a configured PFI.
+counter-output task whose pulses retrigger finite AO cycles, periodically or, for one
+finite run, by dividing the edges of an input PFI; an ``InputTrigger`` restarts a
+cycle for each edge received from a configured PFI.
 
 Both take a ``NiDaqmx`` hub (``vxl.devices.daq.hub_ni``) at construction; the card and pins
 live there.
@@ -10,20 +11,21 @@ live there.
 
 import logging
 import time
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from typing import Annotated, Literal
 
 import numpy as np
 from nidaqmx.constants import AcquisitionType as NiAcqType
-from nidaqmx.constants import Edge, RegenerationMode
+from nidaqmx.constants import Edge, Level, RegenerationMode, TaskMode
 from nidaqmx.task import Task as NiTask
-from pydantic import BaseModel, ConfigDict, Discriminator, TypeAdapter
+from nidaqmx.task.channels import COChannel
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, TypeAdapter
 from vxlib.quantity import VoltageRange
 
 from vxl.devices.daq.hub_ni import NiDaqmx
 from vxl.devices.daq.hub_ni.resources import NiTaskLease  # noqa: TC001 - annotations are evaluated at runtime
 
-from .base import SignalGenerator, Signals
+from .base import EdgeDivision, EdgePacing, SignalGenerator, Signals
 
 
 class CounterTrigger(BaseModel):
@@ -32,12 +34,18 @@ class CounterTrigger(BaseModel):
     The trigger frequency derives from ``Signals.duration + rest_time``.
     ``output`` optionally specifies the NI terminal to which the counter pulse is
     routed for downstream devices.
+
+    ``edge_source`` optionally names an NI input whose rising edges the same counter
+    can divide instead, for one finite run (``start_paced``). ``edge_filter_us`` is
+    the minimum pulse width of that input's digital filter; 0 leaves it unfiltered.
     """
 
     model_config = ConfigDict(frozen=True)
 
     type: Literal["counter"] = "counter"
     output: str | None = None
+    edge_source: str | None = None
+    edge_filter_us: float = Field(default=0.0, ge=0)
 
 
 class InputTrigger(BaseModel):
@@ -56,9 +64,14 @@ Trigger = Annotated[CounterTrigger | InputTrigger, Discriminator("type")]
 
 _TRIGGER_ADAPTER = TypeAdapter(Trigger)
 
-# stop() waits at most one cycle period plus this margin for the cycle in progress to end.
+# stop() and wait_until_done() wait at most one cycle period plus this margin for the
+# cycle in progress to end.
 _CYCLE_END_MARGIN_S = 0.1
 _CYCLE_END_POLL_S = 0.001
+
+# Each edge-divider pulse is high for this many source edges and low for the rest of
+# the divider; AO cycles start on its rising edge.
+_DIVIDER_HIGH_TICKS = 2
 
 
 class NiSignalGenerator(SignalGenerator):
@@ -71,6 +84,7 @@ class NiSignalGenerator(SignalGenerator):
 
     Omitting ``trigger`` selects ``CounterTrigger``. ``InputTrigger`` currently
     supports unbounded external pacing only; ``start(repeat=N)`` is unsupported.
+    A ``CounterTrigger`` with an ``edge_source`` supports ``start_paced``.
 
     Enables regeneration on the AO stream so each trigger can replay the same
     finite buffer.
@@ -96,14 +110,23 @@ class NiSignalGenerator(SignalGenerator):
         self._ao_channel_order: list[str] = []  # port names in the order NI applied them
         self._cycle_samples = 0  # AO samples per channel in one cycle
         self._cycle_period_s = 0.0  # duration + rest_time
+        self._counter_route: tuple[str, str] | None = None  # leased (counter, output PFI) paths
 
-        self._finite_repeat: int | None = None  # last start()'s repeat arg; None = continuous
+        self._finite_repeat: int | None = None  # cycles in the current finite run; None = continuous
+        self._edge_paced = False  # _co_task is the start_paced edge divider
 
     # ---- introspection ----
 
     @property
     def voltage_range(self) -> VoltageRange:
         return self._hub.voltage_range
+
+    @property
+    def edge_pacing(self) -> EdgePacing | None:
+        trigger = self._trigger
+        if not isinstance(trigger, CounterTrigger) or trigger.edge_source is None:
+            return None
+        return EdgePacing(source=trigger.edge_source, filter_s=trigger.edge_filter_us * 1e-6)
 
     # ---- hardware primitives ----
 
@@ -124,7 +147,12 @@ class NiSignalGenerator(SignalGenerator):
         # Input PFIs are validated but not exclusively claimed; an output PFI
         # driven by the counter is part of the lease.
         physical_output = trigger.output if isinstance(trigger, CounterTrigger) else None
-        physical_input_pins = (trigger.source,) if isinstance(trigger, InputTrigger) else ()
+        if isinstance(trigger, InputTrigger):
+            physical_input_pins = (trigger.source,)
+        elif trigger.edge_source is not None:
+            physical_input_pins = (trigger.edge_source,)
+        else:
+            physical_input_pins = ()
 
         lease = self._hub.reserve_ao_task(
             self.uid,
@@ -143,6 +171,7 @@ class NiSignalGenerator(SignalGenerator):
                 self._lease = None
                 raise RuntimeError("Counter-trigger reservation did not provide a counter and output route")
             counter_trigger_resources = (lease.counter_path, lease.output_pfi_path)
+        self._counter_route = counter_trigger_resources
 
         try:
             # Acquire the complete lease before creating any NI task. Keep task
@@ -189,6 +218,7 @@ class NiSignalGenerator(SignalGenerator):
             self._close_tasks_and_release(suppress_close_errors=True)
             if self._lease is None:
                 self._ao_channel_order = []
+                self._counter_route = None
             raise
 
     def _create_counter_trigger(
@@ -241,7 +271,9 @@ class NiSignalGenerator(SignalGenerator):
         self._close_tasks_and_release(suppress_close_errors=False)
         if self._lease is None:
             self._ao_channel_order = []
+            self._counter_route = None
             self._finite_repeat = None
+            self._edge_paced = False
 
     def _close_tasks_and_release(self, *, suppress_close_errors: bool) -> None:
         """Close every configured NI task before releasing the task-scoped lease.
@@ -304,6 +336,14 @@ class NiSignalGenerator(SignalGenerator):
         self._finite_repeat = repeat
 
     def wait_until_done(self, timeout_s: float) -> None:
+        """Wait up to ``timeout_s`` for the counter's finite run, then for its last AO cycle.
+
+        Raises:
+            RuntimeError: No finite run is active, or the AO did not generate exactly
+                one cycle per counter pulse (a pulse arrived while a cycle was still
+                playing, or the last cycle did not finish within one cycle period
+                plus 0.1 s).
+        """
         if self._finite_repeat is None:
             raise RuntimeError(
                 f"{self.uid}: wait_until_done requires a finite acquisition "
@@ -311,17 +351,25 @@ class NiSignalGenerator(SignalGenerator):
             )
         # The CO task is the finite one when repeat is set; retriggerable AO tasks
         # never report done on their own.
-        if self._co_task is not None:
-            self._co_task.wait_until_done(timeout=timeout_s)
-        else:
+        if self._co_task is None or self._ao_task is None:
             # Defensive: should not reach here — InputTrigger + repeat raises in start().
             raise RuntimeError(f"{self.uid}: no CO task to wait on (input-trigger path)")
+        self._co_task.wait_until_done(timeout=timeout_s)
+        # The counter's last pulse has started the last AO cycle, which may still be playing.
+        expected = self._finite_repeat * self._cycle_samples
+        generated = self._wait_for_generated(self._ao_task, lambda count: count >= expected)
+        if generated != expected:
+            raise RuntimeError(
+                f"{self.uid}: AO generated {generated} samples per channel, expected {expected} "
+                f"({self._finite_repeat} cycles of {self._cycle_samples})"
+            )
 
     def stop(self) -> None:
         """Stop the counter, let the AO cycle in progress finish, then stop the AO task.
 
         NI AO tasks hold the last generated sample on the DAC after stop, so a whole
-        cycle leaves every line on its rest sample.
+        cycle leaves every line on its rest sample. Ending an edge-paced run rebuilds
+        the periodic counter task, so ``start`` behaves as before ``start_paced``.
 
         Raises:
             RuntimeError: The cycle did not finish within one cycle period plus 0.1 s.
@@ -334,27 +382,147 @@ class NiSignalGenerator(SignalGenerator):
             self._finite_repeat = None
             return
         try:
-            finished = self._wait_for_cycle_end(ao_task)
+            # A retriggered AO task that was never triggered has generated zero samples.
+            generated = self._wait_for_generated(ao_task, lambda count: count % self._cycle_samples == 0)
         finally:
             ao_task.stop()
             self._finite_repeat = None
-        if not finished:
+            if self._edge_paced:
+                self._restore_counter_trigger()
+        if generated % self._cycle_samples:
             raise RuntimeError(
                 f"{self.uid}: AO output stopped mid-cycle after waiting "
                 f"{self._cycle_period_s + _CYCLE_END_MARGIN_S:.3f} s; the lines may not be at rest"
             )
 
-    def _wait_for_cycle_end(self, ao_task: NiTask) -> bool:
-        """Poll until the AO has generated a whole number of cycles; False on timeout.
-
-        A retriggered AO task that was never triggered has generated zero samples.
-        """
+    def _wait_for_generated(self, ao_task: NiTask, reached: Callable[[int], bool]) -> int:
+        """Poll the AO's generated-sample count until ``reached`` accepts it or one cycle
+        period plus a margin elapses; return the last count read."""
         deadline = time.monotonic() + self._cycle_period_s + _CYCLE_END_MARGIN_S
-        while ao_task.out_stream.total_samp_per_chan_generated % self._cycle_samples:
-            if time.monotonic() >= deadline:
-                return False
+        count = ao_task.out_stream.total_samp_per_chan_generated
+        while not reached(count) and time.monotonic() < deadline:
             time.sleep(_CYCLE_END_POLL_S)
-        return True
+            count = ao_task.out_stream.total_samp_per_chan_generated
+        return count
+
+    # ---- edge pacing ----
+
+    def start_paced(self, division: EdgeDivision) -> dict[str, float | int | str]:
+        """Play ``division.cycles`` AO cycles, each started by dividing the edge source.
+
+        The leased counter's periodic task is replaced by a finite pulse train clocked
+        by the edge source's rising edges: the first pulse after ``initial_delay``
+        edges, then one every ``divider`` edges. Its pulses reach the output PFI like
+        the periodic ones. On failure the generator is left stopped with its periodic
+        counter task.
+
+        Returns:
+            Readbacks after commit: ``filter_s`` (accepted minimum pulse width, 0 when
+            unfiltered), ``filter_clock_s`` (filter timebase period, 0 when unfiltered),
+            ``high_ticks``, ``low_ticks``, ``initial_delay_ticks``, ``source`` (counter
+            timebase terminal), and ``ao_trigger_source``.
+
+        Raises:
+            RuntimeError: Not set up, no ``edge_source`` configured, already edge-paced,
+                or the committed divider differs from the request.
+        """
+        ao_task = self._ao_task
+        lease = self._lease
+        pacing = self.edge_pacing
+        if ao_task is None or lease is None:
+            raise RuntimeError("start_paced() called before setup()")
+        if pacing is None:
+            raise RuntimeError(f"{self.uid}: start_paced requires a counter trigger with an edge_source")
+        if self._edge_paced:
+            raise RuntimeError(f"{self.uid}: an edge-paced run is already active; stop() it first")
+
+        source_path = lease.input_pfi_paths[0]
+        self._close_counter_task()
+        try:
+            divider, channel = self._create_edge_divider(source_path, pacing.filter_s, division)
+            readback = self._read_edge_divider(channel, source_path, pacing.filter_s, division)
+            readback["ao_trigger_source"] = ao_task.triggers.start_trigger.dig_edge_src
+            # AO arms first (waits for a trigger), then the divider starts counting edges.
+            ao_task.start()
+            divider.start()
+        except Exception:
+            try:
+                ao_task.stop()
+            finally:
+                self._restore_counter_trigger()
+            raise
+        self._finite_repeat = division.cycles
+        return readback
+
+    def _create_edge_divider(
+        self, source_path: str, filter_s: float, division: EdgeDivision
+    ) -> tuple[NiTask, COChannel]:
+        """Create and commit the finite edge-divider CO task on the leased counter."""
+        if self._counter_route is None:
+            raise RuntimeError("edge divider requires a leased counter")
+        counter_path, output_pfi_path = self._counter_route
+        divider = NiTask(f"{self.uid}_divider")
+        self._co_task = divider
+        self._edge_paced = True
+        channel = divider.co_channels.add_co_pulse_chan_ticks(
+            counter_path,
+            source_path,
+            idle_state=Level.LOW,
+            initial_delay=division.initial_delay,
+            low_ticks=division.divider - _DIVIDER_HIGH_TICKS,
+            high_ticks=_DIVIDER_HIGH_TICKS,
+        )
+        channel.co_pulse_term = output_pfi_path
+        channel.co_ctr_timebase_active_edge = Edge.RISING
+        channel.co_ctr_timebase_dig_fltr_enable = False
+        if filter_s > 0:
+            channel.co_ctr_timebase_dig_fltr_min_pulse_width = filter_s
+            channel.co_ctr_timebase_dig_fltr_enable = True
+        # DAQmx rejects the synchronizer and the digital filter enabled together
+        # (-200770); an enabled filter qualifies edges on its own clock, so only an
+        # unfiltered source is synchronized.
+        channel.co_ctr_timebase_dig_sync_enable = filter_s == 0
+        divider.timing.cfg_implicit_timing(sample_mode=NiAcqType.FINITE, samps_per_chan=division.cycles)
+        divider.control(TaskMode.TASK_COMMIT)
+        return divider, channel
+
+    def _read_edge_divider(
+        self, channel: COChannel, source_path: str, filter_s: float, division: EdgeDivision
+    ) -> dict[str, float | int | str]:
+        """Check the committed divider against the request and return its readbacks."""
+        ticks = (channel.co_pulse_high_ticks, channel.co_pulse_low_ticks, channel.co_pulse_ticks_initial_delay)
+        expected_ticks = (_DIVIDER_HIGH_TICKS, division.divider - _DIVIDER_HIGH_TICKS, division.initial_delay)
+        for name, actual, expected in (
+            ("high/low/initial-delay ticks", ticks, expected_ticks),
+            ("timebase source", channel.co_ctr_timebase_src, source_path),
+            ("timebase edge", channel.co_ctr_timebase_active_edge, Edge.RISING),
+            ("filter enable", channel.co_ctr_timebase_dig_fltr_enable, filter_s > 0),
+        ):
+            if actual != expected:
+                raise RuntimeError(f"{self.uid}: edge divider {name} read back {actual!r}, expected {expected!r}")
+        filtered = filter_s > 0
+        return {
+            "filter_s": channel.co_ctr_timebase_dig_fltr_min_pulse_width if filtered else 0.0,
+            "filter_clock_s": 1.0 / channel.co_ctr_timebase_dig_fltr_timebase_rate if filtered else 0.0,
+            "high_ticks": ticks[0],
+            "low_ticks": ticks[1],
+            "initial_delay_ticks": ticks[2],
+            "source": channel.co_ctr_timebase_src,
+        }
+
+    def _close_counter_task(self) -> None:
+        if self._co_task is not None:
+            self._co_task.close()
+            self._co_task = None
+
+    def _restore_counter_trigger(self) -> None:
+        """Replace the edge divider with the periodic counter task built by ``setup``."""
+        if self._counter_route is None:
+            raise RuntimeError("periodic counter trigger requires a leased counter")
+        self._close_counter_task()
+        counter_path, output_pfi_path = self._counter_route
+        self._create_counter_trigger(counter_path, 1.0 / self._cycle_period_s, output_pfi_path)
+        self._edge_paced = False
 
     def can_hotswap(self, old: Signals | None, new: Signals) -> bool:
         """Always False for this driver — every load takes the full rebuild path.
