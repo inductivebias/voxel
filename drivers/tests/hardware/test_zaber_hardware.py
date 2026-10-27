@@ -1,12 +1,15 @@
 import asyncio
+import json
 import math
 import os
+from dataclasses import asdict
 
 import pytest
 
 pytest.importorskip("zaber_motion", reason="needs the vxl-drivers `zaber` extra")
 
-from vxl_drivers.axes.zaber import ZaberHub, ZaberLinearAxis
+from vxl_drivers.axes.zaber import ZaberHub
+from vxl_drivers.axes.zaber_probe import probe_zaber
 
 from rigup import DeviceConfig, Rig, RigConfig
 from vxl.devices.axes.continuous.handle import ContinuousAxisHandle
@@ -37,39 +40,9 @@ def _open_hub(uid: str) -> ZaberHub:
 
 
 def test_zaber_hardware_reads_all_axes_without_moving_or_changing_settings() -> None:
-    hub = _open_hub("zaber_hardware_test")
-    axes: list[ZaberLinearAxis] = []
-    try:
-        serial = int(os.environ[DEVICE_SERIAL_VAR])
-        device = hub.device(serial)
-        assert device.axis_count > 0
-
-        for axis_number in range(1, device.axis_count + 1):
-            axis = ZaberLinearAxis(
-                f"zaber_axis_{axis_number}",
-                hub=hub,
-                device_serial=serial,
-                axis_number=axis_number,
-            )
-            axes.append(axis)
-            assert axis.lower_limit < axis.upper_limit
-            assert math.isfinite(axis.device_position)
-            assert not axis.is_moving
-            assert axis.peripheral_name
-            assert axis.peripheral_serial_number > 0
-            print(
-                f"Zaber device={axis.device_name!r} serial={axis.serial_number} "
-                f"axis={axis.axis_number} peripheral={axis.peripheral_name!r} "
-                f"peripheral_serial={axis.peripheral_serial_number} "
-                f"device_position_um={axis.device_position} "
-                f"limits_um=[{axis.lower_limit}, {axis.upper_limit}] homed={axis.is_homed} "
-                f"within_limits={axis.position_within_limits}"
-            )
-    finally:
-        # Mirror Rigup's current hub-before-dependent teardown order.
-        hub.close()
-        for axis in axes:
-            axis.close()
+    result = probe_zaber(serial=int(os.environ[DEVICE_SERIAL_VAR]), **_connection_args())
+    assert result.axes
+    print(json.dumps(asdict(result)))
 
 
 def test_zaber_hardware_builds_every_axis_through_one_rig_hub_then_closes() -> None:

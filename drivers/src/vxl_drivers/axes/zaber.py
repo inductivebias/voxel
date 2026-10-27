@@ -651,9 +651,7 @@ class ZaberHub(Device[DeviceType]):
         self._close_connection_when_idle()
 
     def close(self) -> None:
-        # Rigup currently closes devices in registration order, which can put a
-        # shared hub before its dependent axes. Keep the connection alive until
-        # every axis has had a chance to halt and release its reservation.
+        # Keep the connection alive even when a caller closes the shared hub before its axes.
         with self._reservation_lock:
             self._close_requested = True
         self._close_connection_when_idle()

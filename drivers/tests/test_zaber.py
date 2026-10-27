@@ -7,6 +7,7 @@ import pytest
 pytest.importorskip("zaber_motion", reason="needs the vxl-drivers `zaber` extra")
 
 from vxl_drivers.axes import zaber
+from vxl_drivers.axes.zaber_probe import probe_zaber
 from zaber_motion.exceptions import CommandFailedException, CommandFailedExceptionData, RequestTimeoutException
 
 from rigup import DeviceConfig, Rig, RigConfig
@@ -257,6 +258,29 @@ def install_connection(monkeypatch: pytest.MonkeyPatch, connection: FakeConnecti
         return connection
 
     monkeypatch.setattr(zaber, "open_zaber_connection", open_connection)
+
+
+def test_probe_zaber_reads_identity_without_axis_writes_and_closes_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    axis = FakeAxis(1)
+    connection = FakeConnection([FakeDevice(12345, [axis])])
+    install_connection(monkeypatch, connection)
+    result = probe_zaber(serial=12345, host="controller.invalid")
+    assert result.serial == 12345
+    assert len(result.axes) == 1
+    assert result.axes[0].position_um == 25000
+    assert not axis.settings.set_calls
+    assert not axis.move_absolute_calls
+    assert not axis.move_relative_calls
+    assert not axis.home_calls
+    assert connection.closed
+
+
+def test_probe_zaber_wrong_identity_fails_and_closes_connection(monkeypatch: pytest.MonkeyPatch) -> None:
+    connection = FakeConnection([FakeDevice(12345, [FakeAxis(1)])])
+    install_connection(monkeypatch, connection)
+    with pytest.raises(zaber.ZaberDiscoveryError, match="was not detected"):
+        probe_zaber(serial=67890, host="controller.invalid")
+    assert connection.closed
 
 
 def zaber_rig_config(**axes: dict[str, Any]) -> RigConfig:
