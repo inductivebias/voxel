@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("zaber_motion", reason="needs the vxl-drivers `zaber` extra")
 
 from vxl_drivers.axes import zaber
-from zaber_motion.exceptions import CommandFailedException, CommandFailedExceptionData
+from zaber_motion.exceptions import CommandFailedException, CommandFailedExceptionData, RequestTimeoutException
 
 from rigup import DeviceConfig, Rig, RigConfig
 from vxl.devices.axes.continuous import StepMode, TriggerMode, TTLStepperConfig
@@ -16,6 +16,20 @@ from vxl.devices.axes.continuous.handle import ContinuousAxisHandle
 NATIVE_PER_UM = 10
 TTL_CONFIG = {"ttl_input": 1, "ttl_trigger": 1, "ttl_status_output": 1, "ttl_status_trigger": 2}
 RELATIVE = TTLStepperConfig(step_mode=StepMode.RELATIVE)
+NATIVE = zaber.Units.NATIVE
+S = zaber.SettingConstants
+# Settings the fake stores in micrometres (or per second); natively they are NATIVE_PER_UM times larger.
+# The rest are unitless and stored natively.
+SCALED = {
+    S.POS,
+    S.LIMIT_MIN,
+    S.LIMIT_MAX,
+    S.LIMIT_HOME_PRESET,
+    S.MAXSPEED,
+    S.ACCEL,
+    S.MOTION_ACCELONLY,
+    S.MOTION_DECELONLY,
+}
 
 
 class FakeSettings:
@@ -24,15 +38,26 @@ class FakeSettings:
         self.set_calls: list[tuple[str, float, object]] = []
         self.get_calls: list[str] = []
         self.conversions: list[tuple[str, float, object]] = []
+        self.accel_sets_decel = True
+        self.fail_set: set[str] = set()
 
-    def get(self, setting: str, unit: object) -> float:
-        del unit
+    def get(self, setting: str, unit: object = NATIVE) -> float:
         self.get_calls.append(setting)
-        return self.values[setting]
+        # Like the controller, the accel alias reads back acceleration only.
+        value = self.values[S.MOTION_ACCELONLY if setting == S.ACCEL else setting]
+        return value * NATIVE_PER_UM if unit is NATIVE and setting in SCALED else value
 
-    def set(self, setting: str, value: float, unit: object) -> None:
-        self.values[setting] = value
+    def set(self, setting: str, value: float, unit: object = NATIVE) -> None:
         self.set_calls.append((setting, value, unit))
+        if setting in self.fail_set:
+            raise RuntimeError(f"{setting} write failed")
+        stored = value / NATIVE_PER_UM if unit is NATIVE and setting in SCALED else value
+        if setting == S.ACCEL:
+            self.values[S.MOTION_ACCELONLY] = stored
+            if self.accel_sets_decel:
+                self.values[S.MOTION_DECELONLY] = stored
+        else:
+            self.values[setting] = stored
 
     def has_setting(self, setting: str) -> bool:
         return setting in self.values
@@ -41,6 +66,10 @@ class FakeSettings:
         self.conversions.append((setting, value, unit))
         native = value * NATIVE_PER_UM
         return float(round(native)) if options.get("round") else native
+
+    def convert_from_native_units(self, setting: str, value: float, unit: object) -> float:
+        del setting, unit
+        return value / NATIVE_PER_UM
 
 
 class FakeTrigger:
@@ -87,6 +116,9 @@ class FakeTriggers:
     def get_trigger(self, number: int) -> FakeTrigger:
         return self.by_number[number]
 
+    def get_enabled_states(self) -> list[SimpleNamespace]:
+        return [SimpleNamespace(enabled=trigger.enabled) for trigger in self.by_number.values()]
+
 
 class FakeIO:
     def __init__(self) -> None:
@@ -114,14 +146,24 @@ class FakeAxis:
                 zaber.SettingConstants.LIMIT_MIN: 0.0,
                 zaber.SettingConstants.LIMIT_MAX: 100_000.0,
                 zaber.SettingConstants.MAXSPEED: 10_000.0,
-                zaber.SettingConstants.ACCEL: 20_000.0,
+                zaber.SettingConstants.MOTION_ACCELONLY: 20_000.0,
+                zaber.SettingConstants.MOTION_DECELONLY: 20_000.0,
                 zaber.SettingConstants.LIMIT_HOME_PRESET: 0.0,
                 zaber.SettingConstants.POS: position,
+                zaber.SettingConstants.ENCODER_PORT_DEFAULT: 2,
+                zaber.SettingConstants.CLOOP_ENABLE: 1,
+                zaber.SettingConstants.MOTION_ACCEL_RAMPTIME: 0,
+                "encoder.2.out.enable": 0,
+                "encoder.2.out.interpolation": 4,
+                "encoder.2.out.width": 25,
             }
         )
         self.position = position
+        self.encoder_error = 0.0  # Measured encoder position minus the planned position.
         self.busy = False
         self.homed = True
+        self.flags: set[str] = set()
+        self.warnings = SimpleNamespace(get_flags=lambda: set(self.flags))
         self.move_absolute_calls: list[tuple[float, object, bool]] = []
         self.move_relative_calls: list[tuple[float, object, bool]] = []
         self.home_calls: list[bool] = []
@@ -130,6 +172,12 @@ class FakeAxis:
     def get_position(self, unit: object) -> float:
         del unit
         return self.position
+
+    def generic_command(self, command: str) -> SimpleNamespace:
+        measured = self.position + self.encoder_error
+        positions = {"pos": self.position, "encoder.pos": measured, "encoder.2.pos": measured}
+        names = command.removeprefix("get ").split()
+        return SimpleNamespace(data=" ; ".join(str(round(positions[name] * NATIVE_PER_UM)) for name in names))
 
     def _reject_outside_limits(self, command: str, target: float) -> None:
         limits = self.settings.values
@@ -706,3 +754,307 @@ def test_zaber_axes_share_one_rig_hub_and_step_through_voxel_calls(
     asyncio.run(asyncio.wait_for(run(), timeout=5.0))
     assert not step.enabled
     assert connection.closed
+
+
+SCAN_CONFIG = {
+    "scan_encoder": 2,
+    "scan_interpolation": 4,
+    "scan_output_width_ns": 1000,
+    "scan_scale_period": 20.0,
+    "scan_acceleration": 50_000.0,
+}
+SCAN_START = 25_000.0  # FakeAxis(1)'s position.
+SCAN_TARGET = 30_000.0
+VELOCITY_UM = zaber.Units.VELOCITY_MICROMETRES_PER_SECOND
+ACCELERATION_UM = zaber.Units.ACCELERATION_MICROMETRES_PER_SECOND_SQUARED
+
+
+def scan_axis(
+    hub: zaber.ZaberHub, monkeypatch: pytest.MonkeyPatch, **overrides: Any
+) -> tuple[zaber.ZaberLinearAxis, zaber.ZaberContinuousScanner]:
+    monkeypatch.setattr(zaber, "_SCAN_OUTPUT_SETTLE_S", 0.0)
+    config = {**SCAN_CONFIG, **overrides}
+    axis = zaber.ZaberLinearAxis("x_axis", hub=hub, device_serial=12345, axis_number=1, **config)
+    scanner = axis.get_continuous_scanner()
+    assert isinstance(scanner, zaber.ZaberContinuousScanner)
+    return axis, scanner
+
+
+def test_zaber_continuous_scanner_forces_encoder_output_off_on_open_and_close(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub, _connection, x_sdk, y_sdk = controller
+    x_sdk.settings.values["encoder.2.out.enable"] = 1  # Left on by an earlier session.
+    y_sdk.settings.values["encoder.2.out.enable"] = 1
+
+    axis, scanner = scan_axis(hub, monkeypatch)
+    assert x_sdk.settings.values["encoder.2.out.enable"] == 0, "opening the axis must turn the output off"
+    plain = zaber.ZaberLinearAxis("y_axis", hub=hub, device_serial=12345, axis_number=2)
+    assert plain.get_continuous_scanner() is None, "axes without scan settings keep Voxel's no-scanner path"
+    assert not y_sdk.settings.set_calls
+
+    scanner.prepare(start=SCAN_START, speed=2_000.0)
+    scanner.start(SCAN_TARGET)
+    axis.close()
+    plain.close()
+    assert x_sdk.stop_calls[0] is False, "closing mid-scan halts the axis before restoring its settings"
+    assert x_sdk.settings.values["encoder.2.out.enable"] == 0, "closing the axis must turn the output off"
+    assert x_sdk.settings.values[S.MAXSPEED] == 10_000.0
+    hub.close()
+
+
+def test_zaber_continuous_scan_set_verifies_its_settings_then_restores_them_output_first(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub, _connection, x_sdk, _y_sdk = controller
+    axis, scanner = scan_axis(hub, monkeypatch)
+    settings = x_sdk.settings
+    # Interpolation 4 of a 20 um period: 5 um X4 counts, 20 um per A edge, and 5 m/s at 1000 ns.
+    assert (scanner.info.edge_spacing, scanner.info.acceleration) == (20.0, 50_000.0)
+    assert scanner.info.max_speed == pytest.approx(0.9 * 5e6)
+    assert axis.speed == 10_000.0  # Cached for a second.
+    settled: list[tuple[float, float]] = []
+    monkeypatch.setattr(zaber, "_SCAN_OUTPUT_SETTLE_S", 0.2)
+    monkeypatch.setattr(
+        zaber.time, "sleep", lambda seconds: settled.append((seconds, settings.values["encoder.2.out.enable"]))
+    )
+    settings.set_calls.clear()
+
+    state = scanner.prepare(start=SCAN_START, speed=2_000.0)
+
+    assert state["position"] == state["encoder_position"] == state["exported_encoder_position"] == SCAN_START
+    assert state["origin"] == state["exported_encoder_position"], "a DAQ counts the exported encoder from here"
+    assert [(name, value, unit) for name, value, unit in settings.set_calls] == [
+        ("encoder.2.out.interpolation", 4, NATIVE),
+        ("encoder.2.out.width", 1000, NATIVE),
+        (S.MAXSPEED, 2_000.0, VELOCITY_UM),
+        (S.ACCEL, 50_000.0, ACCELERATION_UM),
+        ("encoder.2.out.enable", 1, NATIVE),
+    ]
+    assert settled == [(0.2, 1)], "the output settles after it is enabled"
+    assert axis.speed == 2_000.0, "the scan's speed write must not hide behind the settings cache"
+    with pytest.raises(RuntimeError, match="already prepared"):
+        scanner.prepare(start=SCAN_START, speed=2_000.0)
+
+    scanner.start(SCAN_TARGET)
+    assert x_sdk.move_absolute_calls == [(SCAN_TARGET, zaber.Units.LENGTH_MICROMETRES, False)]
+    with pytest.raises(RuntimeError, match="already started"):
+        scanner.start(SCAN_TARGET)
+    assert scanner.is_scanning()
+    x_sdk.busy = False
+    assert not scanner.is_scanning()
+    settings.set_calls.clear()
+
+    final = scanner.finish(SCAN_TARGET)
+
+    assert final["position"] == SCAN_TARGET
+    assert final["status_poll_timeouts"] == 0
+    assert settings.set_calls == [
+        ("encoder.2.out.enable", 0, NATIVE),
+        ("encoder.2.out.interpolation", 4, NATIVE),
+        ("encoder.2.out.width", 25, NATIVE),
+        (S.MAXSPEED, 100_000.0, NATIVE),
+        (S.MOTION_ACCELONLY, 200_000.0, NATIVE),
+        (S.MOTION_DECELONLY, 200_000.0, NATIVE),
+    ]
+    assert axis.speed == 10_000.0
+    axis.close()
+    hub.close()
+
+
+def _enable_trigger(_sdk: FakeAxis, device: FakeDevice) -> None:
+    device.triggers.by_number[3].enabled = True
+
+
+@pytest.mark.parametrize(
+    ("change", "speed", "message"),
+    [
+        (lambda sdk, _device: setattr(sdk, "homed", False), 2_000.0, "homed"),
+        (lambda sdk, _device: setattr(sdk, "busy", True), 2_000.0, "idle"),
+        (lambda sdk, _device: sdk.flags.add("FS"), 2_000.0, "warning-free"),
+        (
+            lambda sdk, _device: setattr(sdk, "position", SCAN_START + 1.5),
+            2_000.0,
+            r"position 25001\.5 um is not within",
+        ),
+        (lambda sdk, _device: setattr(sdk, "encoder_error", -1.5), 2_000.0, r"encoder position 24998\.5 um"),
+        (_enable_trigger, 2_000.0, "disable every Zaber trigger"),
+        (lambda sdk, _device: sdk.settings.values.update({"encoder.2.out.enable": 1}), 2_000.0, "already on"),
+        (lambda sdk, _device: sdk.settings.values.update({S.ENCODER_PORT_DEFAULT: 1}), 2_000.0, "follows encoder 1"),
+        (lambda sdk, _device: sdk.settings.values.update({S.CLOOP_ENABLE: 0}), 2_000.0, "closed-loop"),
+        (lambda sdk, _device: sdk.settings.values.update({S.MOTION_ACCEL_RAMPTIME: 10}), 2_000.0, "ramptime"),
+        (lambda sdk, _device: sdk.settings.values.update({S.LIMIT_MIN: 26_000.0}), 2_000.0, "outside limits"),
+        (lambda _sdk, _device: None, 4.6e6, r"outside \(0, 4\.5e\+06\]"),
+        (lambda _sdk, _device: None, float("nan"), "outside"),
+    ],
+)
+def test_zaber_continuous_scan_prepare_refusal_changes_no_setting_and_moves_nothing(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+    change: Any,
+    speed: float,
+    message: str,
+) -> None:
+    hub, connection, x_sdk, _y_sdk = controller
+    axis, scanner = scan_axis(hub, monkeypatch)
+    change(x_sdk, connection.devices[0])
+    x_sdk.settings.set_calls.clear()
+
+    with pytest.raises((RuntimeError, ValueError), match=message):
+        scanner.prepare(start=SCAN_START, speed=speed)
+
+    assert not x_sdk.settings.set_calls
+    assert not x_sdk.move_absolute_calls
+    with pytest.raises(RuntimeError, match="prepare the continuous scan first"):
+        scanner.start(SCAN_TARGET)
+    axis.close()
+    hub.close()
+
+
+def test_zaber_continuous_scan_decelonly_mismatch_refused_and_restored(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub, _connection, x_sdk, _y_sdk = controller
+    axis, scanner = scan_axis(hub, monkeypatch)
+    original = dict(x_sdk.settings.values)
+    x_sdk.settings.accel_sets_decel = False
+
+    with pytest.raises(RuntimeError, match=r"motion\.decelonly reads back 200000, not 500000"):
+        scanner.prepare(start=SCAN_START, speed=2_000.0)
+
+    assert x_sdk.settings.values == original, "a failed prepare restores everything it changed"
+    assert not x_sdk.move_absolute_calls
+    x_sdk.settings.accel_sets_decel = True
+    scanner.prepare(start=SCAN_START, speed=2_000.0)
+    scanner.reset()
+    axis.close()
+    hub.close()
+
+
+@pytest.mark.parametrize("dropped", [3, 4])
+def test_zaber_continuous_scan_status_poll_tolerates_three_consecutive_timeouts(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+    dropped: int,
+) -> None:
+    hub, _connection, x_sdk, _y_sdk = controller
+    axis, scanner = scan_axis(hub, monkeypatch)
+    scanner.prepare(start=SCAN_START, speed=2_000.0)
+    scanner.start(SCAN_TARGET)
+    x_sdk.busy = False
+    remaining = [dropped]
+    real_is_busy = x_sdk.is_busy
+
+    def is_busy() -> bool:
+        if remaining[0]:
+            remaining[0] -= 1
+            raise RequestTimeoutException("Device has not responded in given timeout")
+        return real_is_busy()
+
+    monkeypatch.setattr(x_sdk, "is_busy", is_busy)
+    if dropped > 3:
+        with pytest.raises(RequestTimeoutException):
+            scanner.is_scanning()
+        scanner.reset()
+    else:
+        assert not scanner.is_scanning()
+        assert scanner.finish(SCAN_TARGET)["status_poll_timeouts"] == 3
+    axis.close()
+    hub.close()
+
+
+def test_zaber_continuous_scan_finish_requires_the_axis_settled_at_target(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub, _connection, x_sdk, _y_sdk = controller
+    axis, scanner = scan_axis(hub, monkeypatch)
+    scanner.prepare(start=SCAN_START, speed=2_000.0)
+    scanner.start(SCAN_TARGET)
+
+    with pytest.raises(RuntimeError, match="must be idle"):
+        scanner.finish(SCAN_TARGET)
+    x_sdk.busy = False
+    x_sdk.encoder_error = 1.5
+    with pytest.raises(RuntimeError, match=r"encoder position 30001\.5 um is not within 1 um"):
+        scanner.finish(SCAN_TARGET)
+    x_sdk.encoder_error = 0.0
+    x_sdk.flags.add("FS")
+    with pytest.raises(RuntimeError, match="warning-free"):
+        scanner.finish(SCAN_TARGET)
+    assert x_sdk.settings.values["encoder.2.out.enable"] == 1, "an unsettled finish leaves restoration to reset"
+
+    x_sdk.flags.clear()
+    scanner.finish(SCAN_TARGET)
+    assert x_sdk.settings.values["encoder.2.out.enable"] == 0
+    axis.close()
+    hub.close()
+
+
+def test_zaber_continuous_scan_reset_attempts_every_step_and_is_idempotent(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub, _connection, x_sdk, _y_sdk = controller
+    axis, scanner = scan_axis(hub, monkeypatch)
+    settings = x_sdk.settings
+    scanner.prepare(start=SCAN_START, speed=2_000.0)
+    scanner.start(SCAN_TARGET)
+    settings.fail_set = {"encoder.2.out.width"}
+    settings.set_calls.clear()
+
+    with pytest.raises(RuntimeError, match=r"restore: could not restore .*encoder\.2\.out\.width: .*write failed"):
+        scanner.reset()
+
+    assert x_sdk.stop_calls == [False], "reset halts the moving axis first"
+    assert [name for name, _value, _unit in settings.set_calls] == [
+        "encoder.2.out.enable",
+        "encoder.2.out.interpolation",
+        "encoder.2.out.width",
+        S.MAXSPEED,
+        S.MOTION_ACCELONLY,
+        S.MOTION_DECELONLY,
+        "encoder.2.out.enable",
+    ], "one failed restore must not stop the others, and the output is forced off last"
+    assert settings.values[S.MAXSPEED] == 10_000.0
+    assert settings.values["encoder.2.out.enable"] == 0
+
+    settings.fail_set.clear()
+    scanner.reset()
+    assert settings.values["encoder.2.out.width"] == 25, "a later reset retries what failed"
+    settings.set_calls.clear()
+    scanner.reset()
+    assert settings.set_calls == [("encoder.2.out.enable", 0, NATIVE)]
+    assert x_sdk.stop_calls == [False]
+    axis.close()
+    hub.close()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        ({"scan_acceleration": None}, "configure scan_encoder, .* together"),
+        ({"scan_interpolation": 6}, "6 is not a Zaber encoder output interpolation"),
+        ({"scan_encoder": 0}, "scan_encoder must be positive"),
+        ({"scan_output_width_ns": 0}, "scan_output_width_ns must be positive"),
+        ({"scan_scale_period": -20.0}, "scan_scale_period must be finite and positive"),
+        ({"scan_acceleration": float("nan")}, "scan_acceleration must be finite and positive"),
+    ],
+)
+def test_zaber_linear_axis_invalid_scan_config_rejected_without_leaking_the_axis(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+    overrides: dict[str, Any],
+    message: str,
+) -> None:
+    hub, _connection, x_sdk, _y_sdk = controller
+
+    with pytest.raises(ValueError, match=message):
+        scan_axis(hub, monkeypatch, **overrides)
+
+    assert hub.reserve_axis(12345, 1) is x_sdk, "a rejected configuration must release its axis"
+    hub.release_axis(12345, 1)
+    hub.close()

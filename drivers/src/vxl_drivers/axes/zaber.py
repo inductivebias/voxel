@@ -18,11 +18,13 @@ from zaber_motion.ascii import (
     TriggerCondition,
 )
 from zaber_motion.ascii import Device as ZaberDevice
-from zaber_motion.exceptions import CommandFailedException
+from zaber_motion.exceptions import CommandFailedException, RequestTimeoutException
 
 from rigup import Device, describe
 from vxl.devices.axes.continuous import (
     ContinuousAxis,
+    ContinuousScanInfo,
+    ContinuousScanner,
     StepMode,
     TriggerMode,
     TTLStepper,
@@ -41,6 +43,24 @@ _RESET_ATTEMPTS = 2
 _STEP_TOLERANCE = 1e-3
 # Long enough for the return interface and an NI PFI input to register the pulse.
 _STATUS_PULSE_MS = 1
+# encoder.<n>.out.interpolation values Zaber controllers accept.
+# fmt: off
+_OUTPUT_INTERPOLATIONS = (
+    4, 8, 16, 20, 32, 40, 64, 80, 100, 128, 160, 200,
+    256, 400, 500, 512, 800, 1000, 1024, 2000, 2048, 4000, 4096,
+)
+# fmt: on
+# A closed-loop stage's velocity ripples around the commanded speed, and the output cannot follow
+# transitions closer together than its minimum width, so scans stay 10% below that rate limit.
+_SCAN_SPEED_MARGIN = 0.9
+# Lets the output-enable transition settle before a DAQ takes its zero-count baseline.
+_SCAN_OUTPUT_SETTLE_S = 0.2
+# Consecutive unanswered status polls tolerated during a scan. The DAQ, not this poll, records the
+# scan, so one lost reply on a lossy controller link must not abort it.
+_SCAN_POLL_RETRIES = 3
+_SCAN_STOP_TIMEOUT_S = 5.0
+# How far the planned and measured positions may be from a scan's start or target: 1 µm in each unit.
+_SCAN_POSITION_TOLERANCE = {"nm": 1000.0, "um": 1.0, "mm": 0.001}
 
 # Position, velocity, and acceleration units for each configurable length unit.
 _UNITS = {
@@ -106,6 +126,14 @@ def _validate_ttl_config(
         raise ValueError("ttl_status_output requires ttl_input")
     if step_trigger is not None and step_trigger == status_trigger:
         raise ValueError("ttl_trigger and ttl_status_trigger must be different triggers")
+
+
+def _validate_scan_config(*values: float | None) -> None:
+    if any(value is None for value in values) and any(value is not None for value in values):
+        raise ValueError(
+            "configure scan_encoder, scan_interpolation, scan_output_width_ns, scan_scale_period "
+            "and scan_acceleration together"
+        )
 
 
 def _check_channel(name: str, number: int, count: int) -> None:
@@ -254,6 +282,292 @@ class ZaberTTLStepper(TTLStepper):
             ) from failures[0]
 
 
+class ZaberContinuousScanner(ContinuousScanner):
+    """Move a Zaber axis once at constant speed while its controller exports encoder ``encoder`` as TTL A/B.
+
+    Zaber's output interpolation counts X4 quadrature transitions per ``scale_period`` of the analog
+    encoder, so the axis travels ``4 * scale_period / interpolation`` per A rising edge. Successive A/B
+    transitions are at least ``output_width_ns`` apart, which caps the speed at
+    ``scale_period / (interpolation * output_width_ns)``; ``info.max_speed`` keeps a margin below that.
+    The output is forced off when the scanner is created and is on only from a successful ``prepare``
+    until ``finish`` or ``reset``.
+    """
+
+    def __init__(
+        self,
+        *,
+        lock: threading.RLock,
+        axis: Axis,
+        units: str,
+        encoder: int,
+        interpolation: int,
+        output_width_ns: int,
+        scale_period: float,
+        acceleration: float,
+        invalidate_settings: Callable[[], None],
+    ) -> None:
+        if encoder < 1:
+            raise ValueError(f"scan_encoder must be positive, got {encoder}")
+        if interpolation not in _OUTPUT_INTERPOLATIONS:
+            raise ValueError(
+                f"scan_interpolation {interpolation} is not a Zaber encoder output interpolation; "
+                f"use one of {', '.join(map(str, _OUTPUT_INTERPOLATIONS))}"
+            )
+        if output_width_ns < 1:
+            raise ValueError(f"scan_output_width_ns must be positive, got {output_width_ns}")
+        for name, value in (("scan_scale_period", scale_period), ("scan_acceleration", acceleration)):
+            if not math.isfinite(value) or value <= 0:
+                raise ValueError(f"{name} must be finite and positive, got {value}")
+        self._lock = lock
+        self._axis = axis
+        self._device = axis.device
+        self._units = units
+        self._position_unit, self._velocity_unit, self._acceleration_unit = _UNITS[units]
+        self._tolerance = _SCAN_POSITION_TOLERANCE[units]
+        self._encoder = encoder
+        self._enable = f"encoder.{encoder}.out.enable"
+        self._interpolation = interpolation
+        self._output_width_ns = output_width_ns
+        self._acceleration = acceleration
+        self._invalidate_settings = invalidate_settings
+        rate_limit = scale_period / (interpolation * output_width_ns * 1e-9)
+        self._info = ContinuousScanInfo(
+            edge_spacing=4 * scale_period / interpolation,
+            acceleration=acceleration,
+            max_speed=_SCAN_SPEED_MARGIN * rate_limit,
+        )
+        # Output enable first, so restoring in order turns the output off before any other change.
+        self._changed = (
+            self._enable,
+            f"encoder.{encoder}.out.interpolation",
+            f"encoder.{encoder}.out.width",
+            SettingConstants.MAXSPEED,
+            SettingConstants.MOTION_ACCELONLY,
+            SettingConstants.MOTION_DECELONLY,
+        )
+        self._originals: dict[str, float] | None = None  # Native values, held from prepare until restored.
+        self._started = False
+        self._status_timeouts = 0
+        # Never inherit an output that an earlier session left enabled.
+        self.reset()
+
+    @property
+    def info(self) -> ContinuousScanInfo:
+        return self._info
+
+    def _verify_native(self, name: str, expected: float) -> float:
+        with self._lock:
+            actual = self._axis.settings.get(name)
+        if actual != expected:
+            raise RuntimeError(f"Zaber {name} reads back {actual:g}, not {expected:g}")
+        return actual
+
+    def _set_verified(self, name: str, value: float, unit: Units = Units.NATIVE) -> float:
+        """Write one setting and require the native value the controller should store for it."""
+        settings = self._axis.settings
+        with self._lock:
+            expected = value
+            if unit is not Units.NATIVE:
+                expected = settings.convert_to_native_units(name, value, unit, round=True)
+            try:
+                settings.set(name, value, unit)
+            finally:
+                self._invalidate_settings()
+            return self._verify_native(name, expected)
+
+    def _state(self) -> dict[str, Any]:
+        # One grouped get samples the planned, measured and exported encoder positions together.
+        names = (SettingConstants.POS, SettingConstants.ENCODER_POS, f"encoder.{self._encoder}.pos")
+        with self._lock:
+            reply = self._axis.generic_command(f"get {' '.join(names)}").data
+            try:
+                native = [float(value) for value in reply.split(";")]
+            except ValueError:
+                native = []
+            if len(native) != len(names) or not all(math.isfinite(value) for value in native):
+                raise RuntimeError(f"Zaber returned an invalid position reply {reply!r}")
+            position, encoder_position, exported_position = (
+                self._axis.settings.convert_from_native_units(name, value, self._position_unit)
+                for name, value in zip(names, native, strict=True)
+            )
+            return {
+                "position": position,
+                "encoder_position": encoder_position,
+                "exported_encoder_position": exported_position,
+                "moving": self._axis.is_busy(),
+                "homed": self._axis.is_homed(),
+                "warnings": sorted(self._axis.warnings.get_flags()),
+            }
+
+    def _check_within_limits(self, name: str, position: float) -> None:
+        settings = self._axis.settings
+        with self._lock:
+            lower = settings.get(SettingConstants.LIMIT_MIN, self._position_unit)
+            upper = settings.get(SettingConstants.LIMIT_MAX, self._position_unit)
+        if not lower <= position <= upper:
+            raise ValueError(f"scan {name} {position:g} {self._units} is outside limits [{lower:g}, {upper:g}]")
+
+    def _check_settled(self, state: dict[str, Any], name: str, position: float) -> None:
+        if state["moving"] or not state["homed"] or state["warnings"]:
+            raise RuntimeError(
+                f"the axis must be idle, homed and warning-free at the scan {name}; "
+                f"moving={state['moving']}, homed={state['homed']}, warnings={state['warnings']}"
+            )
+        for key in ("position", "encoder_position"):
+            if abs(state[key] - position) > self._tolerance:
+                raise RuntimeError(
+                    f"{key.replace('_', ' ')} {state[key]:g} {self._units} is not within "
+                    f"{self._tolerance:g} {self._units} of the scan {name} {position:g}"
+                )
+
+    def _check_ready(self, start: float) -> dict[str, Any]:
+        """Read-only checks before prepare changes anything; returns the axis state."""
+        with self._lock:
+            if any(trigger.enabled for trigger in self._device.triggers.get_enabled_states()):
+                raise RuntimeError("disable every Zaber trigger before scanning; reset any TTL stepper first")
+            state = self._state()
+            self._check_settled(state, "start", start)
+            settings = self._axis.settings
+            if settings.get(self._enable) != 0:
+                raise RuntimeError(f"{self._enable} is already on; another scan or tool is using the output")
+            default = settings.get(SettingConstants.ENCODER_PORT_DEFAULT)
+            if default != self._encoder:
+                raise RuntimeError(f"the axis follows encoder {default:g}, not scan encoder {self._encoder}")
+            if settings.get(SettingConstants.CLOOP_ENABLE) != 1:
+                raise RuntimeError("closed-loop control must be on to scan")
+            # The scan's lead-in and stopping distance assume a plain trapezoidal profile.
+            if settings.get(SettingConstants.MOTION_ACCEL_RAMPTIME) != 0:
+                raise RuntimeError("motion.accel.ramptime must be 0 to scan")
+            self._check_within_limits("start", start)
+        return state
+
+    def prepare(self, *, start: float, speed: float) -> dict[str, Any]:
+        if not math.isfinite(start):
+            raise ValueError(f"scan start must be finite, got {start}")
+        if not 0 < speed <= self._info.max_speed:
+            raise ValueError(
+                f"scan speed {speed:g} {self._units}/s is outside (0, {self._info.max_speed:g}]; "
+                "the encoder output cannot follow faster motion"
+            )
+        with self._lock:
+            if self._originals is not None:
+                raise RuntimeError("a continuous scan is already prepared; finish or reset it first")
+            state = self._check_ready(start)
+            self._originals = {name: self._axis.settings.get(name) for name in self._changed}
+            self._status_timeouts = 0
+            try:
+                self._set_verified(f"encoder.{self._encoder}.out.interpolation", self._interpolation)
+                self._set_verified(f"encoder.{self._encoder}.out.width", self._output_width_ns)
+                self._set_verified(SettingConstants.MAXSPEED, speed, self._velocity_unit)
+                # The accel alias writes acceleration and deceleration but reads back acceleration only.
+                accel = self._set_verified(SettingConstants.ACCEL, self._acceleration, self._acceleration_unit)
+                self._verify_native(SettingConstants.MOTION_DECELONLY, accel)
+                self._set_verified(self._enable, 1)
+            except BaseException as error:
+                try:
+                    self.reset()
+                except Exception as cleanup_error:
+                    error.add_note(f"restoring the axis after the failed prepare also failed: {cleanup_error}")
+                raise
+        time.sleep(_SCAN_OUTPUT_SETTLE_S)
+        # A DAQ counting the exported quadrature counts from the exported encoder's own position.
+        return {**state, "origin": state["exported_encoder_position"]}
+
+    def start(self, target: float) -> None:
+        if not math.isfinite(target):
+            raise ValueError(f"scan target must be finite, got {target}")
+        with self._lock:
+            if self._originals is None:
+                raise RuntimeError("prepare the continuous scan first")
+            if self._started:
+                raise RuntimeError("the continuous scan has already started")
+            self._check_within_limits("target", target)
+            self._started = True
+            # A lost reply may still have started the move, so the command is never resent.
+            self._axis.move_absolute(target, self._position_unit, wait_until_idle=False)
+
+    def is_scanning(self) -> bool:
+        if self._originals is None:
+            raise RuntimeError("prepare the continuous scan first")
+        consecutive = 0
+        while True:
+            try:
+                with self._lock:
+                    busy, flags = self._axis.is_busy(), self._axis.warnings.get_flags()
+                break
+            except RequestTimeoutException:
+                self._status_timeouts += 1
+                consecutive += 1
+                if consecutive > _SCAN_POLL_RETRIES:
+                    raise
+        if flags:
+            raise RuntimeError(f"Zaber reported {', '.join(sorted(flags))} during the continuous scan")
+        return busy
+
+    def _restore(self) -> None:
+        """Restore every snapshotted setting in order, attempting all; raises naming each failure."""
+        if self._originals is None:
+            return
+        failures: list[tuple[str, Exception]] = []
+        for name, value in self._originals.items():
+            try:
+                self._set_verified(name, value)
+            except Exception as error:
+                failures.append((name, error))
+        if failures:
+            details = "; ".join(f"{name}: {error}" for name, error in failures)
+            raise RuntimeError(f"could not restore Zaber scan settings ({details})") from failures[0][1]
+        self._originals = None
+        self._started = False
+
+    def finish(self, target: float) -> dict[str, Any]:
+        with self._lock:
+            if self._originals is None:
+                raise RuntimeError("prepare the continuous scan first")
+            state = self._state()
+            self._check_settled(state, "target", target)
+            self._restore()
+        return {**state, "status_poll_timeouts": self._status_timeouts}
+
+    def _stop(self) -> None:
+        """Halt the axis if it is moving and wait for it to stop."""
+        deadline = time.monotonic() + _SCAN_STOP_TIMEOUT_S
+        halted = False
+        while True:
+            with self._lock:
+                if not self._axis.is_busy():
+                    return
+                if not halted:
+                    self._axis.stop(wait_until_idle=False)
+                    halted = True
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"the axis did not stop within {_SCAN_STOP_TIMEOUT_S:g}s")
+            time.sleep(_POLL_INTERVAL_S)
+
+    def reset(self) -> None:
+        failures: list[tuple[str, Exception]] = []
+        if self._originals is not None:
+            try:
+                # Restoring speed and acceleration mid-move would change that move.
+                self._stop()
+            except Exception as error:
+                failures.append(("stop", error))
+            else:
+                try:
+                    self._restore()
+                except Exception as error:
+                    failures.append(("restore", error))
+        try:
+            self._set_verified(self._enable, 0)
+        except Exception as error:
+            failures.append(("output off", error))
+        if failures:
+            details = "; ".join(f"{step}: {error}" for step, error in failures)
+            raise RuntimeError(
+                f"could not reset the Zaber continuous scan on axis {self._axis.axis_number} ({details})"
+            ) from failures[0][1]
+
+
 class ZaberHub(Device[DeviceType]):
     """Own one Zaber connection and reserve its axes by stable device serial."""
 
@@ -358,6 +672,11 @@ class ZaberLinearAxis(ContinuousAxis):
     Setting ``ttl_input`` and ``ttl_trigger`` lets a DAQ pulse on that controller digital input
     step the axis during Voxel acquisitions (see ``ZaberTTLStepper``). ``ttl_status_output`` and
     ``ttl_status_trigger`` optionally pulse a controller digital output after each step.
+
+    Setting all of ``scan_encoder``, ``scan_interpolation``, ``scan_output_width_ns``,
+    ``scan_scale_period`` (the analog encoder period, in axis units) and ``scan_acceleration`` lets the
+    axis make constant-speed scans while the controller exports that encoder as TTL quadrature (see
+    ``ZaberContinuousScanner``).
     """
 
     def __init__(
@@ -372,8 +691,16 @@ class ZaberLinearAxis(ContinuousAxis):
         ttl_trigger: int | None = None,
         ttl_status_output: int | None = None,
         ttl_status_trigger: int | None = None,
+        scan_encoder: int | None = None,
+        scan_interpolation: int | None = None,
+        scan_output_width_ns: int | None = None,
+        scan_scale_period: float | None = None,
+        scan_acceleration: float | None = None,
     ) -> None:
         _validate_ttl_config(ttl_input, ttl_trigger, ttl_status_output, ttl_status_trigger)
+        _validate_scan_config(
+            scan_encoder, scan_interpolation, scan_output_width_ns, scan_scale_period, scan_acceleration
+        )
         super().__init__(uid=uid, units=units)
         self.hub = hub
         self.device_serial = device_serial
@@ -402,6 +729,25 @@ class ZaberLinearAxis(ContinuousAxis):
                     step_trigger=ttl_trigger,
                     status_output=ttl_status_output,
                     status_trigger=ttl_status_trigger,
+                )
+            self._continuous_scanner: ZaberContinuousScanner | None = None
+            if (
+                scan_encoder is not None
+                and scan_interpolation is not None
+                and scan_output_width_ns is not None
+                and scan_scale_period is not None
+                and scan_acceleration is not None
+            ):
+                self._continuous_scanner = ZaberContinuousScanner(
+                    lock=hub.lock,
+                    axis=self._axis,
+                    units=units,
+                    encoder=scan_encoder,
+                    interpolation=scan_interpolation,
+                    output_width_ns=scan_output_width_ns,
+                    scale_period=scan_scale_period,
+                    acceleration=scan_acceleration,
+                    invalidate_settings=self._settings.clear,
                 )
         except Exception:
             hub.release_axis(device_serial, axis_number)
@@ -616,13 +962,20 @@ class ZaberLinearAxis(ContinuousAxis):
     def get_ttl_stepper(self) -> TTLStepper | None:
         return self._ttl_stepper
 
+    def get_continuous_scanner(self) -> ContinuousScanner | None:
+        return self._continuous_scanner
+
     def close(self) -> None:
         if self._closed:
             return
         self._closed = True
         try:
-            if self._ttl_stepper is not None:
-                self._ttl_stepper.reset()
+            try:
+                if self._continuous_scanner is not None:
+                    self._continuous_scanner.reset()
+            finally:
+                if self._ttl_stepper is not None:
+                    self._ttl_stepper.reset()
         finally:
             try:
                 self.halt()
