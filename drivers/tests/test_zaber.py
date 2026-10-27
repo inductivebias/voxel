@@ -567,6 +567,8 @@ def test_zaber_ttl_stepper_refuses_steps_it_cannot_make_safely(
             stepper.queue_relative_move(delta)
     with pytest.raises(ValueError, match="native resolution"):
         stepper.queue_relative_move(0.01)
+    with pytest.raises(ValueError, match=r"would move 1\. .* such as 1 or 1\.1"):
+        stepper.queue_relative_move(1.03)
     device.io.digital_inputs[0] = True
     with pytest.raises(RuntimeError, match="already high"):
         stepper.queue_relative_move(1.0)

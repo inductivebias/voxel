@@ -37,6 +37,8 @@ _POLL_INTERVAL_S = 0.05
 # through this driver take effect at once.
 _SETTINGS_TTL_S = 1.0
 _RESET_ATTEMPTS = 2
+# Largest relative difference between a requested TTL step and the whole native steps it becomes.
+_STEP_TOLERANCE = 1e-3
 # Long enough for the return interface and an NI PFI input to register the pulse.
 _STATUS_PULSE_MS = 1
 
@@ -180,9 +182,19 @@ class ZaberTTLStepper(TTLStepper):
                 raise RuntimeError("configure the Zaber TTL stepper before queueing a step")
             if self._armed:
                 raise RuntimeError("Zaber TTL stepping repeats one step; reset before queueing another")
-            native = self._axis.settings.convert_to_native_units(SettingConstants.POS, delta, self._unit, round=True)
+            exact = self._axis.settings.convert_to_native_units(SettingConstants.POS, delta, self._unit)
+            native = round(exact)
             if native == 0:
                 raise ValueError(f"TTL step {delta} is below the axis's native resolution")
+            # The controller moves whole native steps, so a rounded step silently changes the spacing
+            # Voxel records: 1 µm on an axis with 0.09525 µm steps moves 0.9525 µm.
+            if abs(native - exact) > _STEP_TOLERANCE * abs(exact):
+                step = delta / exact
+                below, above = sorted((math.floor(exact) * step, math.ceil(exact) * step))
+                raise ValueError(
+                    f"TTL step {delta:g} is {exact:.4f} native steps; the axis would move {native * step:.6g}. "
+                    f"Use a whole number of steps, such as {below:.6g} or {above:.6g}"
+                )
             # A trigger whose condition already holds fires as soon as it is enabled.
             if self._device.io.get_digital_input(self._input_channel):
                 raise RuntimeError(
