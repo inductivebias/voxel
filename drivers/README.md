@@ -155,6 +155,14 @@ uv run pytest drivers/tests
 These checks cannot establish compatibility with a physical device or vendor runtime. Hardware validation should
 name the exact model, firmware, connection, and exercised operations.
 
+`drivers/tests/hardware/` holds opt-in tests against real devices (marked `hardware`). Each skips unless its
+environment variables name the device, and tests that acquire, move, or change emission also need an explicit
+`YES`. Close the device in any running Voxel first, and set only the variables for the test you intend:
+
+```bash
+VOXEL_KINETIX_SERIAL=<serial> VOXEL_KINETIX_ALLOW_ACQUISITION=YES uv run pytest -m hardware drivers/tests/hardware
+```
+
 
 Low-level ASI Tiger command behavior is documented separately in the
 [`tigerhub/ops` reference](src/vxl_drivers/tigerhub/ops/README.md).

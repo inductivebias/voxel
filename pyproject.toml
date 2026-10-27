@@ -103,6 +103,7 @@ testpaths = [
 ]
 markers = [
     "slow: integration-flavored tests (ZMQ networking, zarr I/O); excluded from pre-push, run in CI",
+    "hardware: talks to a physical device; skips unless the environment selects one (drivers/tests/hardware)",
 ]
 
 [tool.pyright]
