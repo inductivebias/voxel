@@ -23,6 +23,34 @@ class _Values(BaseModel):
     values: dict[str, Any]
 
 
+@pytest.mark.parametrize("name", ["../escape", "absolute", "nested/name"])
+def test_instantiate_invalid_name_cannot_escape_directory(
+    instrument_config: InstrumentConfig, tmp_path: Path, name: str
+) -> None:
+    name = str(tmp_path / "absolute") if name == "absolute" else name
+    with pytest.raises(ValueError, match="Instrument name"):
+        InstrumentStore.instantiate(instrument_config, name, tmp_path, replace=True)
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_instantiate_failed_replacement_restores_original(
+    instrument_config: InstrumentConfig, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    home = InstrumentStore.instantiate(instrument_config, "scope", tmp_path)
+    (home / "state.json").write_text("original state")
+    rename = Path.rename
+
+    def fail_promotion(source: Path, target: Path) -> Path:
+        if source.parent.name.startswith(".scope-"):
+            raise OSError("promotion failed")
+        return rename(source, target)
+
+    monkeypatch.setattr(Path, "rename", fail_promotion)
+    with pytest.raises(OSError, match="promotion failed"):
+        InstrumentStore.instantiate(instrument_config, "scope", tmp_path, replace=True)
+    assert (home / "state.json").read_text() == "original state"
+
+
 def test_saved_yaml_loads_back_unchanged(tmp_path: Path) -> None:
     path = tmp_path / "values.yaml"
     model = _Values(values={"label": "no", "position": "on", "exposure": 1e-05, "time": "1:30"})

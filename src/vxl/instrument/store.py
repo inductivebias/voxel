@@ -1,5 +1,6 @@
 import asyncio
 import datetime
+import tempfile
 from collections.abc import Collection
 from dataclasses import dataclass
 from pathlib import Path
@@ -7,6 +8,7 @@ from typing import Annotated, Any, Literal, Self
 
 from pydantic import BaseModel, Field, ValidationError, model_validator
 from vxlib.reactivity import Cell, Readable, Subscribable
+from vxlib.schema import check_identifier
 
 from vxl._utils.files import atomic_write, load_and_validate_yaml, save_yaml
 
@@ -95,13 +97,33 @@ class InstrumentStore(Subscribable[InstrumentState]):
     """Validating persistence for one :class:`InstrumentState`."""
 
     @staticmethod
-    def instantiate(config: InstrumentConfig, name: str, into: Path | str) -> Path:
-        """Create ``<into>/<name>.voxel`` and persist its initial configuration."""
+    def instantiate(config: InstrumentConfig, name: str, into: Path | str, *, replace: bool = False) -> Path:
+        """Install a validated config, retaining a backup when replacing an existing instrument."""
+        check_identifier(name, "Instrument name")
         directory = Path(into) / f"{name}.voxel"
-        if directory.exists():
+        if directory.exists() and not replace:
             raise FileExistsError(f"Instrument '{name}' already exists at {directory}")
-        directory.mkdir(parents=True)
-        save_yaml(directory / "config.yaml", config)
+        directory.parent.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(prefix=f".{name}-", dir=directory.parent) as temporary:
+            staged = Path(temporary) / directory.name
+            staged.mkdir()
+            save_yaml(staged / "config.yaml", config)
+            inspection = InstrumentStore.load_config(staged / "config.yaml")
+            if not inspection.ok:
+                raise StartupError(list(inspection.violations))
+            backup = None
+            if directory.exists():
+                if not replace:
+                    raise FileExistsError(f"Instrument '{name}' already exists at {directory}")
+                stamp = datetime.datetime.now(datetime.UTC).strftime("%Y%m%dT%H%M%S%fZ")
+                backup = directory.with_name(f"{directory.name}.bak-{stamp}")
+                directory.rename(backup)
+            try:
+                staged.rename(directory)
+            except BaseException:
+                if backup is not None:
+                    backup.rename(directory)
+                raise
         return directory
 
     @staticmethod
