@@ -1,6 +1,7 @@
 import threading
 from unittest.mock import Mock, patch
 
+import pytest
 from vxl_drivers.serial import SerialTransport
 
 
@@ -34,3 +35,13 @@ def test_transaction_holds_exclusive_access_across_write_and_read() -> None:
         ("readline", (), {}),
         ("write", (b"other",), {}),
     ]
+
+
+def test_drain_input_continuous_bytes_raises_and_restores_timeout() -> None:
+    port = Mock(timeout=1.0, baudrate=115200, in_waiting=1_048_576)
+    port.read.return_value = b"x" * 1_048_576
+    with patch("vxl_drivers.serial.serial.Serial", return_value=port):
+        transport = SerialTransport("test")
+    with pytest.raises(TimeoutError, match="drain limit"):
+        transport.drain_input()
+    assert port.timeout == 1.0

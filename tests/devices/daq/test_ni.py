@@ -102,6 +102,17 @@ def _running_generator(
     return generator, ao_task
 
 
+def test_stop_counter_failure_still_stops_analog_output() -> None:
+    events: list[tuple[str, str]] = []
+    generator, _ = _running_generator([100], events)
+    counter = MagicMock()
+    counter.stop.side_effect = RuntimeError("counter stop failed")
+    generator._co_task = counter
+    with pytest.raises(RuntimeError, match="counter stop failed"):
+        generator.stop()
+    assert ("stop", "ao") in events
+
+
 class TestNiSignalGeneratorStop:
     def test_stop_running_cycle_stops_counter_before_ao(self):
         events: list[tuple[str, str]] = []

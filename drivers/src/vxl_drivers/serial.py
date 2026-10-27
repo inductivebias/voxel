@@ -1,5 +1,6 @@
 import logging
 import threading
+import time
 from collections.abc import Generator
 from contextlib import contextmanager
 
@@ -16,7 +17,7 @@ class SerialTransport:
     _QUIET_BYTE_TIMES = 4
 
     def __init__(self, port: str, baud: int = 115200, timeout: float = 0.5):
-        self.ser = serial.Serial(port=port, baudrate=baud, timeout=timeout)
+        self.ser = serial.Serial(port=port, baudrate=baud, timeout=timeout, write_timeout=timeout)
         # Reentrant so the helpers below can be called from inside `transaction()`, which is where
         # a protocol layer holding the port needs them.
         self._lock = threading.RLock()
@@ -46,9 +47,12 @@ class SerialTransport:
         discarded = 0
         with self._lock:
             previous, self.ser.timeout = self.ser.timeout, window
+            deadline = time.monotonic() + (previous if previous is not None else 0.5)
             try:
-                while chunk := self.ser.read(max(1, self.ser.in_waiting)):
+                while chunk := self.ser.read(min(65_536, max(1, self.ser.in_waiting))):
                     discarded += len(chunk)
+                    if discarded >= 1_048_576 or time.monotonic() >= deadline:
+                        raise TimeoutError("Serial input did not become quiet before the drain limit")
             finally:
                 self.ser.timeout = previous
         return discarded

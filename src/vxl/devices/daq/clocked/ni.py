@@ -375,11 +375,17 @@ class NiSignalGenerator(SignalGenerator):
             RuntimeError: The cycle did not finish within one cycle period plus 0.1 s.
                 The AO task is stopped anyway, so the lines may not be at rest.
         """
+        counter_error: Exception | None = None
         if self._co_task is not None:
-            self._co_task.stop()
+            try:
+                self._co_task.stop()
+            except Exception as error:
+                counter_error = error
         ao_task = self._ao_task
         if ao_task is None:
             self._finite_repeat = None
+            if counter_error is not None:
+                raise counter_error
             return
         try:
             # A retriggered AO task that was never triggered has generated zero samples.
@@ -389,6 +395,8 @@ class NiSignalGenerator(SignalGenerator):
             self._finite_repeat = None
             if self._edge_paced:
                 self._restore_counter_trigger()
+        if counter_error is not None:
+            raise counter_error
         if generated % self._cycle_samples:
             raise RuntimeError(
                 f"{self.uid}: AO output stopped mid-cycle after waiting "
