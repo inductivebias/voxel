@@ -9,6 +9,7 @@ from enum import StrEnum
 from typing import Any, ClassVar
 
 from pydantic import BaseModel
+from vxlib.asyncio import settle
 
 from .props import PropertyModel
 from .schema import (
@@ -100,7 +101,7 @@ class DeviceController[D: "Device"]:
     async def _run_sync[R](self, fn: Callable[..., R], *args: Any, **kwargs: Any) -> R:
         """Run a sync function in the thread pool."""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._thread_pool, lambda: fn(*args, **kwargs))
+        return await settle(loop.run_in_executor(self._thread_pool, lambda: fn(*args, **kwargs)))
 
     async def execute_command(self, command: str, *args: Any, **kwargs: Any) -> Result:
         if command not in self._commands:
@@ -153,6 +154,9 @@ class DeviceController[D: "Device"]:
         def _get() -> PropResults:
             results: dict[str, Result] = {}
             for name in props_to_get:
+                if name not in self._interface.properties:
+                    results[name] = Result.err(f"Unknown property: {name}")
+                    continue
                 try:
                     target = self._device if name in self._device_props else self
                     results[name] = Result.ok(PropertyModel.from_value(getattr(target, name)))
@@ -169,6 +173,10 @@ class DeviceController[D: "Device"]:
         def _set() -> PropResults:
             results: dict[str, Result] = {}
             for name, value in props.items():
+                info = self._interface.properties.get(name)
+                if info is None or info.access != "rw":
+                    results[name] = Result.err(f"Property is not writable: {name}")
+                    continue
                 try:
                     target = self._device if name in self._device_props else self
                     setattr(target, name, value)
@@ -232,8 +240,22 @@ class DeviceController[D: "Device"]:
 
     async def close(self) -> None:
         await self.stop_streaming()
+        await self._run_sync(self._device.close)
         self._thread_pool.shutdown(wait=False, cancel_futures=True)
-        self._device.close()
+
+
+async def close_controllers(controllers: dict[str, DeviceController]) -> None:
+    """Close dependents first, retaining failed controllers and attempting every device."""
+    errors: list[Exception] = []
+    for uid, controller in reversed(list(controllers.items())):
+        try:
+            await controller.close()
+        except Exception as error:
+            errors.append(error)
+        else:
+            del controllers[uid]
+    if errors:
+        raise ExceptionGroup("Device shutdown failed", errors)
 
 
 class Device[T: StrEnum]:

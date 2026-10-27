@@ -216,16 +216,14 @@ class TransportNode(Node):
         return handles, response.errors
 
     async def close_device(self, uid: str) -> None:
-        with suppress(Exception):
-            await call(self._transport, Action.CLOSE_DEVICE, CloseDeviceRequest(uid=uid), Empty)
+        await call(self._transport, Action.CLOSE_DEVICE, CloseDeviceRequest(uid=uid), Empty)
         adapter = self._adapters.pop(uid, None)
         self._handles.pop(uid, None)
         if adapter is not None:
             await adapter.close()
 
     async def close_all_devices(self) -> None:
-        with suppress(Exception):
-            await call(self._transport, Action.CLOSE_ALL_DEVICES, Empty(), Empty)
+        await call(self._transport, Action.CLOSE_ALL_DEVICES, Empty(), Empty)
         for adapter in self._adapters.values():
             await adapter.close()
         self._adapters.clear()

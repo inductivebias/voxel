@@ -13,7 +13,7 @@ from typing import Any, overload
 from pydantic import BaseModel
 from vxlib.lifecycle import Teardown
 
-from rigup.build import build_objects_async
+from rigup.build import build_for_owner
 from rigup.device import (
     Adapter,
     CommandRequest,
@@ -26,6 +26,7 @@ from rigup.device import (
     Results,
     StreamCallback,
 )
+from rigup.device.driver import close_controllers
 from rigup.wire import TopicDispatcher
 
 from ._base import DevicesBuildResult, DevicesConfig, Node
@@ -124,7 +125,7 @@ class LocalNode(Node):
 
     async def build_devices(self, configs: DevicesConfig) -> DevicesBuildResult:
         await self.close_all_devices()
-        built, errors = await build_objects_async(configs, Device)
+        built, errors, cancelled = await build_for_owner(configs, Device)
 
         for uid, err in errors.items():
             self._log.error("Failed to build %s: %s", uid, err.message)
@@ -133,24 +134,31 @@ class LocalNode(Node):
         for uid, device in built.items():
             controller_cls = type(device).__CONTROLLER_TYPE__
             controller: DeviceController = controller_cls(device)
-            controller.start_streaming()
+            if uid not in errors and cancelled is None:
+                controller.start_streaming()
             adapter: LocalAdapter = LocalAdapter(controller)
             handle: DeviceHandle = DeviceHandle(adapter)
             self._controllers[uid] = controller
             self._handles[uid] = handle
             handles[uid] = handle
 
+        if cancelled is not None:
+            await self.close_all_devices()
+            raise cancelled
         return handles, errors
 
     async def close_device(self, uid: str) -> None:
-        controller = self._controllers.pop(uid, None)
-        self._handles.pop(uid, None)
+        controller = self._controllers.get(uid)
         if controller is not None:
             await controller.close()
+            del self._controllers[uid]
+            self._handles.pop(uid, None)
 
     async def close_all_devices(self) -> None:
-        for uid in list(self._controllers):
-            await self.close_device(uid)
+        try:
+            await close_controllers(self._controllers)
+        finally:
+            self._handles = {uid: handle for uid, handle in self._handles.items() if uid in self._controllers}
 
     @property
     def devices(self) -> dict[str, DeviceHandle]:

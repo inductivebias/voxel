@@ -9,6 +9,25 @@ _log = logging.getLogger(__name__)
 _background_tasks: set[asyncio.Task[Any]] = set()
 
 
+async def settle[T](work: asyncio.Future[T]) -> T:
+    """Wait for owned work to finish before propagating cancellation to its caller."""
+    cancelled: asyncio.CancelledError | None = None
+    while not work.done():
+        try:
+            await asyncio.shield(work)
+        except asyncio.CancelledError as error:
+            if work.cancelled():
+                raise
+            cancelled = error
+        except Exception:
+            break
+    if cancelled is not None:
+        if not work.cancelled() and (error := work.exception()) is not None:
+            cancelled.add_note(f"Owned work also failed: {error}")
+        raise cancelled
+    return work.result()
+
+
 def spawn[T](
     coro: Coroutine[Any, Any, T],
     *,
@@ -56,4 +75,4 @@ def spawn[T](
     return task
 
 
-__all__ = ["spawn"]
+__all__ = ["settle", "spawn"]

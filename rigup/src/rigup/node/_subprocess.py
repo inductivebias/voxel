@@ -63,8 +63,8 @@ class SubprocessNode(TransportNode):
 
     async def close(self) -> None:
         if self._process is not None and self._process.returncode is None:
-            with suppress(Exception):
-                await asyncio.wait_for(self.close_all_devices(), timeout=5.0)
+            # An unverified device close retains the process and transport for recovery.
+            await asyncio.wait_for(self.close_all_devices(), timeout=5.0)
             with suppress(Exception):
                 await asyncio.wait_for(
                     send_notify(self._transport, Notify.SHUTDOWN, ShutdownPayload(reason="orchestrator close")),

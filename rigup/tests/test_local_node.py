@@ -50,6 +50,18 @@ class TestLocalNodeBuild:
 
 
 class TestLocalNodeDeviceOps:
+    async def test_properties_reject_internal_and_read_only_names(self, node: LocalNode, device_configs):
+        await node.build_devices(device_configs)
+        handle = node.devices["dev_a"]
+        try:
+            written = await handle.props.set(_stream_interval=0, enabled=True)
+            assert not written.is_ok
+            read = await handle.props.get("_device", "_stream_interval")
+            assert not read.is_ok
+            assert (await handle.props.get("enabled"))["enabled"].unwrap().value is False
+        finally:
+            await node.close()
+
     async def test_run_command(self, node: LocalNode, device_configs):
         await node.build_devices(device_configs)
         handle = node.devices["dev_a"]

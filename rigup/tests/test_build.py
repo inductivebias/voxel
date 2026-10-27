@@ -1,5 +1,8 @@
 """Tests for rigup.build — defaults failure semantics and async build."""
 
+from typing import ClassVar
+
+import pytest
 import rigup.build as build_module
 from rigup.build import BuildConfig, build_objects, build_objects_async
 
@@ -25,6 +28,38 @@ class _ReadOnlyDevice:
     @property
     def locked(self) -> bool:
         return True
+
+
+class _ResourceDevice(_ReadOnlyDevice):
+    instances: ClassVar[list["_ResourceDevice"]] = []
+
+    def __init__(self, uid: str, fail_close: bool = False) -> None:
+        super().__init__(uid)
+        self.closed = False
+        self.fail_close = fail_close
+        self.instances.append(self)
+
+    def close(self) -> None:
+        if self.fail_close:
+            raise OSError("device refused close")
+        self.closed = True
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("fail_close", [False, True])
+async def test_build_objects_failed_defaults_close_or_retain_device(asynchronous: bool, fail_close: bool) -> None:
+    configs = {
+        "device": BuildConfig(
+            target=f"{__name__}._ResourceDevice", init={"fail_close": fail_close}, defaults={"locked": False}
+        )
+    }
+    built, errors = await build_objects_async(configs) if asynchronous else build_objects(configs)
+    device = _ResourceDevice.instances[-1]
+    assert errors["device"].error_type == "defaults"
+    assert device.closed is not fail_close
+    assert (built.get("device") is device) is fail_close
+    device.fail_close = False
+    device.close()
 
 
 class _DependentDevice:

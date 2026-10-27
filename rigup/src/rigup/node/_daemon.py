@@ -17,7 +17,7 @@ import logging
 
 from pydantic import BaseModel
 
-from rigup.build import build_objects_async
+from rigup.build import build_for_owner
 from rigup.device import (
     Device,
     DeviceController,
@@ -27,6 +27,7 @@ from rigup.device import (
     PublishTypedFn,
     Results,
 )
+from rigup.device.driver import close_controllers
 from rigup.node._logs import NodeLogHandler
 from rigup.protocol import (
     Action,
@@ -159,7 +160,7 @@ class NodeDaemon:
 
     async def _handle_build(self, req: BuildDevicesRequest) -> BuildDevicesResponse:
         await self._close_all_controllers()
-        built_devices, errors = await build_objects_async(req.devices, Device)
+        built_devices, errors, cancelled = await build_for_owner(req.devices, Device)
 
         built_interfaces: dict[str, DeviceInterface] = {}
         for uid, device in built_devices.items():
@@ -167,7 +168,8 @@ class NodeDaemon:
             controller: DeviceController = controller_cls(device)
             controller.set_typed_publisher(self._make_typed_publisher(uid))
             controller.set_bytes_publisher(self._make_bytes_publisher(uid))
-            controller.start_streaming()
+            if uid not in errors and cancelled is None:
+                controller.start_streaming()
             self._controllers[uid] = controller
             built_interfaces[uid] = controller.interface
             self._log.info("Built device %s (%s)", uid, device.__class__.__name__)
@@ -175,6 +177,9 @@ class NodeDaemon:
         for uid, err in errors.items():
             self._log.error("Failed to build %s: %s", uid, err.message)
 
+        if cancelled is not None:
+            await self._close_all_controllers()
+            raise cancelled
         return BuildDevicesResponse(built=built_interfaces, errors=errors)
 
     def _make_typed_publisher(self, device_uid: str) -> PublishTypedFn:
@@ -194,9 +199,10 @@ class NodeDaemon:
         return publish
 
     async def _handle_close_device(self, req: CloseDeviceRequest) -> Empty:
-        controller = self._controllers.pop(req.uid, None)
+        controller = self._controllers.get(req.uid)
         if controller is not None:
             await controller.close()
+            del self._controllers[req.uid]
             self._log.info("Closed device %s", req.uid)
         return Empty()
 
@@ -205,10 +211,7 @@ class NodeDaemon:
         return Empty()
 
     async def _close_all_controllers(self) -> None:
-        for uid, controller in self._controllers.items():
-            await controller.close()
-            self._log.debug("Closed device %s", uid)
-        self._controllers.clear()
+        await close_controllers(self._controllers)
 
     # ==================== Device RPC ====================
 

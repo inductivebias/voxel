@@ -79,12 +79,17 @@ class Rig:
     async def close(self) -> None:
         """Close all devices and disconnect/terminate all nodes."""
         self._log.info("Closing rig '%s'", self.name)
-        for node in reversed(list(self._nodes.values())):
+        errors: list[Exception] = []
+        for uid, node in reversed(list(self._nodes.items())):
             try:
                 await node.close()
-            except Exception:
+            except Exception as error:
                 self._log.exception("Error closing node %s", node.node_id)
-        self._nodes.clear()
+                errors.append(error)
+            else:
+                del self._nodes[uid]
+        if errors:
+            raise ExceptionGroup("Rig shutdown failed", errors)
         self._build_errors.clear()
         self._log.info("Rig '%s' closed", self.name)
 

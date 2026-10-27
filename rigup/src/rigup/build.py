@@ -48,7 +48,7 @@ type BuildGroupSpec = Mapping[str, BuildConfig]
 type BuildObjectsResult[T] = tuple[Mapping[str, T], Mapping[str, BuildError]]
 
 
-def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildObjectsResult[T]:  # noqa: C901 - factory with dependency resolution
+def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildObjectsResult[T]:
     """Build objects from configuration with error accumulation and dependency resolution.
 
     Args:
@@ -56,7 +56,8 @@ def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildO
         base_cls: Base class for type checking (default: object)
 
     Returns:
-        Tuple of (successful_objects, build_errors)
+        Tuple of (owned_objects, build_errors). A failed object whose close also fails is
+        retained in both mappings so the owner can retry cleanup; it cannot be used as a dependency.
     """
     built: dict[str, T] = {}
     errors = {
@@ -69,43 +70,12 @@ def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildO
     }
     building: set[str] = set()
 
-    def _resolve_references(value: Any) -> Any:
-        """Recursively resolve string references to built objects."""
-        if isinstance(value, str) and value in built:
-            return built[value]
-        if isinstance(value, list):
-            return [_resolve_references(item) for item in value]
-        if isinstance(value, dict):
-            return {k: _resolve_references(v) for k, v in value.items()}
-        return value
-
-    def _extract_dependencies(uid: str) -> set[str]:
-        """Extract obj UIDs referenced in kwargs."""
-        dependencies = set()
-        obj_cfg = cfgs[uid]
-
-        def _scan(value: Any) -> None:
-            if isinstance(value, str) and value in cfgs and value != uid:
-                dependencies.add(value)
-            elif isinstance(value, list):
-                for item in value:
-                    _scan(item)
-            elif isinstance(value, dict):
-                for v in value.values():
-                    _scan(v)
-
-        for v in obj_cfg.init.values():
-            _scan(v)
-
-        return dependencies
-
     def _build_one(uid: str) -> T | BuildError:
         """Build a single obj, resolving dependencies first."""
-        if uid in built:
-            return built[uid]
-
         if uid in errors:
             return errors[uid]
+        if uid in built:
+            return built[uid]
 
         if uid in building:
             error = BuildError(
@@ -121,7 +91,7 @@ def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildO
             obj_cfg = cfgs[uid]
 
             # Build dependencies first
-            deps = _extract_dependencies(uid)
+            deps = _extract_deps(cfgs, uid)
             for dep_uid in deps:
                 if dep_uid in errors:
                     error = BuildError(
@@ -142,63 +112,13 @@ def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildO
                     errors[uid] = error
                     return error
 
-            # Import the obj class
-            try:
-                cls = obj_cfg.get_obj_class()
-                if not issubclass(cls, base_cls):
-                    logger.warning(
-                        "object of uid: %s uses class: %s which is not a subclass of the common base class: %s",
-                        uid,
-                        cls.__name__,
-                        base_cls.__name__,
-                    )
-            except Exception as e:
-                error = BuildError(
-                    uid=uid,
-                    error_type="import",
-                    message=f"Failed to import '{obj_cfg.target}': {e}",
-                    traceback=traceback.format_exc(),
-                )
+            obj, error = _construct(uid, obj_cfg, built, base_cls)
+            if obj is not None:
+                built[uid] = obj
+            if error is not None:
                 errors[uid] = error
                 return error
-
-            # Resolve references in init
-            resolved_init = _resolve_references(obj_cfg.init)
-            if "uid" not in resolved_init:
-                resolved_init["uid"] = uid
-
-            # Instantiate the obj
-            try:
-                obj = cls(**resolved_init)
-            except Exception as e:
-                error = BuildError(
-                    uid=uid,
-                    error_type="instantiation",
-                    message=f"Failed to instantiate {cls.__name__}: {e}",
-                    traceback=traceback.format_exc(),
-                )
-                errors[uid] = error
-                return error
-
-            # Apply defaults after construction. A failing setattr means the device's initial
-            # state would diverge from config, so we fail the build for this device rather than
-            # continuing with a silently-wrong default.
-            if obj_cfg.defaults:
-                for name, value in obj_cfg.defaults.items():
-                    try:
-                        setattr(obj, name, value)
-                    except Exception as e:
-                        error = BuildError(
-                            uid=uid,
-                            error_type="defaults",
-                            message=f"Failed to set default {name}={value!r} on {uid}: {e}",
-                            traceback=traceback.format_exc(),
-                        )
-                        errors[uid] = error
-                        return error
-
-            built[uid] = obj
-            return obj
+            return built[uid]
 
         finally:
             building.discard(uid)
@@ -209,35 +129,6 @@ def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildO
             _build_one(uid)
 
     return built, errors
-
-
-# ==================== Async Build ====================
-#
-# Async device building solves the problem of blocking the event loop during
-# device construction (serial ports, SDK init). The approach:
-#
-# 1. Topological sort: devices are sorted into dependency layers. A device
-#    only appears in a layer after all its dependencies are in earlier layers.
-#
-# 2. Target grouping: within each layer, devices sharing the same `target`
-#    class (i.e. same driver) are grouped together. This ensures that devices
-#    using the same SDK or hardware interface are constructed sequentially,
-#    avoiding thread-safety issues with shared driver state/singletons.
-#
-# 3. Concurrent execution: groups with different targets within a layer run
-#    concurrently via asyncio.gather + to_thread. This means independent
-#    hardware (e.g. a camera SDK and a serial stage controller) initializes
-#    in parallel.
-#
-# 4. Event loop yields: between layers, control returns to the event loop,
-#    allowing log messages and status updates to stream to connected clients
-#    in real time during startup.
-#
-# Example for an ExASPIM rig:
-#   Layer 0: [daq_1] [camera] [aotf_1] [fw_emission] [tiger_controller]
-#            (5 groups, all independent, built concurrently)
-#   Layer 1: [laser_488, laser_561, laser_640] [x_axis, y_axis, z_axis, ...]
-#            (2 groups: lasers share a target, axes share a target)
 
 
 def _extract_deps(cfgs: BuildGroupSpec, uid: str) -> set[str]:
@@ -310,7 +201,7 @@ def _topological_layers(cfgs: BuildGroupSpec) -> list[list[list[str]]]:
 
     while remaining:
         # Find all devices with no unresolved dependencies
-        ready = [uid for uid in remaining if in_degree[uid] == 0]
+        ready = [uid for uid in cfgs if uid in remaining and in_degree[uid] == 0]
         if not ready:
             # Circular dependency — dump remaining as a single layer
             logger.warning("Circular dependency detected among: %s", remaining)
@@ -333,97 +224,55 @@ def _topological_layers(cfgs: BuildGroupSpec) -> list[list[list[str]]]:
     return layers
 
 
+def _resolve_references(value: Any, built: Mapping[str, Any]) -> Any:
+    if isinstance(value, str) and value in built:
+        return built[value]
+    if isinstance(value, list):
+        return [_resolve_references(item, built) for item in value]
+    if isinstance(value, dict):
+        return {key: _resolve_references(item, built) for key, item in value.items()}
+    return value
+
+
+def _construct[T](
+    uid: str, cfg: BuildConfig, built: Mapping[str, T], base_cls: type[T]
+) -> tuple[T | None, BuildError | None]:
+    """Construct and apply defaults, retaining any object whose cleanup fails."""
+    obj: T | None = None
+    phase: Literal["import", "instantiation", "defaults"] = "import"
+    try:
+        cls = cfg.get_obj_class()
+        if not issubclass(cls, base_cls):
+            logger.warning(
+                "object %s uses class %s which is not a subclass of %s", uid, cls.__name__, base_cls.__name__
+            )
+        phase = "instantiation"
+        init = _resolve_references(cfg.init, built)
+        init.setdefault("uid", uid)
+        obj = cls(**init)
+        phase = "defaults"
+        for name, value in (cfg.defaults or {}).items():
+            setattr(obj, name, value)
+        return obj, None
+    except Exception as error:
+        message = f"Failed {phase} for '{uid}' ({cfg.target}): {error}"
+        trace = traceback.format_exc()
+        if obj is not None:
+            try:
+                if close := getattr(obj, "close", None):
+                    close()
+            except Exception as cleanup_error:
+                message += f"; cleanup failed and is retained for retry: {cleanup_error}"
+            else:
+                obj = None
+        return obj, BuildError(uid=uid, error_type=phase, message=message, traceback=trace)
+
+
 def _build_group_sync[T](
-    group: list[str],
-    cfgs: BuildGroupSpec,
-    built: dict[str, T],
-    base_cls: type[T],
-) -> list[tuple[str, T | BuildError]]:
-    """Build a group of devices sequentially (same target/driver). Runs in a worker thread.
-
-    Does not write to `built` — the caller merges results after all groups complete.
-    `built` is read-only here (references from prior layers).
-    """
-
-    def resolve(value: Any) -> Any:
-        """Recursively resolve string references to already-built devices."""
-        if isinstance(value, str) and value in built:
-            return built[value]
-        if isinstance(value, list):
-            return [resolve(item) for item in value]
-        if isinstance(value, dict):
-            return {k: resolve(v) for k, v in value.items()}
-        return value
-
-    results: list[tuple[str, T | BuildError]] = []
-    for uid in group:
-        cfg = cfgs[uid]
-        logger.info("Building device: %s (%s)", uid, cfg.target.rsplit(".", 1)[-1])
-
-        # Import class
-        try:
-            cls = cfg.get_obj_class()
-            if not issubclass(cls, base_cls):
-                logger.warning(
-                    "object %s uses class %s which is not a subclass of %s", uid, cls.__name__, base_cls.__name__
-                )
-        except Exception as e:
-            results.append(
-                (
-                    uid,
-                    BuildError(
-                        uid=uid,
-                        error_type="import",
-                        message=f"Failed to import '{cfg.target}': {e}",
-                        traceback=traceback.format_exc(),
-                    ),
-                )
-            )
-            continue
-
-        # Resolve references and instantiate
-        resolved_init = resolve(cfg.init)
-        if "uid" not in resolved_init:
-            resolved_init["uid"] = uid
-
-        try:
-            obj = cls(**resolved_init)
-        except Exception as e:
-            results.append(
-                (
-                    uid,
-                    BuildError(
-                        uid=uid,
-                        error_type="instantiation",
-                        message=f"Failed to instantiate {cls.__name__}: {e}",
-                        traceback=traceback.format_exc(),
-                    ),
-                )
-            )
-            continue
-
-        # Apply defaults. A failing setattr fails this device's build (same rationale as the
-        # sync path above). Record the BuildError and move on to the next uid.
-        default_error: BuildError | None = None
-        if cfg.defaults:
-            for name, value in cfg.defaults.items():
-                try:
-                    setattr(obj, name, value)
-                except Exception as e:
-                    default_error = BuildError(
-                        uid=uid,
-                        error_type="defaults",
-                        message=f"Failed to set default {name}={value!r} on {uid}: {e}",
-                        traceback=traceback.format_exc(),
-                    )
-                    break
-
-        if default_error is not None:
-            results.append((uid, default_error))
-            continue
-
-        results.append((uid, obj))
-    return results
+    group: list[str], cfgs: BuildGroupSpec, built: dict[str, T], base_cls: type[T]
+) -> list[tuple[str, T | None, BuildError | None]]:
+    # Driver groups are serialized; prior-layer objects are read-only in worker threads.
+    return [(uid, *_construct(uid, cfgs[uid], built, base_cls)) for uid in group]
 
 
 def _prewarm_parent_modules(cfgs: BuildGroupSpec) -> None:
@@ -511,10 +360,26 @@ async def build_objects_async[T](cfgs: BuildGroupSpec, base_cls: type[T] = objec
                         traceback=formatted_traceback,
                     )
                 continue
-            for uid, result in group_result:
-                if isinstance(result, BuildError):
-                    errors[uid] = result
-                else:
-                    built[uid] = result
+            for uid, obj, error in group_result:
+                if obj is not None:
+                    built[uid] = obj
+                if error is not None:
+                    errors[uid] = error
 
     return built, errors
+
+
+async def build_for_owner[T](
+    cfgs: BuildGroupSpec, base_cls: type[T]
+) -> tuple[Mapping[str, T], Mapping[str, BuildError], asyncio.CancelledError | None]:
+    """Settle construction before returning resources and any pending cancellation to their owner."""
+    building = asyncio.create_task(build_objects_async(cfgs, base_cls))
+    cancelled: asyncio.CancelledError | None = None
+    while not building.done():
+        try:
+            await asyncio.shield(building)
+        except asyncio.CancelledError as error:
+            # SDK constructor threads cannot be stopped. Their results must be adopted before cleanup.
+            cancelled = error
+    built, errors = building.result()
+    return built, errors, cancelled

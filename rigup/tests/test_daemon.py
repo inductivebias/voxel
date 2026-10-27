@@ -3,8 +3,9 @@
 import asyncio
 
 import pytest
+from rigup.config import NodeConfig
 from rigup.device import CommandRequest, DeviceInterface, PropResults, Results
-from rigup.node import NodeDaemon
+from rigup.node import NodeDaemon, RemoteNode
 from rigup.protocol import (
     Action,
     BuildDevicesRequest,
@@ -30,7 +31,29 @@ from rigup.transport import TCPAddress, ZMQTransportClient, ZMQTransportServer
 
 from rigup import DeviceConfig
 
+from .test_shutdown import _ClosingDevice
+
 MOCK_TARGET = "tests._mock.MockDevice"
+
+
+@pytest.mark.usefixtures("daemon_pair")
+async def test_remote_close_failure_preserves_handles_for_retry(free_tcp_address: TCPAddress) -> None:
+    node = RemoteNode("remote", NodeConfig(kind="remote", address=free_tcp_address.rpc_addr))
+    await node.open()
+    try:
+        await node.build_devices(
+            {
+                "good": DeviceConfig(target=f"{_ClosingDevice.__module__}._ClosingDevice"),
+                "bad": DeviceConfig(target=f"{_ClosingDevice.__module__}._ClosingDevice", init={"fail_close": True}),
+            }
+        )
+        with pytest.raises(RuntimeError, match="shutdown failed"):
+            await node.close_all_devices()
+        assert set(node.devices) == {"good", "bad"}, "unverified handles remain owned until the daemon confirms cleanup"
+        await node.close_all_devices()
+        assert not node.devices
+    finally:
+        await node.close()
 
 
 @pytest.fixture
