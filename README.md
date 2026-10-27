@@ -148,7 +148,8 @@ nub run --cwd web-ui check
 
 The default type check covers the core and drivers supported by the standard environment.
 Optional Qt, benchmark, and SDK entry points are listed in `pyrightconfig.optional.json`; with their
-corresponding extras installed, run `uv run basedpyright --project pyrightconfig.optional.json` as well. Missing imports
+corresponding dependencies installed, run `uv run basedpyright --project pyrightconfig.optional.json`
+as well. Missing imports
 remain errors in both checks. Default pre-push tests exclude `hardware` and `slow`; physical tests
 require their explicit opt-in setup.
 

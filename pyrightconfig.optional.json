@@ -5,6 +5,7 @@
     "bench",
     "drivers/src/vxl_drivers/axes/thorlabs.py",
     "drivers/src/vxl_drivers/cameras/egrabber.py",
+    "drivers/src/vxl_drivers/cameras/pco.py",
     "drivers/src/vxl_drivers/cameras/ximea.py",
     "drivers/src/vxl_drivers/lasers/genesis_mx.py",
     "drivers/src/vxl_drivers/lasers/mpds/calibration.py",
