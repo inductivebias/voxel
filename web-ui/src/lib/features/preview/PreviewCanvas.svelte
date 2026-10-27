@@ -146,7 +146,8 @@
   function frameLoop() {
     if (!isRendering) return;
     syncSize();
-    if (needsRedraw && !drawPending && canvasEl) void draw();
+    // draw() picks the overlay canvas or the side-by-side canvases; canvasEl is null side by side.
+    if (needsRedraw && !drawPending) void draw();
     animFrameId = requestAnimationFrame(frameLoop);
   }
 
