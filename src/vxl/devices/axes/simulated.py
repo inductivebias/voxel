@@ -5,6 +5,8 @@ from typing import Any
 
 from vxl.devices.axes.continuous import (
     ContinuousAxis,
+    ContinuousScanInfo,
+    ContinuousScanner,
     StepMode,
     TriggerMode,
     TTLStepper,
@@ -12,6 +14,9 @@ from vxl.devices.axes.continuous import (
 )
 from vxl.devices.axes.discrete import DiscreteAxis
 from vxl.devices.axes.discrete.base import DiscreteAxisState
+
+# Simulated moves end exactly on target; this only absorbs float noise in axis units.
+_SCAN_POSITION_TOLERANCE = 1e-6
 
 
 class SimulatedTTLStepper(TTLStepper):
@@ -48,6 +53,77 @@ class SimulatedTTLStepper(TTLStepper):
         self._axis.log.info("TTL stepper reset - buffer cleared")
 
 
+class SimulatedContinuousScanner(ContinuousScanner):
+    """Simulated continuous scan: one ordinary simulated move at the requested speed."""
+
+    def __init__(self, axis: "SimulatedContinuousAxis", info: ContinuousScanInfo) -> None:
+        self._axis = axis
+        self._info = info
+        self._previous_speed: float | None = None  # Set while a scan is prepared.
+
+    @property
+    def info(self) -> ContinuousScanInfo:
+        return self._info
+
+    def _state(self) -> dict[str, Any]:
+        position = self._axis.position
+        return {"position": position, "origin": position, "moving": self._axis.is_moving}
+
+    def _require_prepared(self) -> None:
+        if self._previous_speed is None:
+            raise RuntimeError("Continuous scan not prepared")
+
+    def _restore(self) -> None:
+        if self._previous_speed is not None:
+            self._axis.speed = self._previous_speed
+            self._previous_speed = None
+
+    def prepare(self, *, start: float, speed: float) -> dict[str, Any]:
+        if self._previous_speed is not None:
+            raise RuntimeError("A continuous scan is already prepared; finish or reset it first")
+        if not 0 < speed <= self._info.max_speed:
+            raise ValueError(f"Scan speed {speed} is outside (0, {self._info.max_speed}] {self._axis.units}/s")
+        if self._axis.is_moving:
+            raise RuntimeError("Axis must be idle to prepare a continuous scan")
+        position = self._axis.position
+        if not math.isclose(position, start, abs_tol=_SCAN_POSITION_TOLERANCE):
+            raise RuntimeError(f"Axis is at {position} {self._axis.units}, not the scan start {start}")
+        self._previous_speed = self._axis.speed
+        self._axis.speed = speed
+        self._axis.log.info(f"Prepared continuous scan from {start} at {speed} {self._axis.units}/s")
+        return self._state()
+
+    def start(self, target: float) -> None:
+        self._require_prepared()
+        lower, upper = self._axis.lower_limit, self._axis.upper_limit
+        if not lower <= target <= upper:
+            raise ValueError(f"Scan target {target} {self._axis.units} is outside limits [{lower}, {upper}]")
+        self._axis.move_abs(target)
+
+    def is_scanning(self) -> bool:
+        self._require_prepared()
+        return self._axis.is_moving
+
+    def finish(self, target: float) -> dict[str, Any]:
+        self._require_prepared()
+        if self._axis.is_moving:
+            raise RuntimeError("Axis is still moving")
+        state = self._state()
+        if not math.isclose(state["position"], target, abs_tol=_SCAN_POSITION_TOLERANCE):
+            raise RuntimeError(f"Axis stopped at {state['position']} {self._axis.units}, not the scan target {target}")
+        self._restore()
+        self._axis.log.info(f"Finished continuous scan at {target} {self._axis.units}")
+        return state
+
+    def reset(self) -> None:
+        if self._previous_speed is None:
+            return
+        if self._axis.is_moving:
+            self._axis.halt()
+        self._restore()
+        self._axis.log.info("Continuous scan reset")
+
+
 class SimulatedContinuousAxis(ContinuousAxis):
     def __init__(
         self,
@@ -58,6 +134,9 @@ class SimulatedContinuousAxis(ContinuousAxis):
         speed: float = 1000.0,
         acceleration: float = 100000.0,
         has_ttl_stepper: bool = True,
+        scan_edge_spacing: float | None = None,
+        scan_acceleration: float = 20000.0,
+        scan_max_speed: float = 5000.0,
     ):
         super().__init__(uid=uid, units=units)
         self._position = 0.0
@@ -74,6 +153,13 @@ class SimulatedContinuousAxis(ContinuousAxis):
         self._ttl_stepper: SimulatedTTLStepper | None = None
         if has_ttl_stepper:
             self._ttl_stepper = SimulatedTTLStepper(self)
+        # Continuous scan capability - enabled by giving the exported edge spacing
+        self._continuous_scanner: SimulatedContinuousScanner | None = None
+        if scan_edge_spacing is not None:
+            info = ContinuousScanInfo(
+                edge_spacing=scan_edge_spacing, acceleration=scan_acceleration, max_speed=scan_max_speed
+            )
+            self._continuous_scanner = SimulatedContinuousScanner(self, info)
 
     # Unit specification _____________________________________________________________________________________________
 
@@ -263,6 +349,10 @@ class SimulatedContinuousAxis(ContinuousAxis):
         carries a stepper — so a simulated scanning axis supports step-and-shoot acquisition by default.
         """
         return self._ttl_stepper
+
+    def get_continuous_scanner(self) -> ContinuousScanner | None:
+        """Return this axis's continuous scanner, or None unless constructed with ``scan_edge_spacing``."""
+        return self._continuous_scanner
 
 
 class SimulatedDiscreteAxis(DiscreteAxis):

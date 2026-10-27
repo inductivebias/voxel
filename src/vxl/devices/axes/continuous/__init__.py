@@ -3,6 +3,8 @@
 from vxl.devices.axes.continuous.base import (
     ContinuousAxis,
     ContinuousAxisController,
+    ContinuousScanInfo,
+    ContinuousScanner,
     ScanMode,
     StepMode,
     TriggerMode,
@@ -15,6 +17,8 @@ __all__ = [
     "ContinuousAxis",
     "ContinuousAxisController",
     "ContinuousAxisHandle",
+    "ContinuousScanInfo",
+    "ContinuousScanner",
     "ScanMode",
     "StepMode",
     "TTLStepper",

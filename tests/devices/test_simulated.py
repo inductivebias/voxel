@@ -1,8 +1,10 @@
 from collections.abc import Callable
 
 import pytest
+from rigup.node import LocalAdapter
 
-from vxl.devices.axes.simulated import SimulatedDiscreteAxis
+from vxl.devices.axes.continuous import ContinuousAxisController, ContinuousAxisHandle, ContinuousScanInfo
+from vxl.devices.axes.simulated import SimulatedContinuousAxis, SimulatedDiscreteAxis
 from vxl.devices.camera.simulated.simulated import SimulatedCamera
 from vxl.devices.laser.simulated import SimulatedLaser
 from vxl.devices.laser.source import ModulationMode
@@ -98,3 +100,33 @@ def test_laser_rejects_invalid_power_noise(noise: float) -> None:
 def test_simulated_device_rejects_invalid_delays(create_device: Callable[[float], object], delay: float) -> None:
     with pytest.raises(ValueError, match="finite and non-negative"):
         create_device(delay)
+
+
+async def test_simulated_continuous_scan_moves_to_target_at_requested_speed_then_restores_speed() -> None:
+    axis = SimulatedContinuousAxis("x_axis", speed=100.0, scan_edge_spacing=20.0)
+    handle = ContinuousAxisHandle(LocalAdapter(ContinuousAxisController(axis)))
+    assert await handle.get_continuous_scan_info() == ContinuousScanInfo(
+        edge_spacing=20.0, acceleration=20_000.0, max_speed=5_000.0
+    )
+
+    with pytest.raises(RuntimeError, match="outside"):
+        await handle.prepare_continuous_scan(0.0, 5_001.0)
+    assert await handle.prepare_continuous_scan(0.0, 5_000.0) == {"position": 0.0, "origin": 0.0, "moving": False}
+    with pytest.raises(RuntimeError, match="outside limits"):
+        await handle.start_continuous_scan(25_001.0)
+    await handle.start_continuous_scan(500.0)
+    assert await handle.continuous_scan_moving()
+    assert axis.speed == 5_000.0, "the scan runs at the requested speed"
+    # 500 um takes 0.1 s at the scan speed and 5 s at the axis's own speed.
+    axis.await_movement(timeout_s=2.0)
+    assert not await handle.continuous_scan_moving()
+    assert await handle.finish_continuous_scan(500.0) == {"position": 500.0, "origin": 500.0, "moving": False}
+    assert axis.speed == 100.0
+    await handle.reset_continuous_scan()
+
+
+async def test_simulated_continuous_scan_absent_without_edge_spacing() -> None:
+    axis = SimulatedContinuousAxis("x_axis")
+    handle = ContinuousAxisHandle(LocalAdapter(ContinuousAxisController(axis)))
+    assert axis.get_continuous_scanner() is None
+    assert await handle.get_continuous_scan_info() is None

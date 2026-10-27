@@ -2,12 +2,13 @@
 
 import asyncio
 import time
+from typing import Any
 
 from pydantic import TypeAdapter
 from rigup.device.handle import Adapter, DeviceProperty
 
 from rigup import DeviceHandle
-from vxl.devices.axes.continuous.base import ContinuousAxis, TTLStepperConfig
+from vxl.devices.axes.continuous.base import ContinuousAxis, ContinuousScanInfo, TTLStepperConfig
 
 _POLL_INTERVAL = 0.05  # 50 ms - matches the 20 Hz stream rate
 _FLOAT_ADAPTER = TypeAdapter(float)
@@ -87,3 +88,24 @@ class ContinuousAxisHandle(DeviceHandle[ContinuousAxis]):
 
     async def reset_ttl_stepper(self) -> None:
         await self.call("reset_ttl_stepper")
+
+    # Continuous scanning
+
+    async def get_continuous_scan_info(self) -> ContinuousScanInfo | None:
+        info = await self.props.get_value("continuous_scan_info")
+        return None if info is None else ContinuousScanInfo.model_validate(info)
+
+    async def prepare_continuous_scan(self, start: float, speed: float) -> dict[str, Any]:
+        return await self.call("prepare_continuous_scan", start, speed)
+
+    async def start_continuous_scan(self, target: float) -> None:
+        await self.call("start_continuous_scan", target)
+
+    async def continuous_scan_moving(self) -> bool:
+        return await self.call("continuous_scan_moving")
+
+    async def finish_continuous_scan(self, target: float) -> dict[str, Any]:
+        return await self.call("finish_continuous_scan", target)
+
+    async def reset_continuous_scan(self) -> None:
+        await self.call("reset_continuous_scan")

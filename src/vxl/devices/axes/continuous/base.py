@@ -75,18 +75,76 @@ class TTLStepper(ABC):
         """Reset the step-and-shoot configuration and clear the buffer."""
 
 
+class ContinuousScanInfo(BaseModel, frozen=True):
+    """What a continuous scan on this axis exports.
+
+    Attributes:
+        edge_spacing: Axis travel, in axis units, per exported encoder A rising edge.
+        acceleration: Acceleration the scan uses, in axis units per second squared.
+        max_speed: Fastest speed the exported encoder signal supports, in axis units per second.
+    """
+
+    edge_spacing: float
+    acceleration: float
+    max_speed: float
+
+
+class ContinuousScanner(ABC):
+    """Abstract capability for one constant-speed move that exports the axis encoder as TTL quadrature."""
+
+    @property
+    @abstractmethod
+    def info(self) -> ContinuousScanInfo:
+        """The exported edge spacing, scan acceleration and speed limit."""
+
+    @abstractmethod
+    def prepare(self, *, start: float, speed: float) -> dict[str, Any]:
+        """Check the axis is idle, homed, fault-free and at `start`; snapshot the settings it changes;
+        apply `speed`, the scan acceleration and encoder output; enable the output. A failed prepare
+        restores what it changed, as reset does, before raising. Refuses while settings from an earlier
+        prepare are still held.
+
+        Returns:
+            The axis state read. Its ``origin`` is the position the exported encoder reports at `start`,
+            which a DAQ counting that encoder counts from.
+        """
+
+    @abstractmethod
+    def start(self, target: float) -> None:
+        """Start the single constant-speed move to `target`. Never retried."""
+
+    @abstractmethod
+    def is_scanning(self) -> bool:
+        """True while the move runs; raises on an axis fault."""
+
+    @abstractmethod
+    def finish(self, target: float) -> dict[str, Any]:
+        """Require the axis idle and settled at `target`, restore every changed setting (output off first),
+        and return the final state."""
+
+    @abstractmethod
+    def reset(self) -> None:
+        """Idempotent cleanup after any failure: halt if moving, wait (bounded) for idle, restore settings,
+        and force the encoder output off. Raises if any step failed, after attempting all of them."""
+
+
 class ScanMode(StrEnum):
     IDLE = "IDLE"
     TTL_STEPPING = "TTL_STEPPING"
+    CONTINUOUS = "CONTINUOUS"
 
 
 class ContinuousAxisController(DeviceController["ContinuousAxis"]):
-    """Controller for ContinuousAxis with TTL stepping support."""
+    """Controller for ContinuousAxis with TTL stepping and continuous scan support.
+
+    TTL stepping and continuous scanning exclude each other: each mode's commands refuse while the other is active.
+    """
 
     def __init__(self, device: "ContinuousAxis", stream_interval: float = 0.05):
         super().__init__(device, stream_interval=stream_interval)
         self._scan_mode = ScanMode.IDLE
         self._ttl_stepper = device.get_ttl_stepper()
+        self._continuous_scanner = device.get_continuous_scanner()
 
     @property
     @describe(label="Scan Mode", stream=True)
@@ -131,9 +189,69 @@ class ContinuousAxisController(DeviceController["ContinuousAxis"]):
         if not self._ttl_stepper:
             self.log.warning("reset_ttl_stepper called but axis %s has no TTL stepper", self.device.uid)
             return
+        if self._scan_mode == ScanMode.CONTINUOUS:
+            raise RuntimeError("Cannot reset the TTL stepper during a continuous scan")
 
         await self._run_sync(self._ttl_stepper.reset)
         self._scan_mode = ScanMode.IDLE
+
+    @property
+    @describe(label="Continuous Scan")
+    def continuous_scan_info(self) -> ContinuousScanInfo | None:
+        return self._continuous_scanner.info if self._continuous_scanner else None
+
+    def _scanner(self) -> ContinuousScanner:
+        if not self._continuous_scanner:
+            raise NotImplementedError(f"Axis {self.device.uid} does not support continuous scanning")
+        return self._continuous_scanner
+
+    def _prepared_scanner(self) -> ContinuousScanner:
+        scanner = self._scanner()
+        if self._scan_mode != ScanMode.CONTINUOUS:
+            raise RuntimeError("Continuous scan not prepared")
+        return scanner
+
+    @describe(label="Prepare Continuous Scan")
+    async def prepare_continuous_scan(self, start: float, speed: float) -> dict[str, Any]:
+        scanner = self._scanner()
+        if self._scan_mode != ScanMode.IDLE:
+            raise RuntimeError(f"Cannot prepare a continuous scan while in {self._scan_mode} mode")
+
+        # Claim the mode before the blocking call so a concurrent TTL configure cannot also pass its IDLE check.
+        self._scan_mode = ScanMode.CONTINUOUS
+        try:
+            return await self._run_sync(scanner.prepare, start=start, speed=speed)
+        except BaseException:
+            self._scan_mode = ScanMode.IDLE
+            raise
+
+    @describe(label="Start Continuous Scan")
+    async def start_continuous_scan(self, target: float) -> None:
+        await self._run_sync(self._prepared_scanner().start, target)
+
+    @describe(label="Continuous Scan Moving")
+    async def continuous_scan_moving(self) -> bool:
+        return await self._run_sync(self._prepared_scanner().is_scanning)
+
+    @describe(label="Finish Continuous Scan")
+    async def finish_continuous_scan(self, target: float) -> dict[str, Any]:
+        state = await self._run_sync(self._prepared_scanner().finish, target)
+        self._scan_mode = ScanMode.IDLE
+        return state
+
+    @describe(label="Reset Continuous Scan")
+    async def reset_continuous_scan(self) -> None:
+        if not self._continuous_scanner:
+            self.log.warning("reset_continuous_scan called but axis %s has no continuous scanner", self.device.uid)
+            return
+        if self._scan_mode == ScanMode.TTL_STEPPING:
+            raise RuntimeError("Cannot reset a continuous scan while TTL stepping")
+
+        try:
+            await self._run_sync(self._continuous_scanner.reset)
+        finally:
+            # Reset attempts every cleanup step before raising, and can be retried from IDLE.
+            self._scan_mode = ScanMode.IDLE
 
 
 class ContinuousAxis(Axis):
@@ -337,6 +455,16 @@ class ContinuousAxis(Axis):
 
         Returns:
             TTLStepper instance if supported, None otherwise.
+        """
+        return None
+
+    def get_continuous_scanner(self) -> ContinuousScanner | None:
+        """Return a ContinuousScanner capability object if supported, otherwise None.
+
+        This is an optional capability for axes that can move at constant speed while exporting their encoder.
+
+        Returns:
+            ContinuousScanner instance if supported, None otherwise.
         """
         return None
 
