@@ -164,13 +164,17 @@ class SignalGenerator(Device):
 
     @abstractmethod
     def stop(self) -> None:
-        """Halt output.
+        """Halt output at a cycle boundary.
 
-        Drivers are expected to leave outputs at the per-port rest voltage. Hardware
-        that holds the last written sample after stop (e.g. NI-DAQmx) satisfies this
-        implicitly when waveforms end on their rest sample; other drivers may need an
-        explicit final write. If no ``write`` has happened yet, this is effectively a
-        no-op beyond halting any running task.
+        No new cycle starts, and the cycle in progress plays to its end so every line
+        finishes on its rest sample. Hardware that holds the last generated sample after
+        stop (e.g. NI-DAQmx) then stays at rest; other drivers may need an explicit
+        final write. If no ``write`` has happened yet, this is effectively a no-op
+        beyond halting any running task.
+
+        Raises:
+            RuntimeError: The cycle in progress did not end in time. Output is halted
+                anyway, so the lines may not be at rest.
         """
 
     @abstractmethod

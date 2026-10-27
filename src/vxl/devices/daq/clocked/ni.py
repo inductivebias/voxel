@@ -9,6 +9,7 @@ live there.
 """
 
 import logging
+import time
 from collections.abc import Mapping
 from typing import Annotated, Literal
 
@@ -55,6 +56,10 @@ Trigger = Annotated[CounterTrigger | InputTrigger, Discriminator("type")]
 
 _TRIGGER_ADAPTER = TypeAdapter(Trigger)
 
+# stop() waits at most one cycle period plus this margin for the cycle in progress to end.
+_CYCLE_END_MARGIN_S = 0.1
+_CYCLE_END_POLL_S = 0.001
+
 
 class NiSignalGenerator(SignalGenerator):
     """NI-DAQmx analog-output engine.
@@ -89,6 +94,8 @@ class NiSignalGenerator(SignalGenerator):
         self._co_task: NiTask | None = None
         self._lease: NiTaskLease | None = None
         self._ao_channel_order: list[str] = []  # port names in the order NI applied them
+        self._cycle_samples = 0  # AO samples per channel in one cycle
+        self._cycle_period_s = 0.0  # duration + rest_time
 
         self._finite_repeat: int | None = None  # last start()'s repeat arg; None = continuous
 
@@ -110,7 +117,9 @@ class NiSignalGenerator(SignalGenerator):
         rest_time = signals.rest_time
 
         num_samples = int(float(sample_rate) * float(duration))
-        frame_freq = 1.0 / (float(duration) + float(rest_time))
+        self._cycle_samples = num_samples
+        self._cycle_period_s = float(duration) + float(rest_time)
+        frame_freq = 1.0 / self._cycle_period_s
 
         # Input PFIs are validated but not exclusively claimed; an output PFI
         # driven by the counter is part of the lease.
@@ -309,16 +318,43 @@ class NiSignalGenerator(SignalGenerator):
             raise RuntimeError(f"{self.uid}: no CO task to wait on (input-trigger path)")
 
     def stop(self) -> None:
-        # NI AO tasks hold the last written sample on the DAC after stop. Waveforms are
-        # authored to end on their rest voltage, so the line settles there without an
-        # explicit final write.
-        # TODO: verify on real hardware that the DAC actually holds (rather than going
-        # high-Z or zero) after task.stop() — confirm with a scope on the pin post-stop.
+        """Stop the counter, let the AO cycle in progress finish, then stop the AO task.
+
+        NI AO tasks hold the last generated sample on the DAC after stop, so a whole
+        cycle leaves every line on its rest sample.
+
+        Raises:
+            RuntimeError: The cycle did not finish within one cycle period plus 0.1 s.
+                The AO task is stopped anyway, so the lines may not be at rest.
+        """
         if self._co_task is not None:
             self._co_task.stop()
-        if self._ao_task is not None:
-            self._ao_task.stop()
-        self._finite_repeat = None
+        ao_task = self._ao_task
+        if ao_task is None:
+            self._finite_repeat = None
+            return
+        try:
+            finished = self._wait_for_cycle_end(ao_task)
+        finally:
+            ao_task.stop()
+            self._finite_repeat = None
+        if not finished:
+            raise RuntimeError(
+                f"{self.uid}: AO output stopped mid-cycle after waiting "
+                f"{self._cycle_period_s + _CYCLE_END_MARGIN_S:.3f} s; the lines may not be at rest"
+            )
+
+    def _wait_for_cycle_end(self, ao_task: NiTask) -> bool:
+        """Poll until the AO has generated a whole number of cycles; False on timeout.
+
+        A retriggered AO task that was never triggered has generated zero samples.
+        """
+        deadline = time.monotonic() + self._cycle_period_s + _CYCLE_END_MARGIN_S
+        while ao_task.out_stream.total_samp_per_chan_generated % self._cycle_samples:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(_CYCLE_END_POLL_S)
+        return True
 
     def can_hotswap(self, old: Signals | None, new: Signals) -> bool:
         """Always False for this driver — every load takes the full rebuild path.
