@@ -4,7 +4,7 @@ import logging
 from collections.abc import Mapping
 from typing import Annotated, Literal, Self
 
-from pydantic import ConfigDict, Field, RootModel, field_validator, model_validator
+from pydantic import ConfigDict, Field, RootModel, StringConstraints, field_validator, model_validator
 from vxlib.schema import FrozenModel, identifier
 
 from rigup import DeviceConfig, RigConfig
@@ -13,11 +13,33 @@ from .errors import Violation, ViolationLoc, assignment_violations
 
 logger = logging.getLogger(__name__)
 
+type StageAxisName = Literal["x", "y", "z"]
+type StageAxisLabel = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4)]
+
 
 class StageAxes(FrozenModel):
+    """Device uids of Voxel's logical stage axes: x and y span the tile grid, z is the stack (scan) axis."""
+
     x: str
     y: str
     z: str
+    labels: dict[StageAxisName, StageAxisLabel] = Field(
+        default_factory=dict,
+        description="Names operators use for the physical axes, shown instead of the logical letters",
+    )
+
+    @model_validator(mode="after")
+    def _validate_distinct_labels(self) -> Self:
+        # Unlabeled axes keep their letters, so labeling z "X" alone would show two X axes.
+        seen: dict[str, StageAxisName] = {}
+        for axis in ("x", "y", "z"):
+            if (other := seen.setdefault(self.label(axis).casefold(), axis)) != axis:
+                raise ValueError(f"stage axes '{other}' and '{axis}' would both be labeled '{self.label(axis)}'")
+        return self
+
+    def label(self, axis: StageAxisName) -> str:
+        """Return the name operators know ``axis`` by: its label, else the upper-case logical letter."""
+        return self.labels.get(axis, axis.upper())
 
 
 class OpticalAssembly(FrozenModel):

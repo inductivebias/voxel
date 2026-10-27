@@ -9,11 +9,18 @@ export interface DeviceConfig {
   autosave?: '*' | string[];
 }
 
+/** A logical stage axis: x and y span the tile grid, z is the stack (scan) axis. */
+export type StageAxis = 'x' | 'y' | 'z';
+
+/** The names operators use for the physical axes, by logical axis; unlabeled axes show their letter. */
+export type StageAxisLabels = Partial<Record<StageAxis, string>>;
+
 /** Stage axis → device-id mapping. */
 export interface StageConfig {
   x: string;
   y: string;
   z: string;
+  labels?: StageAxisLabels;
 }
 
 export interface OpticalAssemblyConfig {

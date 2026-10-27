@@ -572,10 +572,10 @@
           bind:this={zContainer}
           class="relative min-h-0 min-w-0 flex-1 border border-line-faint transition-colors duration-300 ease-in-out hover:bg-tint-hover"
         >
-          <p class="absolute top-1 right-1 z-20 text-fg-muted">Z</p>
+          <p class="absolute top-1 right-1 z-20 text-fg-muted">{instrument.stage.label('z')}</p>
           <input
             type="range"
-            aria-label="Stage Z"
+            aria-label={`Stage ${instrument.stage.label('z')}`}
             class="stage-slider absolute inset-0 z-10 size-full"
             style:--thumb-length="{zHeight}px"
             min={zLower}

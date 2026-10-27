@@ -263,6 +263,7 @@
   {/snippet}
 </PageHeader>
 {#if instrument && task}
+  {@const stage = instrument.stage}
   <div class="flex page-body flex-col gap-4 pb-0!">
     <Section heading="XY coverage" variant="bordered">
       {#snippet trailing()}
@@ -284,7 +285,7 @@
               axis="x"
               value={bounds.minX}
               max={bounds.maxX}
-              prefix="X"
+              prefix={stage.qualifiedLabel('x')}
               {unit}
               onEditStart={() => instrument.edits.hold()}
               onChange={(value, edit) => updateBound('x', 'min', value, edit)}
@@ -295,7 +296,7 @@
               axis="y"
               value={bounds.minY}
               max={bounds.maxY}
-              prefix="Y"
+              prefix={stage.qualifiedLabel('y')}
               {unit}
               onEditStart={() => instrument.edits.hold()}
               onChange={(value, edit) => updateBound('y', 'min', value, edit)}
@@ -308,7 +309,7 @@
               axis="x"
               value={bounds.maxX}
               min={bounds.minX}
-              prefix="X"
+              prefix={stage.qualifiedLabel('x')}
               {unit}
               onEditStart={() => instrument.edits.hold()}
               onChange={(value, edit) => updateBound('x', 'max', value, edit)}
@@ -319,7 +320,7 @@
               axis="y"
               value={bounds.maxY}
               min={bounds.minY}
-              prefix="Y"
+              prefix={stage.qualifiedLabel('y')}
               {unit}
               onEditStart={() => instrument.edits.hold()}
               onChange={(value, edit) => updateBound('y', 'max', value, edit)}
@@ -355,12 +356,16 @@
                   {/if}
 
                   <div class="grid min-w-0 cursor-auto grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center">
-                    {@render coordinate(item.point.x, `Point ${index + 1} X`, (value, context) =>
-                      updateLayoutPoint(index, 'x', value, context)
+                    {@render coordinate(
+                      item.point.x,
+                      `Point ${index + 1} ${stage.qualifiedLabel('x')}`,
+                      (value, context) => updateLayoutPoint(index, 'x', value, context)
                     )}
                     <span class="px-0.5 text-fg-muted select-none">,</span>
-                    {@render coordinate(item.point.y, `Point ${index + 1} Y`, (value, context) =>
-                      updateLayoutPoint(index, 'y', value, context)
+                    {@render coordinate(
+                      item.point.y,
+                      `Point ${index + 1} ${stage.qualifiedLabel('y')}`,
+                      (value, context) => updateLayoutPoint(index, 'y', value, context)
                     )}
                   </div>
 
@@ -584,12 +589,15 @@
           {#each volumeRows as { volume, index } (`${volume.profile}:${volume.x}:${volume.y}:${index}`)}
             <div
               class="flex min-w-0 items-center gap-1.5 py-1.5 pr-2.5 pl-2 hover:bg-tint-hover"
-              aria-label={`Volume ${index + 1}, ${profileLabel(volume.profile)}, X ${formatCoordinate(volume.x)} ${unit.label}, Y ${formatCoordinate(volume.y)} ${unit.label}, Z ${formatCoordinate(volume.z_start)} to ${formatCoordinate(volume.z_end)} ${unit.label}`}
+              aria-label={`Volume ${index + 1}, ${profileLabel(volume.profile)}, ${stage.qualifiedLabel('x')} ${formatCoordinate(volume.x)} ${unit.label}, ${stage.qualifiedLabel('y')} ${formatCoordinate(volume.y)} ${unit.label}, ${stage.qualifiedLabel('z')} ${formatCoordinate(volume.z_start)} to ${formatCoordinate(volume.z_end)} ${unit.label}`}
             >
               <div class="flex shrink-0 items-center gap-1 text-sm tabular-nums">
-                {@render positionChip('X', formatCoordinate(volume.x))}
-                {@render positionChip('Y', formatCoordinate(volume.y))}
-                {@render positionChip('Z', `${formatCoordinate(volume.z_start)} – ${formatCoordinate(volume.z_end)}`)}
+                {@render positionChip(stage.qualifiedLabel('x'), formatCoordinate(volume.x))}
+                {@render positionChip(stage.qualifiedLabel('y'), formatCoordinate(volume.y))}
+                {@render positionChip(
+                  stage.qualifiedLabel('z'),
+                  `${formatCoordinate(volume.z_start)} – ${formatCoordinate(volume.z_end)}`
+                )}
               </div>
               <span
                 class="min-w-20 truncate rounded-sm bg-tint px-1.5 py-0.5 whitespace-nowrap text-fg-muted"

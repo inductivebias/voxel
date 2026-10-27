@@ -52,6 +52,39 @@ def test_topology_rejects_unknown_fields() -> None:
         HardwareTopology.model_validate({**topology.model_dump(), "stgae": topology.stage})
 
 
+def test_stage_axis_labels_default_to_the_logical_letters() -> None:
+    stage = _hal_config().stage
+
+    assert stage.labels == {}
+    assert [stage.label(axis) for axis in ("x", "y", "z")] == ["X", "Y", "Z"]
+
+
+def test_stage_axis_labels_replace_logical_letters_and_round_trip() -> None:
+    topology = _hal_config()
+    payload = topology.model_dump()
+    payload["stage"]["labels"] = {"x": "Z", "z": " X "}
+
+    labeled = HardwareTopology.model_validate(payload)
+
+    assert [labeled.stage.label(axis) for axis in ("x", "y", "z")] == ["Z", "Y", "X"], "labels are stripped"
+    assert HardwareTopology.model_validate(labeled.model_dump()) == labeled
+
+
+@pytest.mark.parametrize(
+    ("labels", "message"),
+    [
+        ({"w": "W"}, "Input should be 'x', 'y' or 'z'"),
+        ({"z": "  "}, "at least 1 character"),
+        ({"z": "Scan1"}, "at most 4 characters"),
+        ({"z": "X"}, "stage axes 'x' and 'z' would both be labeled 'X'"),
+        ({"x": "Pan", "y": "pan"}, "stage axes 'x' and 'y' would both be labeled 'pan'"),
+    ],
+)
+def test_stage_axis_labels_reject_unknown_axes_and_ambiguous_names(labels: dict[str, str], message: str) -> None:
+    with pytest.raises(ValidationError, match=message):
+        StageAxes.model_validate({"x": "x_axis", "y": "y_axis", "z": "z_axis", "labels": labels})
+
+
 def test_optical_routing_config_uses_named_routes_with_selector_assignments() -> None:
     payload = {
         "excitation_side": {

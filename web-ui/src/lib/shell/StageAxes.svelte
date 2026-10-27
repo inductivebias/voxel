@@ -34,7 +34,7 @@
       max={fromMicrometers(stage.axis(axis)?.upperLimit?.value ?? 1, unit.value)}
       step={fromMicrometers(step, unit.value)}
       decimals={unit.decimals}
-      prefix={axis.toUpperCase()}
+      prefix={stage.label(axis)}
       suffix={unit.label}
       class={cn('w-full min-w-0', stage.moving(axis) && 'animate-pulse text-fg-muted')}
     />

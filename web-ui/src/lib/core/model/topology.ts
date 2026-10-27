@@ -1,5 +1,5 @@
-import { assignDeviceRoles, type DeviceRole } from './device-rules';
-import type { DeviceConfig, HALConfig, ImagingProtocol } from './types';
+import { assignDeviceRoles, type DeviceRole } from './device-rules.ts';
+import type { DeviceConfig, HALConfig, ImagingProtocol, StageAxis, StageAxisLabels } from './types';
 
 interface DeviceReference {
   deviceId: string;
@@ -39,6 +39,17 @@ function collectReferences(value: unknown, deviceIds: Set<string>, path: string,
   }
 }
 
+/** The name operators know a stage axis by: its configured label, else its upper-case logical letter. */
+export function stageAxisLabel(labels: StageAxisLabels | undefined, axis: StageAxis): string {
+  return labels?.[axis] ?? axis.toUpperCase();
+}
+
+/** A stage axis label followed by its logical axis when the two differ, as in "X (z)". */
+export function qualifiedStageAxisLabel(labels: StageAxisLabels | undefined, axis: StageAxis): string {
+  const label = stageAxisLabel(labels, axis);
+  return label.toLowerCase() === axis ? label : `${label} (${axis})`;
+}
+
 export function resolveDeviceConfig(hal: HALConfig, deviceId: string, nodeId: string | null): DeviceConfig | undefined {
   return nodeId === null ? hal.devices[deviceId] : hal.nodes[nodeId]?.devices[deviceId];
 }
@@ -61,8 +72,8 @@ export function buildDeviceUsageIndex(hal: HALConfig): DeviceUsageIndex {
     else usages.set(deviceId, [label]);
   };
 
-  for (const [axis, axisDeviceId] of Object.entries(hal.stage)) {
-    add(axisDeviceId, `Stage ${axis.toUpperCase()} axis`);
+  for (const axis of ['x', 'y', 'z'] as const) {
+    add(hal.stage[axis], `Stage ${stageAxisLabel(hal.stage.labels, axis)} axis`);
   }
   for (const [pathId, path] of Object.entries(hal.detection)) {
     add(pathId, 'Detection camera');

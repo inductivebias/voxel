@@ -10,7 +10,8 @@ import {
   LaserHandle,
   NumericModel,
   type Prop,
-  SignalGeneratorHandle
+  SignalGeneratorHandle,
+  stageAxisLabel
 } from '$lib/core/model';
 import { displayName, trimFloat } from '$lib/core/utils';
 import { numberDisplay } from '$lib/kit';
@@ -95,8 +96,8 @@ const ROLE_LABELS: Record<DeviceRole, string> = {
 
 export function roleLabel(hal: HALConfig, deviceId: string, role: DeviceRole, device?: DeviceHandle): string {
   if (role === 'stage') {
-    const axis = Object.entries(hal.stage).find(([, id]) => id === deviceId)?.[0];
-    return axis ? `Stage ${axis.toUpperCase()}` : ROLE_LABELS.stage;
+    const axis = (['x', 'y', 'z'] as const).find((candidate) => hal.stage[candidate] === deviceId);
+    return axis ? `Stage ${stageAxisLabel(hal.stage.labels, axis)}` : ROLE_LABELS.stage;
   }
   if (role !== 'other') return ROLE_LABELS[role];
   const type = device?.interface?.type;

@@ -326,8 +326,8 @@
             ? 'text-fg-muted'
             : 'text-fg-faint'}"
         >
-          <span>X {formatSpatialValue(cursor.x, prefs.spatialUnit.get())}</span>
-          <span>Y {formatSpatialDistance(cursor.y, prefs.spatialUnit.get())}</span>
+          <span>{stage.label('x')} {formatSpatialValue(cursor.x, prefs.spatialUnit.get())}</span>
+          <span>{stage.label('y')} {formatSpatialDistance(cursor.y, prefs.spatialUnit.get())}</span>
           {#if !inBounds}<span>· out of range</span>{/if}
         </div>
       {/if}
@@ -429,7 +429,7 @@
               {@const selected = taskColors.get()[key]?.[axis] ?? ''}
               {#if index}<ContextMenu.Separator />{/if}
               <ContextMenu.RadioGroup
-                aria-label={`${axis.toUpperCase()} split`}
+                aria-label={`${stage.qualifiedLabel(axis)} split`}
                 value={dimensions.some((dimension) => dimension.id === selected) ? selected : ''}
                 onValueChange={(value) =>
                   taskColors.set({
@@ -437,7 +437,7 @@
                     [key]: { ...taskColors.get()[key], [axis]: value }
                   })}
               >
-                <ContextMenu.GroupHeading>{axis.toUpperCase()} split</ContextMenu.GroupHeading>
+                <ContextMenu.GroupHeading>{stage.qualifiedLabel(axis)} split</ContextMenu.GroupHeading>
                 <ContextMenu.RadioItem value="" closeOnSelect={false}>None</ContextMenu.RadioItem>
                 {#each dimensions as dimension (dimension.id)}
                   <ContextMenu.RadioItem value={dimension.id} closeOnSelect={false}>

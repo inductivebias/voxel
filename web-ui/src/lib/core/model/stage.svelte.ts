@@ -1,8 +1,7 @@
 /** The stage of the open instrument: its axes, imageable bounds and moves. */
 import { AxisHandle } from './device.svelte';
-import type { StageOrientation } from './types';
-
-export type StageAxis = 'x' | 'y' | 'z';
+import { qualifiedStageAxisLabel, stageAxisLabel } from './topology';
+import type { StageAxis, StageAxisLabels, StageOrientation } from './types';
 
 /** Stage extent per axis (µm). Structurally a superset of the renderer's 2D `Bounds` (X/Y). */
 export interface StageBounds {
@@ -34,9 +33,20 @@ export class Stage {
     readonly z: AxisHandle,
     getFov: () => [number, number] | null,
     /** Per-axis display sign shared with the renderers (hardcoded upstream for now). */
-    readonly orientation: StageOrientation
+    readonly orientation: StageOrientation,
+    readonly labels: StageAxisLabels = {}
   ) {
     this.#getFov = getFov;
+  }
+
+  /** The name operators know an axis by, for controls and readouts that move or show the stage. */
+  label(a: StageAxis): string {
+    return stageAxisLabel(this.labels, a);
+  }
+
+  /** The label with the logical axis when they differ, as in "X (z)", for task geometry in stage coordinates. */
+  qualifiedLabel(a: StageAxis): string {
+    return qualifiedStageAxisLabel(this.labels, a);
   }
 
   /** Field of view (µm), read live so a FOV change doesn't rebuild the whole Stage. */

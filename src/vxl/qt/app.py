@@ -30,6 +30,7 @@ from vxlib.lifecycle import Teardown  # noqa: TC002 — runtime annotation alias
 
 from vxl._utils.color import Color
 from vxl._utils.logging import configure_logging
+from vxl.hal import StageAxes
 from vxl.instrument import Instrument
 from vxl.instrument.store import InstrumentInspection
 from vxl.qt.devices import DevicesStore
@@ -160,12 +161,16 @@ class Footer(QWidget):
     """Stage position + per-laser indicators, shown inline with the tab bar. Binds to the device and
     stage stores directly (no app/coordinator)."""
 
-    def __init__(self, devices: DevicesStore, stage: StageStore, parent: QWidget | None = None) -> None:
+    def __init__(
+        self, devices: DevicesStore, stage: StageStore, axes: StageAxes, parent: QWidget | None = None
+    ) -> None:
         super().__init__(parent)
         self._devices = devices
         self._stage = stage
+        self._axes = axes
         self.setFixedHeight(Size.XL)
-        self._stage_label = Text.value("X: 0.000  Y: 0.000  Z: 0.000", color=Colors.TEXT_MUTED)
+        self._stage_label = Text.value("", color=Colors.TEXT_MUTED)
+        self._on_position()
         self._laser_box = Flex.hstack(spacing=Spacing.XS)
         self._indicators: dict[str, Text] = {}
         content = Flex.hstack(
@@ -199,8 +204,11 @@ class Footer(QWidget):
             dot.fmt = dot.fmt.with_(color=color)
 
     def _on_position(self) -> None:
-        s = self._stage
-        self._stage_label.setText(f"X: {s.x.position:.3f}  Y: {s.y.position:.3f}  Z: {s.z.position:.3f}")
+        s, axes = self._stage, self._axes
+        self._stage_label.setText(
+            f"{axes.label('x')}: {s.x.position:.3f}  {axes.label('y')}: {s.y.position:.3f}  "
+            f"{axes.label('z')}: {s.z.position:.3f}"
+        )
 
 
 class MainWindow(QMainWindow):
@@ -281,7 +289,7 @@ class MainWindow(QMainWindow):
         tabs.add_tab(WaveformsPanel(), "Waveforms")
         self._logs = LogPanel()
         tabs.add_tab(self._logs, "Logs")
-        tabs.set_status_widget(Footer(self._devices, self._stage))
+        tabs.set_status_widget(Footer(self._devices, self._stage, self._instrument.hardware_config.stage))
         center.addWidget(tabs)
         center.setSizes([600, 400])
 

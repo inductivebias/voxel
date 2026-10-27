@@ -390,7 +390,7 @@ class GridCanvas(QWidget):
 
 
 class StageControls(QWidget):
-    """X/Y/Z slider+spinboxes bound to each stage axis's ``position`` property.
+    """A slider+spinbox per stage axis, named by its label and bound to the axis's ``position`` property.
 
     The ``position`` model is deliminated, so a single property carries both the live value and the
     range (``minimum``/``maximum`` = the axis limits); :func:`bind_slider_spinbox` drives the range and
@@ -404,7 +404,7 @@ class StageControls(QWidget):
         super().__init__(parent)
         self._devices = devices
         cfg = instrument.hardware_config.stage
-        self._axis_uids = {"X": cfg.x, "Y": cfg.y, "Z": cfg.z}
+        self._axis_uids = {cfg.label("x"): cfg.x, cfg.label("y"): cfg.y, cfg.label("z"): cfg.z}
         self._sliders: dict[str, SliderSpinBox] = {}
         self._bound = False
 

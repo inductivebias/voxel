@@ -582,7 +582,8 @@
           max="100"
           aria-label="Acquisition progress"
         ></progress>
-        {#if manifest && active && volume}
+        {#if instrument && manifest && active && volume}
+          {@const stage = instrument.stage}
           <dl class={DETAILS}>
             <dt>Volume</dt>
             <dd>{active.volume_index + 1} of {manifest.volumes.length}</dd>
@@ -592,7 +593,9 @@
             <dd class="font-mono tabular-nums">{active.frames_captured} / {framesTotal}</dd>
             <dt>Position</dt>
             <dd class="font-mono tabular-nums">
-              X {formatSpatialValue(volume.x, unit.value)}, Y {formatSpatialValue(volume.y, unit.value)}, Z
+              {stage.qualifiedLabel('x')}
+              {formatSpatialValue(volume.x, unit.value)}, {stage.qualifiedLabel('y')}
+              {formatSpatialValue(volume.y, unit.value)}, {stage.qualifiedLabel('z')}
               {formatSpatialValue(volume.z_start, unit.value)} to {formatSpatialValue(volume.z_end, unit.value)}
               {unit.label}
             </dd>

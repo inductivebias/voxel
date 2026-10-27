@@ -141,6 +141,7 @@
         dimension.resolved != null && dimension.current != null && dimension.current !== dimension.resolved}
       {@const found = issues.about({ dimension: dimension.id })}
       {@const position = dimension.axis ? instrument.stage.axis(dimension.axis).position?.value : null}
+      {@const splitAxis = dimension.axis && instrument.stage.qualifiedLabel(dimension.axis)}
       <Section
         id={`routing-${dimension.id}`}
         heading={displayName(dimension.id)}
@@ -150,7 +151,7 @@
         class="scroll-mt-3"
       >
         {#snippet trailing()}
-          <Badge>{dimension.axis ? `split by stage ${dimension.axis.toUpperCase()}` : 'fixed choice'}</Badge>
+          <Badge>{splitAxis ? `split by stage ${splitAxis}` : 'fixed choice'}</Badge>
         {/snippet}
 
         <div class="col-span-full grid grid-cols-subgrid items-center gap-y-2 p-2.5">
@@ -163,7 +164,7 @@
                     {model}
                     displayScale={unit.scale}
                     decimals={unit.decimals}
-                    prefix={`${dimension.axis?.toUpperCase()} split`}
+                    prefix={splitAxis && `${splitAxis} split`}
                     suffix={unit.label}
                     class="min-w-0 flex-1 rounded-r-none"
                     {disabled}

@@ -18,7 +18,7 @@ import { assignDeviceRoles, type DeviceRoleAssignment } from './device-rules';
 import { createEditQueue } from './edit-queue.svelte';
 import { ProfileLinks } from './profile-links.svelte';
 import { type EditContext, EnumeratedModel, NumericModel } from './prop.svelte';
-import { Stage, type StageAxis } from './stage.svelte';
+import { Stage } from './stage.svelte';
 import type {
   AcquisitionManifest,
   AcquisitionRequest,
@@ -38,6 +38,7 @@ import type {
   SensorROI,
   SessionView,
   Signals,
+  StageAxis,
   TaskPatch,
   WriterPatch
 } from './types';
@@ -275,7 +276,7 @@ export class Instrument {
     const sy = this.#stageAxis('y');
     const sz = this.#stageAxis('z');
     if (!sx || !sy || !sz) throw new Error('Instrument stage must map all three (X/Y/Z) axes');
-    this.stage = new Stage(sx, sy, sz, () => this.fov, DEFAULT_STAGE_ORIENTATION);
+    this.stage = new Stage(sx, sy, sz, () => this.fov, DEFAULT_STAGE_ORIENTATION, this.hal.stage.labels);
     this.#syncProfileLinks();
     this.#syncRoutingDimensions();
     void this.#syncMetadataSchema();

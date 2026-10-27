@@ -18,12 +18,7 @@
 
   const AXES: readonly Axis[] = ['x', 'y', 'z'];
   const GIZMO_VIEWS: readonly GizmoView[] = ['iso', 'xy', 'xz', 'yz'];
-  const GIZMO_TITLES: Record<GizmoView, string> = {
-    iso: 'View all 3 axes',
-    xy: 'View down Z',
-    xz: 'View down Y',
-    yz: 'View down X'
-  };
+  const GIZMO_DOWN: Record<Exclude<GizmoView, 'iso'>, Axis> = { xy: 'z', xz: 'y', yz: 'x' };
   const GIZMO_AXES: Record<GizmoView, Record<Axis, boolean>> = {
     iso: { x: true, y: true, z: true },
     xy: { x: true, y: true, z: false },
@@ -62,6 +57,10 @@
 
   function goHome(handle: AxisHandle): void {
     reportFailure(handle.runCommand('go_home', [], { wait: false }));
+  }
+
+  function gizmoTitle(view: GizmoView): string {
+    return view === 'iso' ? 'View all 3 axes' : `View down ${stage.label(GIZMO_DOWN[view])}`;
   }
 </script>
 
@@ -118,10 +117,10 @@
           <span class="flex min-w-0 items-center gap-2">
             <span
               class={cn(
-                'flex size-5 shrink-0 items-center justify-center rounded-sm text-sm font-medium uppercase',
+                'flex h-5 min-w-5 shrink-0 items-center justify-center rounded-sm px-1 text-sm font-medium',
                 AXIS_TAGS[axis]
               )}
-              aria-hidden="true">{axis}</span
+              aria-hidden="true">{stage.label(axis)}</span
             >
             <a
               href={deviceHref({ stationId: instrument.stationId, instrumentId: instrument.id }, handle.id)}
@@ -151,7 +150,7 @@
                   max={upper}
                   onChange={(position) => move(axis, position)}
                   disabled={locked}
-                  aria-label={`${axis.toUpperCase()} position`}
+                  aria-label={`${stage.label(axis)} position`}
                 />
               {/if}
             </div>
@@ -167,7 +166,7 @@
                 suffix={unit.label}
                 onChange={(position) => move(axis, position)}
                 disabled={locked}
-                aria-label={`${axis.toUpperCase()} position`}
+                aria-label={`${stage.label(axis)} position`}
               />
             {/key}
           </div>
@@ -208,17 +207,17 @@
         {@const picked = view === gizmoView}
         <label
           class={cn(
-            'flex h-6 w-9 cursor-pointer items-center justify-center rounded-sm font-mono text-sm transition-colors has-focus-visible:outline-2 has-focus-visible:outline-focus',
+            'flex h-6 min-w-9 cursor-pointer items-center justify-center rounded-sm px-1 font-mono text-sm transition-colors has-focus-visible:outline-2 has-focus-visible:outline-focus',
             picked ? 'bg-element-selected' : 'opacity-60 hover:bg-element-hover hover:opacity-100'
           )}
-          title={GIZMO_TITLES[view]}
+          title={gizmoTitle(view)}
         >
           <input type="radio" name="gizmo-view" value={view} bind:group={gizmoView} class="sr-only" />
           {#if view === 'iso'}
             <span class="text-fg">3D</span>
           {:else}
             {#each [...view] as Axis[] as axis (axis)}
-              <span class={AXIS_TEXT[axis]}>{axis.toUpperCase()}</span>
+              <span class={AXIS_TEXT[axis]}>{stage.label(axis)}</span>
             {/each}
           {/if}
         </label>
