@@ -4,7 +4,6 @@ import argparse
 import sys
 from collections.abc import Sequence
 from importlib import import_module
-from ipaddress import IPv4Address
 from pathlib import Path
 from types import ModuleType
 from typing import TextIO
@@ -16,7 +15,7 @@ from .station import import_catalog
 from .station import initialize as initialize_station
 
 _COMMANDS = {"check", "serve", "web", "qt", "node", "station"}
-_DEFAULT_HOST = str(IPv4Address(0))
+_DEFAULT_HOST = "127.0.0.1"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -28,7 +27,7 @@ def build_parser() -> argparse.ArgumentParser:
     check.add_argument("--json", action="store_true", dest="as_json", help="emit machine-readable JSON")
 
     serve = commands.add_parser("serve", aliases=["web"], help="launch the web application")
-    serve.add_argument("--host", default=_DEFAULT_HOST, help="bind address (default: all interfaces)")
+    serve.add_argument("--host", default=_DEFAULT_HOST, help="bind address (default: loopback)")
     serve.add_argument("--port", type=int, default=8000, help="web server port")
     serve.add_argument("--debug", action="store_true", help="enable debug logging")
 

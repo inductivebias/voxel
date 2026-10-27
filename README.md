@@ -44,6 +44,12 @@ uv run vxl serve
 Open [http://localhost:8000](http://localhost:8000), create an instrument from the `simulated-local` template, and
 open it. The simulated configuration exercises the application without requiring microscope hardware.
 
+The server binds loopback by default. For remote access, an SSH tunnel preserves that default.
+Direct remote serving requires `VOXEL_WEB_PASSWORD` and an explicit `--host`; the browser username is
+`voxel`. Put direct remote serving behind HTTPS. HTTP authentication establishes an HttpOnly session
+cookie shared with the WebSocket connections. Browser origins and host headers are checked;
+`--debug` additionally permits the local frontend development origins on port 5173.
+
 Station initialization is a one-time operation that writes `~/.voxel/station.yaml`. Remote device nodes do not need
 a station configuration; they use an optional `~/.voxel/system.yaml`, `VOXEL_*` environment variables, or defaults.
 
@@ -139,6 +145,17 @@ uv run basedpyright
 uv run pytest
 nub run --cwd web-ui check
 ```
+
+The default type check covers the core and drivers supported by the standard environment.
+SDK-specific entry points are listed in `pyrightconfig.optional.json`; on a host with their extras
+installed, run `uv run basedpyright --project pyrightconfig.optional.json` as well. Missing imports
+remain errors in both checks. Default pre-push tests exclude `hardware` and `slow`; physical tests
+require their explicit opt-in setup.
+
+Writer settings accept a positive `io_timeout_s` (default 300 seconds) for capacity waits, uploads,
+and acquisition finalization. Increase it explicitly for a storage target that needs longer drains.
+Capture deadlines are calculated separately from the imaging recipe. A cleanup failure keeps capture
+busy until the instrument is closed and reopened, rather than permitting reuse of uncertain hardware.
 
 For frontend development, run `nub run --cwd web-ui dev` beside `uv run vxl serve`. Build the frontend and Python
 release artifacts together with `uv run scripts/build.py`.

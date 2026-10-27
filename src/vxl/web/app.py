@@ -1,6 +1,7 @@
 """FastAPI composition for the Voxel web application."""
 
 import logging
+import os
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -11,6 +12,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from starlette.exceptions import HTTPException
+from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import Receive, Scope, Send
@@ -21,6 +23,7 @@ from vxl.instrument.errors import InstrumentBusyError, OperationRejectedError, S
 from vxl.station import InstrumentTemplates, Station
 from vxl.system import StationConfig, System, load_voxel_env
 
+from .access import ControlAccess
 from .realtime import Realtime
 from .router import api_router
 
@@ -92,16 +95,21 @@ def create_app(
     templates: InstrumentTemplates | None = None,
     *,
     serve_static: bool = True,
+    allowed_origins: tuple[str, ...] = (),
+    allowed_hosts: tuple[str, ...] = ("localhost", "127.0.0.1", "[::1]"),
+    password: str | None = None,
 ) -> FastAPI:
     """Build the FastAPI application from injected runtime resources."""
     app = FastAPI(title="Voxel API", version="0.1.0", lifespan=_lifespan)
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=list(allowed_origins),
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
     )
+    app.add_middleware(ControlAccess, origins=allowed_origins, password=password)
+    app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts))
     app.state.station = station
     app.state.instrument_templates = templates if templates is not None else InstrumentTemplates()
     app.state.realtime = Realtime(station)
@@ -119,6 +127,10 @@ def create_app(
 def serve(*, host: str, port: int = 8000, debug: bool = False) -> None:
     """Run the Voxel web application as the sole hardware owner."""
     load_voxel_env()
+    remote = host not in {"localhost", "127.0.0.1", "::1"}
+    password = os.getenv("VOXEL_WEB_PASSWORD")
+    if remote and not password:
+        raise RuntimeError("Set VOXEL_WEB_PASSWORD before serving beyond loopback (browser username: voxel)")
     console_level = logging.DEBUG if debug else logging.INFO
     configure_logging(level=console_level, fmt="%(message)s", datefmt="[%X]")
     root_logger = logging.getLogger()
@@ -133,10 +145,15 @@ def serve(*, host: str, port: int = 8000, debug: bool = False) -> None:
 
     log.info("Starting Voxel...")
     log.info("Web UI: http://localhost:%d", port)
-    if (local_ip := System.local_ip()) != "127.0.0.1":
+    if remote and (local_ip := System.local_ip()) != "127.0.0.1":
         log.info("      or http://%s:%d", local_ip, port)
     uvicorn.run(
-        create_app(Station(StationConfig.load())),
+        create_app(
+            Station(StationConfig.load()),
+            password=password,
+            allowed_hosts=tuple({"localhost", "127.0.0.1", "[::1]", host, *([System.local_ip()] if remote else [])}),
+            allowed_origins=("http://localhost:5173", "http://127.0.0.1:5173") if debug else (),
+        ),
         host=host,
         port=port,
         log_config=get_uvicorn_log_config(),
