@@ -170,3 +170,19 @@ class NiDaqmx(Device):
             do_terminals=do_terminals,
             hardware_timed=hardware_timed,
         )
+
+    def reserve_input_task(
+        self,
+        owner_uid: str,
+        *,
+        counters: int,
+        timed_di_lines: Sequence[str],
+        input_pfis: Sequence[str],
+    ) -> NiTaskLease:
+        """Atomically reserve input counters, hardware-timed DI lines, and their input PFIs."""
+        return self._resource_manager.reserve_input_task(
+            owner_uid=owner_uid,
+            counters=counters,
+            timed_di_lines=timed_di_lines,
+            input_pfis=input_pfis,
+        )
