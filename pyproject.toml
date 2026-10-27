@@ -83,6 +83,7 @@ vxl-records = { workspace = true }
 [dependency-groups]
 dev = [
     "basedpyright>=1.20.0",
+    "httpx2>=2.16.0",
     "pytest>=9.0.0",
     "pytest-asyncio>=0.24.0",
     "ruff>=0.8.0",
@@ -108,6 +109,28 @@ markers = [
 
 [tool.pyright]
 typeCheckingMode = "standard"
+include = ["src", "rigup", "drivers", "vxlib", "omezarr", "records", "tests", "scripts", "bench"]
+# SDK-specific entry points are checked separately with pyrightconfig.optional.json on a host
+# providing those extras. Missing imports remain errors in both configurations.
+exclude = [
+    "**/node_modules",
+    "**/__pycache__",
+    "**/.*",
+    "drivers/src/vxl_drivers/axes/thorlabs.py",
+    "drivers/src/vxl_drivers/cameras/egrabber.py",
+    "drivers/src/vxl_drivers/cameras/ximea.py",
+    "drivers/src/vxl_drivers/lasers/genesis_mx.py",
+    "drivers/src/vxl_drivers/lasers/mpds/calibration.py",
+    "drivers/src/vxl_drivers/lasers/mpds/cli.py",
+    "drivers/src/vxl_drivers/lasers_legacy/cobolt_skyra.py",
+    "drivers/src/vxl_drivers/lasers_legacy/coherent/genesis_mx.py",
+    "drivers/src/vxl_drivers/lasers_legacy/coherent/obis.py",
+    "drivers/src/vxl_drivers/lasers_legacy/vortran_stradus.py",
+    "drivers/src/vxl_drivers/power_meters/thorlabs.py",
+    "omezarr/src/ome_zarr_writer/array/zarrs.py",
+    "omezarr/src/ome_zarr_writer/viewer/ng_view.py",
+    "scripts/generate_gradients.py",
+]
 ignore = [
     "**/sdk/**",
     "**/vendor/**",

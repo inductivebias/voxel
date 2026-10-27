@@ -58,7 +58,7 @@ repos:
 
       - id: pytest
         name: pytest (excluding @pytest.mark.slow)
-        entry: uv run pytest -m "not slow"
+        entry: uv run pytest -m "not slow and not hardware"
         language: system
         types_or: [python, pyi]
         pass_filenames: false

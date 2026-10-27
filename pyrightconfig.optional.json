@@ -1,0 +1,20 @@
+{
+  "typeCheckingMode": "standard",
+  "include": [
+    "drivers/src/vxl_drivers/axes/thorlabs.py",
+    "drivers/src/vxl_drivers/cameras/egrabber.py",
+    "drivers/src/vxl_drivers/cameras/ximea.py",
+    "drivers/src/vxl_drivers/lasers/genesis_mx.py",
+    "drivers/src/vxl_drivers/lasers/mpds/calibration.py",
+    "drivers/src/vxl_drivers/lasers/mpds/cli.py",
+    "drivers/src/vxl_drivers/lasers_legacy/cobolt_skyra.py",
+    "drivers/src/vxl_drivers/lasers_legacy/coherent/genesis_mx.py",
+    "drivers/src/vxl_drivers/lasers_legacy/coherent/obis.py",
+    "drivers/src/vxl_drivers/lasers_legacy/vortran_stradus.py",
+    "drivers/src/vxl_drivers/power_meters/thorlabs.py",
+    "omezarr/src/ome_zarr_writer/array/zarrs.py",
+    "omezarr/src/ome_zarr_writer/viewer/ng_view.py",
+    "scripts/generate_gradients.py"
+  ],
+  "ignore": ["**/sdk/**", "**/vendor/**"]
+}
