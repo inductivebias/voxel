@@ -20,6 +20,7 @@ dependencies = [
 
 [project.scripts]
 vxl-calibrate-mpds = "vxl_drivers.lasers.mpds.cli:main"
+vxl-pvcam-diagnose = "vxl_drivers.cameras.pvcam_diagnose:main"
 
 [project.optional-dependencies]
 # Optomechanics drivers

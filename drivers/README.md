@@ -71,6 +71,10 @@ firmware, operating-system drivers, and vendor runtimes.
 | Ximea cameras | `vxl_drivers.cameras.ximea.XimeaCamera` | `ximea-camera` extra |
 | Teledyne Photometrics Kinetix (PVCAM) | `vxl_drivers.cameras.teledyne.Kinetix` | `pvcam-camera` extra; Linux with the PVCAM runtime and `pvcam_pcie` module |
 
+`vxl-pvcam-diagnose` checks the PVCAM stack in stages (environment, `/dev/pvcamPCIE_*` access, runtime,
+enumeration) without opening an instrument; `--open` also reads each head's identity, and `--serial` requires
+one head.
+
 ### Lasers and AOTFs
 
 The [canonical laser contract](../src/vxl/devices/laser/README.md) separates source settings from output control.
