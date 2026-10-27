@@ -25,6 +25,7 @@ import json
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextlib import contextmanager
@@ -87,6 +88,7 @@ class WriterSettings(BaseModel):
         description="Pyramid downsample method. Gaussian (anti-aliased) is the default for display-quality",
     )
     target_shard_gb: float = 1.0
+    io_timeout_s: float = Field(default=300.0, gt=0, allow_inf_nan=False)
 
     @property
     def chunk_shape(self) -> UIVec3D:
@@ -428,6 +430,21 @@ class DatasetWriter:
                 return True
         return any(slot.reusable for slot in self._ring)
 
+    def wait_ready(self, timeout_s: float | None = None) -> None:
+        """Wait for capacity, raising if a worker failed or the deadline expires."""
+        deadline = time.monotonic() + (self._config.io_timeout_s if timeout_s is None else timeout_s)
+        while True:
+            self._reap_uploads()
+            for _, future in self._inflight.values():
+                if future.done() and (error := future.exception()) is not None:
+                    self._failure = self._failure or error
+            self._raise_if_failed()
+            if self.ready_for_batch:
+                return
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Writer capacity did not become available before the deadline")
+            time.sleep(0.005)
+
     @property
     def batches(self) -> list[BatchMetrics]:
         """The per-batch metrics records for this dataset, indexed by batch."""
@@ -469,7 +486,10 @@ class DatasetWriter:
 
     def _assign_collecting_slot(self) -> None:
         """Choose any reusable ring slot, waiting only when processing or retained reads occupy all slots."""
+        deadline = time.monotonic() + self._config.io_timeout_s
         while True:
+            if time.monotonic() >= deadline:
+                raise TimeoutError("Writer could not release a frame slot before its I/O deadline")
             self._reap()
             for offset in range(self._slot_count):
                 slot_idx = (self._next_slot_hint + offset) % self._slot_count
@@ -486,7 +506,11 @@ class DatasetWriter:
                 return
 
             if self._inflight:
-                wait((future for _, future in self._inflight.values()), return_when=FIRST_COMPLETED)
+                wait(
+                    (future for _, future in self._inflight.values()),
+                    timeout=max(0, deadline - time.monotonic()),
+                    return_when=FIRST_COMPLETED,
+                )
                 continue
 
             # Every worker is finished, so retained readers are the only remaining owners. Wait briefly
@@ -635,7 +659,8 @@ class DatasetWriter:
         z_start = batch_idx * self._batch_z
         z_end = min(z_start + self._batch_z, self._volume_z)
         jobs = self._transfer_jobs(z_start, z_end)
-        self._upload_slots.acquire()
+        if not self._upload_slots.acquire(timeout=self._config.io_timeout_s):
+            raise TimeoutError("Uploads did not release staging capacity before the I/O deadline")
         batch = self._batches[batch_idx]
         self._uploads.append(self._upload_pool.submit(self._upload_and_evict, jobs, batch, tuning))
 
@@ -657,7 +682,13 @@ class DatasetWriter:
         via the future."""
         try:
             with batch.transferring.measure():
-                bytes_up = run_s5cmd(jobs, self._store, numworkers=tuning.numworkers, retry_count=tuning.retry_count)
+                bytes_up = run_s5cmd(
+                    jobs,
+                    self._store,
+                    numworkers=tuning.numworkers,
+                    retry_count=tuning.retry_count,
+                    timeout_s=self._config.io_timeout_s,
+                )
                 batch.transfered_bytes = bytes_up
             with batch.evicting.measure():
                 for job in jobs:
@@ -753,6 +784,12 @@ class OMEZarrWriter:
         """Whether the next batch can be collected without blocking: True when no dataset is open, or the
         open dataset has at least one IDLE slot."""
         return self._active is None or self._active.ready_for_batch
+
+    def wait_ready(self, timeout_s: float | None = None) -> None:
+        """Wait for the active dataset's capacity or report its terminal failure."""
+        if self._active is None:
+            raise RuntimeError("No stack open")
+        self._active.wait_ready(timeout_s)
 
     @property
     def batches(self) -> list[BatchMetrics]:

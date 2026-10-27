@@ -8,6 +8,7 @@ the invariant holds while flush overlaps capture.
 """
 
 from concurrent.futures import Future
+from contextlib import suppress
 from pathlib import Path
 
 import numpy as np
@@ -142,3 +143,26 @@ def test_flush_failure_poisoning_is_sticky(tmp_path: Path, monkeypatch: pytest.M
 
     lease.close()
     writer.close()
+
+
+@pytest.mark.slow
+def test_wait_ready_storage_failure_raises_before_arming_another_batch(tmp_path: Path) -> None:
+    cfg = WriterConfig(
+        volume_shape=UIVec3D(z=2, y=64, x=64),
+        voxel_size=UVec3D(z=1, y=1, x=1),
+        max_level=ScaleLevel.L0,
+    )
+    writer = OMEZarrWriter(slots=2)
+    writer.begin_stack(cfg, Local(target=tmp_path / "blocked"))
+    # The real storage backend must create chunk directories under this prefix.
+    (tmp_path / "blocked.ome.zarr/0/c").write_text("blocks chunk writes")
+    try:
+        with suppress(RuntimeError, ValueError):
+            for _ in range(2):
+                with writer.new_frame() as frame:
+                    frame.fill(7)
+        with pytest.raises(RuntimeError, match="pipeline failure"):
+            writer.wait_ready(5)
+    finally:
+        with suppress(RuntimeError, ValueError):
+            writer.close()

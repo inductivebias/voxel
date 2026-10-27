@@ -166,14 +166,16 @@ class CameraController(DeviceController["Camera"]):
         System.Ram.reserve(self.device.uid, weight=1.0)
 
     async def close(self) -> None:
-        self._publish_fn = None
+        await self.stop_preview()
+        await self.close_stack()
+        if self._task is not None:
+            await asyncio.shield(self._task)
         self._previewer.close()
         for task in self._publish_tasks.values():
             task.cancel()
+        await asyncio.gather(*self._publish_tasks.values(), return_exceptions=True)
         self._publish_tasks.clear()
-        if self._writer is not None:  # free the reusable ring (its slots' workers + shared memory)
-            await self._run_sync(self._writer.close)
-            self._writer = None
+        await self.release_writer()
         System.Ram.release(self.device.uid)
         await super().close()
 
@@ -352,7 +354,7 @@ class CameraController(DeviceController["Camera"]):
         if self._writer is None:
             self._writer = OMEZarrWriter()
         _t = time.perf_counter()
-        self._writer.begin_stack(cfg, dest, sizer=self._size_ring)
+        await self._run_sync(self._writer.begin_stack, cfg, dest, sizer=self._size_ring)
         log.info(
             "OMEZarrWriter begin_stack for %s took %.1fs",
             self.device.uid,
@@ -399,21 +401,36 @@ class CameraController(DeviceController["Camera"]):
 
     @describe(label="Close Stack")
     async def close_stack(self) -> None:
-        """Drain and close the writer in the background, then disarm the camera. Returns immediately;
-        poll :meth:`capture_state` until ``CLOSED``. Draining/uploading can take a while, so it runs
-        off the RPC path rather than blocking the call."""
-        if self._task is not None and not self._task.done():
-            raise RuntimeError("Capture task already in progress.")
-        self._task = asyncio.create_task(self._close_stack())
+        """Stop collection and drain the writer in the background; poll until ``CLOSED``.
+
+        Repeated calls join the same cleanup. In-flight frame writes settle before their buffers
+        are released, including when capture failed or was cancelled.
+        """
+        if (
+            self._task_kind == "close"
+            and self._task is not None
+            and not self._task.cancelled()
+            and (not self._task.done() or self._task.exception() is None)
+        ):
+            return
+        collecting = self._task
+        if collecting is not None and not collecting.done():
+            collecting.cancel()
+        self._task = asyncio.create_task(self._close_stack(collecting))
         self._task_kind = "close"
 
-    async def _close_stack(self) -> None:
+    async def _close_stack(self, collecting: asyncio.Task[None] | None) -> None:
         """Flush and close the writer, then reset the camera to a reusable IDLE state.
 
         The camera is always reset even if ``writer.end_stack()`` raises. A failed writer ring remains
         owned but poisoned until preview releases its readers; the next stack or :meth:`release_writer`
         then replaces it safely.
         """
+        if collecting is not None:
+            # Capture errors are reported through capture_state; cleanup must still run.
+            await asyncio.gather(collecting, return_exceptions=True)
+        if self._mode is CameraMode.ACQUISITION:
+            await self._run_sync(self.device.stop)
         self._previewer.cancel_pending()
         try:
             if self._writer is not None:
@@ -486,10 +503,7 @@ class CameraController(DeviceController["Camera"]):
         if self._task is not None and not self._task.done():
             raise RuntimeError("Capture task already in progress.")
         writer = self._writer
-        while True:  # wait for a free ring slot before arming (a prior batch may still be flushing)
-            if writer.ready_for_batch:
-                break
-            await asyncio.sleep(0.005)
+        await self._run_sync(writer.wait_ready)
         await self._run_sync(
             lambda: self.device.start(
                 frame_count=num_frames, trigger_mode=trigger_mode, trigger_polarity=trigger_polarity
@@ -500,19 +514,21 @@ class CameraController(DeviceController["Camera"]):
 
     async def _collect_batch(self, num_frames: int, writer: OMEZarrWriter) -> None:
         """Grab ``num_frames`` frames into the writer, then stop the camera."""
-        for _ in range(num_frames):
-            frame = await self._capture_into_writer(writer)
-            try:
-                self._previewer.submit_frame(
-                    frame,
-                    self._frame_idx,
-                    valid_bits=PIXEL_FMT_TO_VALID_BITS[cast("PixelFormat", str(self.device.pixel_format))],
-                )
-            except Exception:
-                frame.close()
-                raise
-            self._frame_idx += 1
-        await self._run_sync(self.device.stop)
+        try:
+            for _ in range(num_frames):
+                frame = await self._capture_into_writer(writer)
+                try:
+                    self._previewer.submit_frame(
+                        frame,
+                        self._frame_idx,
+                        valid_bits=PIXEL_FMT_TO_VALID_BITS[cast("PixelFormat", str(self.device.pixel_format))],
+                    )
+                except Exception:
+                    frame.close()
+                    raise
+                self._frame_idx += 1
+        finally:
+            await self._run_sync(self.device.stop)
 
     async def _capture_into_writer(self, writer: OMEZarrWriter) -> FrameLease:
         """Fill and commit one writer frame as one serialized, cancellation-safe device transaction."""
@@ -542,6 +558,8 @@ class CameraController(DeviceController["Camera"]):
             return CaptureState.IDLE
         if not task.done():
             return CaptureState.COLLECTING if self._task_kind == "batch" else CaptureState.CLOSING
+        if task.cancelled():
+            raise RuntimeError("Capture task was cancelled before cleanup")
         if (exc := task.exception()) is not None:
             raise RuntimeError(f"Capture task failed: {exc}")
         return CaptureState.DONE if self._task_kind == "batch" else CaptureState.CLOSED

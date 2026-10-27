@@ -25,6 +25,7 @@ from vxl_records import (
     StorageSpec,
     VoxelRecords,
 )
+from vxlib.asyncio import settle
 from vxlib.history import Change, HistoryState, UndoHistory
 from vxlib.lifecycle import Teardown  # noqa: TC002 — runtime annotation alias
 from vxlib.reactivity import Cell, Computed, Derived, Emitter, ReactiveQuery, Readable, Subscribable
@@ -205,6 +206,7 @@ class Instrument:
     """An opened instrument: hardware, persisted acquisition state, and active-profile orchestration."""
 
     def __init__(self, store: InstrumentStore, *, records: VoxelRecords, system: System | None = None) -> None:
+        self._cleanup_errors: list[Exception] = []
         """Construct an instrument from its store without opening hardware."""
         self._hal = HAL(store.config.hal, name=store.home.name)
         self._store = store
@@ -383,6 +385,7 @@ class Instrument:
 
     async def close(self) -> None:
         """Stop preview, close hardware, and clear history while retaining the selected profile."""
+        await self.stop_acquisition()
         self._preview_source_ids.clear()
         self._preview_positions.clear()
         for unsub in self._device_unsubs:
@@ -399,6 +402,8 @@ class Instrument:
         self._preview_unsubs = []
         self.fov.clear_triggers()
         await self._hal.close()
+        self._cleanup_errors.clear()
+        await self._activity.set(IdleActivity())
         self._channels = {}
         self._remote_stores = {}
         async with self._lock:
@@ -791,18 +796,25 @@ class Instrument:
         """Cancel the active acquisition and await its cleanup."""
         if (task := self._acq_task) is not None and not task.done():
             activity = self._activity.value
-            if isinstance(activity, CaptureActivity) and (acquisition := activity.acquisition) is not None:
+            if (
+                isinstance(activity, CaptureActivity)
+                and (acquisition := activity.acquisition) is not None
+                and acquisition.phase is not AcquisitionPhase.STOPPING
+            ):
                 stopping = acquisition.model_copy(update={"phase": AcquisitionPhase.STOPPING})
                 await self._activity.set(activity.model_copy(update={"acquisition": stopping}))
-            task.cancel()
+                task.cancel()
             with suppress(asyncio.CancelledError):
-                await task
+                await settle(task)
 
     async def wait_acquisition(self) -> None:
         """Wait for acquisition completion, or return immediately if none has started."""
         if (task := self._acq_task) is not None:
-            with suppress(asyncio.CancelledError):
-                await task
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                if not task.cancelled():
+                    raise
 
     async def _discover_remote_stores(self) -> None:
         """Materialize the conservative object-store intersection across all camera hosts."""
@@ -1653,7 +1665,6 @@ class Instrument:
                 logger.exception("Failed to persist failure for acquisition %s", manifest.id)
             logger.exception("Acquisition aborted")
         finally:
-            self._acq_task = None
             # Free each camera's writer ring (workers + ~hundreds of GB shared memory) now the run is
             # over — it's kept resident across volumes for reuse, but not indefinitely afterward. The
             # next acquisition re-allocates it cold. Runs on completion, failure, or cancellation.
@@ -1663,7 +1674,12 @@ class Instrument:
             for cam_id, result in zip(self._hal.cameras, released, strict=True):
                 if isinstance(result, BaseException):
                     logger.warning("release_writer failed for %s: %r", cam_id, result)
-            await self._activity.set(IdleActivity())
+                    self._cleanup_errors.append(result if isinstance(result, Exception) else RuntimeError(str(result)))
+            if not self._cleanup_errors:
+                await self._activity.set(IdleActivity())
+            else:
+                await self._update_acquisition(manifest, phase=AcquisitionPhase.STOPPING)
+            self._acq_task = None
             try:
                 await self._records.logs.close_acquisition_window(manifest.id)
             except Exception:
@@ -1721,30 +1737,27 @@ class Instrument:
                 frames_done = num_frames
                 await self._update_acquisition(manifest, frames_captured=num_frames)
             else:
-                for batch_idx in range(math.ceil(num_frames / batch_z)):
-                    frames_in_batch = min(batch_z, num_frames - batch_idx * batch_z)
-                    # begin_batch waits for a free writer slot and arms the camera before returning,
-                    # so the signal generator is safe to fire once these resolve.
-                    await _gather_hardware(*(ch.camera.begin_batch(frames_in_batch) for ch in channels.values()))
-                    if batch_idx == 0:
-                        await _gather_hardware(*(ch.enable_laser_output() for ch in channels.values()))
-                    await self._start_signal_generators()
-                    while True:
-                        states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
-                        if all(state is CaptureState.DONE for state in states):
-                            break
-                        await asyncio.sleep(0.05)
-                    await self._stop_signal_generators()
-                    done = min((batch_idx + 1) * batch_z, num_frames)
-                    frames_done = done
-                    await self._update_acquisition(manifest, frames_captured=done)
+                frames_done = await self._capture_batches(manifest, volume, channels, batch_z)
         except BaseException as error:
             capture_error = error
 
-        active = self._capture_activity().acquisition
-        if active is not None and active.phase is not AcquisitionPhase.STOPPING:
-            await self._update_acquisition(manifest, phase=AcquisitionPhase.FINALIZING)
-        cleanup_errors = await self._teardown_capture(list(channels.values()), scanning_axis, progress)
+        active = None
+        try:
+            active = self._capture_activity().acquisition
+            if active is not None and active.phase is not AcquisitionPhase.STOPPING:
+                await self._update_acquisition(manifest, phase=AcquisitionPhase.FINALIZING)
+        except BaseException as error:
+            capture_error = capture_error or error
+        finally:
+            cleanup = asyncio.create_task(self._teardown_capture(list(channels.values()), scanning_axis, progress))
+            try:
+                cleanup_errors = await settle(cleanup)
+            except asyncio.CancelledError as error:
+                cleanup_errors = cleanup.result()
+                capture_error = capture_error or error
+            except Exception as error:
+                cleanup_errors = [error]
+            self._cleanup_errors.extend(cleanup_errors)
         if capture_error is None and not cleanup_errors:
             manifest = await self._records.acquisitions.complete_volume(manifest.id, volume_index=volume_index)
             await self._update_acquisition(manifest)
@@ -1754,7 +1767,11 @@ class Instrument:
         location_status = LocationStatus.FAILED if cleanup_errors else LocationStatus.AVAILABLE
         # A continuous pass that started moving has written frames even if it failed before counting them.
         moved = progress is not None and progress.moving
-        dataset_status = DatasetStatus.PARTIAL if frames_done or moved else DatasetStatus.FAILED
+        dataset_status = (
+            DatasetStatus.PARTIAL
+            if frames_done or moved or (active is not None and active.frames_captured)
+            else DatasetStatus.FAILED
+        )
         try:
             terminalize = (
                 self._records.acquisitions.cancel_volume
@@ -1780,6 +1797,29 @@ class Instrument:
         raise ExceptionGroup(
             f"capture cleanup failed for task {volume.task} / profile {volume.profile}", cleanup_errors
         )
+
+    async def _capture_batches(
+        self, manifest: AcquisitionManifest, volume: PlannedVolume, channels: Mapping[str, Channel], batch_z: int
+    ) -> int:
+        signals = self._store.value.imaging.profiles[volume.profile].sync.values()
+        period = max((float(s.duration) + float(s.rest_time) for s in signals), default=1.0)
+        for batch_idx in range(math.ceil(volume.frames_total / batch_z)):
+            frames = min(batch_z, volume.frames_total - batch_idx * batch_z)
+            await _gather_hardware(*(ch.camera.begin_batch(frames) for ch in channels.values()))
+            if batch_idx == 0:
+                await _gather_hardware(*(ch.enable_laser_output() for ch in channels.values()))
+            await self._start_signal_generators()
+            async with asyncio.timeout(30.0 + 2 * frames * period):
+                while True:
+                    states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
+                    if all(state is CaptureState.DONE for state in states):
+                        break
+                    await asyncio.sleep(0.05)
+            await self._stop_signal_generators()
+            await self._update_acquisition(
+                manifest, frames_captured=min((batch_idx + 1) * batch_z, volume.frames_total)
+            )
+        return volume.frames_total
 
     async def _open_stacks(
         self,
@@ -1999,12 +2039,28 @@ class Instrument:
             errors.append(error)
         if unfinished and progress is not None:
             errors.extend(await self._abort_pass(progress, scanning_axis))
-        with suppress(NotImplementedError, RuntimeError):
+        try:
             await scanning_axis.reset_ttl_stepper()
+        except NotImplementedError:
+            pass
+        except Exception as error:
+            errors.append(error)
+        return errors + await self._close_stacks(chans)
+
+    async def _close_stacks(self, chans: list[Channel]) -> list[Exception]:
+        errors: list[Exception] = []
         close_results = await asyncio.gather(*(ch.camera.close_stack() for ch in chans), return_exceptions=True)
-        errors.extend(_report("close_stack", close_results, collect=True))
+        errors.extend(
+            result if isinstance(result, Exception) else RuntimeError(str(result))
+            for result in close_results
+            if isinstance(result, BaseException)
+        )
         pending = [ch for ch, result in zip(chans, close_results, strict=True) if not isinstance(result, BaseException)]
+        deadline = asyncio.get_running_loop().time() + self._store.value.output.io_timeout_s
         while pending:
+            if asyncio.get_running_loop().time() >= deadline:
+                errors.append(TimeoutError("Camera writers did not close before the I/O deadline"))
+                break
             states = await asyncio.gather(*(ch.camera.capture_state() for ch in pending), return_exceptions=True)
             still_closing = []
             for ch, state in zip(pending, states, strict=True):

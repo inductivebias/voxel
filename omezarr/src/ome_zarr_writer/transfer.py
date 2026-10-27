@@ -48,7 +48,9 @@ class TransferError(RuntimeError):
     """An s5cmd upload failed (after its per-object retries)."""
 
 
-def run_s5cmd(jobs: list[TransferJob], store: S3Store | None, *, numworkers: int, retry_count: int) -> int:
+def run_s5cmd(
+    jobs: list[TransferJob], store: S3Store | None, *, numworkers: int, retry_count: int, timeout_s: float = 300.0
+) -> int:
     """Upload one group via a single ``s5cmd run``, reaching S3 via `store` (an empty/``None``
     store falls back to the ambient AWS environment); returns total bytes moved. Raises
     `TransferError` if s5cmd exits non-zero. Blocks until the group is durable in S3."""
@@ -80,6 +82,7 @@ def run_s5cmd(jobs: list[TransferJob], store: S3Store | None, *, numworkers: int
         text=True,
         check=False,
         env=env,
+        timeout=timeout_s,
     )
     if proc.returncode != 0:
         raise TransferError(f"upload failed:\n{proc.stderr or proc.stdout}")

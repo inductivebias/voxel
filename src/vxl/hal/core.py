@@ -165,10 +165,13 @@ class HAL:
             raise HALStartupError(violations)
 
     async def close(self) -> None:
+        preview_results = await asyncio.gather(
+            *(camera.close_preview_updates() for camera in self.cameras.values()), return_exceptions=True
+        )
+        await self._rig.close()
         self._stage = None
         self.routing.clear()
         self._device_interfaces = {}
-        await asyncio.gather(*(camera.close_preview_updates() for camera in self.cameras.values()))
         self.cameras.clear()
         self.lasers.clear()
         self.continuous_axes.clear()
@@ -176,7 +179,8 @@ class HAL:
         self.fws.clear()
         self.signal_generators.clear()
         self.recorders.clear()
-        await self._rig.close()
+        if errors := [result for result in preview_results if isinstance(result, Exception)]:
+            raise ExceptionGroup("Camera subscription shutdown failed", errors)
 
     def _build_violations(self) -> list[Violation]:
         return [

@@ -21,6 +21,7 @@ from vxl.instrument import (
     CaptureActivity,
     IdleActivity,
     Instrument,
+    InstrumentBusyError,
     Point2D,
     XYDefinition,
     XYMode,
@@ -137,7 +138,9 @@ async def test_writer_close_failure_marks_dataset_and_acquisition_failed(
     assert dataset.status is DatasetStatus.PARTIAL
     assert dataset.locations[0].status is LocationStatus.FAILED
     assert writer.released
-    assert isinstance(instrument.activity.value, IdleActivity)
+    assert isinstance(instrument.activity.value, CaptureActivity)
+    with pytest.raises(InstrumentBusyError, match="already in progress"):
+        await instrument.start_acquisition(AcquisitionRequest(storage=storage))
 
 
 async def test_profile_preparation_failure_still_stops_daq_and_finalizes_volume(

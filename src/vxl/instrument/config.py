@@ -437,6 +437,7 @@ class TaskPatch(Patch):
 
 
 class WriterPatch(Patch):
+    io_timeout_s: Annotated[float, Field(gt=0, allow_inf_nan=False)] | None = None
     max_level: ScaleLevel | None = None
     shard_z_chunks: Annotated[int, Field(ge=1)] | None = None
     batch_z_shards: Annotated[int, Field(ge=1)] | None = None
