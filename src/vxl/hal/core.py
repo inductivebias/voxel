@@ -13,6 +13,7 @@ from vxl.devices.axes.discrete.base import DiscreteAxisState
 from vxl.devices.axes.discrete.handle import DiscreteAxisHandle
 from vxl.devices.camera import CameraHandle
 from vxl.devices.daq.clocked import SignalGeneratorHandle
+from vxl.devices.daq.recording import PositionRecorderHandle
 
 from .errors import HALError, HALStartupError, Violation, ViolationLoc
 from .topology import HardwareTopology, OpticalRouteDefinition
@@ -110,6 +111,7 @@ class HAL:
         self.fws: dict[str, DiscreteAxisHandle] = {}
         self.routing: dict[str, RouteDimension] = {}
         self.signal_generators: dict[str, SignalGeneratorHandle] = {}
+        self.recorders: dict[str, PositionRecorderHandle] = {}
         self._device_interfaces: dict[str, DeviceInterface] = {}
         self._stage: Stage | None = None
 
@@ -173,6 +175,7 @@ class HAL:
         self.discrete_axes.clear()
         self.fws.clear()
         self.signal_generators.clear()
+        self.recorders.clear()
         await self._rig.close()
 
     def _build_violations(self) -> list[Violation]:
@@ -215,6 +218,8 @@ class HAL:
                     self.cameras[uid] = CameraHandle.wrap(handle)
                 case "signal_generator":
                     self.signal_generators[uid] = SignalGeneratorHandle.wrap(handle)
+                case "position_recorder":
+                    self.recorders[uid] = PositionRecorderHandle.wrap(handle)
                 case "laser":
                     self.lasers[uid] = handle
                 case "continuous_axis":

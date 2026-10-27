@@ -11,5 +11,6 @@ class DeviceType(StrEnum):
     ROTATION_AXIS = "rotation_axis"
     DISCRETE_AXIS = "discrete_axis"
     SIGNAL_GENERATOR = "signal_generator"
+    POSITION_RECORDER = "position_recorder"
     DAQ_AO = "daq_ao"
     DAQ_DO = "daq_do"
