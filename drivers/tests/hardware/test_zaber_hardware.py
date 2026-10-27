@@ -3,6 +3,9 @@ import math
 import os
 
 import pytest
+
+pytest.importorskip("zaber_motion", reason="needs the vxl-drivers `zaber` extra")
+
 from vxl_drivers.axes.zaber import ZaberHub, ZaberLinearAxis
 
 from rigup import DeviceConfig, Rig, RigConfig
