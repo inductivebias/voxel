@@ -5,6 +5,9 @@
 
 **Control, coordinate, and acquire with light-sheet microscopes.**
 
+This fork's `mobi` branch adds hardware drivers, encoder-paced continuous scanning, and lifecycle
+and access hardening. See the [Mobi overview](README.mobi.md) for the changes, motivation, and status.
+
 Voxel is an application-first microscopy platform built from reusable Python components. It brings local and
 distributed hardware under one control model, coordinates preview and acquisition workflows, streams datasets into
 storage, and records operational history through web and desktop interfaces.
