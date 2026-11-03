@@ -21,7 +21,7 @@
 
   const cameraLayout = pref<'separate' | 'overlay'>('preview:camera-layout', 'separate');
   const crosshairVisible = prefs.viewer.crosshairVisible;
-  let hover = $state.raw<{ normX: number; normY: number; aspect: number } | null>(null);
+  let crosshairPos = $state.raw<{ normX: number; normY: number }>({ normX: 0.5, normY: 0.5 });
   const visibleChannels = $derived(previewer.channels.filter((channel) => channel.name && channel.visible));
   // Channels sharing one sensor remain composited; independent cameras get individual canvases.
   const hasMultipleCameras = $derived(
@@ -77,23 +77,28 @@
   // Pan/zoom on the canvas element itself, so overlay siblings (controls, navigator) never trip it.
   function setupPanZoom(el: HTMLCanvasElement): () => void {
     let isPanning = false;
+    let isDraggingCrosshair = false;
     let panStartX = 0;
     let panStartY = 0;
     let startViewport = { ...previewer.viewport };
 
-    const updateHover = (e: MouseEvent) => {
+    const updateCrosshair = (e: MouseEvent) => {
       const rect = el.getBoundingClientRect();
       if (rect.width <= 0 || rect.height <= 0) return;
-      hover = {
+      crosshairPos = {
         normX: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
-        normY: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
-        aspect: rect.width / rect.height
+        normY: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
       };
     };
 
     const pointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return;
       el.setPointerCapture(e.pointerId);
+      if (crosshairVisible.get()) {
+        isDraggingCrosshair = true;
+        updateCrosshair(e);
+        return;
+      }
       isPanning = true;
       panStartX = e.clientX;
       panStartY = e.clientY;
@@ -101,7 +106,10 @@
     };
 
     const pointerMove = (e: PointerEvent) => {
-      updateHover(e);
+      if (isDraggingCrosshair) {
+        updateCrosshair(e);
+        return;
+      }
       if (!isPanning) return;
       const rect = el.getBoundingClientRect();
       const dx = ((e.clientX - panStartX) / rect.width) * previewer.viewport.w;
@@ -113,17 +121,13 @@
 
     const pointerUp = (e: PointerEvent) => {
       if (e.button !== 0) return;
-      el.releasePointerCapture(e.pointerId);
+      if (el.hasPointerCapture(e.pointerId)) el.releasePointerCapture(e.pointerId);
       isPanning = false;
-    };
-
-    const pointerLeave = () => {
-      hover = null;
+      isDraggingCrosshair = false;
     };
 
     const wheel = (e: WheelEvent) => {
       e.preventDefault();
-      updateHover(e);
       const rect = el.getBoundingClientRect();
       const vp = previewer.viewport;
       // Keep the sensor point under the cursor fixed on screen.
@@ -135,14 +139,14 @@
     el.addEventListener('pointerdown', pointerDown, { passive: true });
     el.addEventListener('pointermove', pointerMove, { passive: true });
     el.addEventListener('pointerup', pointerUp, { passive: true });
-    el.addEventListener('pointerleave', pointerLeave, { passive: true });
+    el.addEventListener('pointercancel', pointerUp, { passive: true });
     el.addEventListener('wheel', wheel, { passive: false });
 
     return () => {
       el.removeEventListener('pointerdown', pointerDown);
       el.removeEventListener('pointermove', pointerMove);
       el.removeEventListener('pointerup', pointerUp);
-      el.removeEventListener('pointerleave', pointerLeave);
+      el.removeEventListener('pointercancel', pointerUp);
       el.removeEventListener('wheel', wheel);
     };
   }
@@ -204,9 +208,10 @@
     };
   });
 
-  function sampleAtHover(channelName?: string) {
+  function sampleAtCrosshair(channelName?: string) {
     void previewer.redrawGeneration;
-    return hover ? previewer.samplePixel(hover.normX, hover.normY, hover.aspect, channelName) : [];
+    const aspect = viewW > 0 && viewH > 0 ? viewW / viewH : 1;
+    return previewer.samplePixel(crosshairPos.normX, crosshairPos.normY, aspect, channelName);
   }
 
   // ── Scale bar ──
@@ -245,19 +250,25 @@
 {/snippet}
 
 {#snippet crosshairOverlay(channelName?: string)}
-  {#if crosshairVisible.get() && hover}
-    {@const samples = sampleAtHover(channelName)}
-    <div class="pointer-events-none absolute inset-x-0 z-10 h-px bg-fg/70 halo" style:top="{hover.normY * 100}%"></div>
-    <div class="pointer-events-none absolute inset-y-0 z-10 w-px bg-fg/70 halo" style:left="{hover.normX * 100}%"></div>
+  {#if crosshairVisible.get()}
+    {@const samples = sampleAtCrosshair(channelName)}
     <div
-      class="pointer-events-none absolute z-10 flex flex-col gap-0.5 frame-overlay px-2 py-1 font-mono text-xs text-fg tabular-nums {hover.normX >
+      class="pointer-events-none absolute inset-x-0 z-10 h-px bg-fg/70 halo"
+      style:top="{crosshairPos.normY * 100}%"
+    ></div>
+    <div
+      class="pointer-events-none absolute inset-y-0 z-10 w-px bg-fg/70 halo"
+      style:left="{crosshairPos.normX * 100}%"
+    ></div>
+    <div
+      class="pointer-events-none absolute z-10 flex flex-col gap-0.5 frame-overlay px-2 py-1 font-mono text-xs text-fg tabular-nums {crosshairPos.normX >
       0.7
         ? '-translate-x-2'
-        : 'translate-x-2'} {hover.normY > 0.8 ? '-translate-y-2' : 'translate-y-2'}"
-      style:left={hover.normX > 0.7 ? undefined : `${hover.normX * 100}%`}
-      style:right={hover.normX > 0.7 ? `${(1 - hover.normX) * 100}%` : undefined}
-      style:top={hover.normY > 0.8 ? undefined : `${hover.normY * 100}%`}
-      style:bottom={hover.normY > 0.8 ? `${(1 - hover.normY) * 100}%` : undefined}
+        : 'translate-x-2'} {crosshairPos.normY > 0.8 ? '-translate-y-2' : 'translate-y-2'}"
+      style:left={crosshairPos.normX > 0.7 ? undefined : `${crosshairPos.normX * 100}%`}
+      style:right={crosshairPos.normX > 0.7 ? `${(1 - crosshairPos.normX) * 100}%` : undefined}
+      style:top={crosshairPos.normY > 0.8 ? undefined : `${crosshairPos.normY * 100}%`}
+      style:bottom={crosshairPos.normY > 0.8 ? `${(1 - crosshairPos.normY) * 100}%` : undefined}
     >
       {#if samples.length > 0}
         <span class="text-fg-muted">({samples[0].sensorX}, {samples[0].sensorY})</span>
