@@ -452,7 +452,7 @@ class ZaberContinuousScanner(ContinuousScanner):
         with self._lock:
             if self._originals is not None:
                 raise RuntimeError("a continuous scan is already prepared; finish or reset it first")
-            state = self._check_ready(start)
+            self._check_ready(start)
             self._originals = {name: self._axis.settings.get(name) for name in self._changed}
             self._status_timeouts = 0
             try:
@@ -470,6 +470,16 @@ class ZaberContinuousScanner(ContinuousScanner):
                     error.add_note(f"restoring the axis after the failed prepare also failed: {cleanup_error}")
                 raise
         time.sleep(_SCAN_OUTPUT_SETTLE_S)
+        try:
+            with self._lock:
+                state = self._state()
+                self._check_settled(state, "start", start)
+        except BaseException as error:
+            try:
+                self.reset()
+            except Exception as cleanup_error:
+                error.add_note(f"restoring the axis after the failed prepare also failed: {cleanup_error}")
+            raise
         # A DAQ counting the exported quadrature counts from the exported encoder's own position.
         return {**state, "origin": state["exported_encoder_position"]}
 

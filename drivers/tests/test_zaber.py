@@ -841,14 +841,18 @@ def test_zaber_continuous_scan_set_verifies_its_settings_then_restores_them_outp
     assert axis.speed == 10_000.0  # Cached for a second.
     settled: list[tuple[float, float]] = []
     monkeypatch.setattr(zaber, "_SCAN_OUTPUT_SETTLE_S", 0.2)
-    monkeypatch.setattr(
-        zaber.time, "sleep", lambda seconds: settled.append((seconds, settings.values["encoder.2.out.enable"]))
-    )
+
+    def settle(seconds: float) -> None:
+        settled.append((seconds, settings.values["encoder.2.out.enable"]))
+        x_sdk.encoder_error = 0.2
+
+    monkeypatch.setattr(zaber.time, "sleep", settle)
     settings.set_calls.clear()
 
     state = scanner.prepare(start=SCAN_START, speed=2_000.0)
 
-    assert state["position"] == state["encoder_position"] == state["exported_encoder_position"] == SCAN_START
+    assert state["position"] == SCAN_START
+    assert state["encoder_position"] == state["exported_encoder_position"] == pytest.approx(SCAN_START + 0.2)
     assert state["origin"] == state["exported_encoder_position"], "a DAQ counts the exported encoder from here"
     assert [(name, value, unit) for name, value, unit in settings.set_calls] == [
         ("encoder.2.out.interpolation", 4, NATIVE),

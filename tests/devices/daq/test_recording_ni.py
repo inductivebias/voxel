@@ -374,6 +374,34 @@ def test_buffer_overrun_fails_the_pass(monkeypatch):
     assert _closed_everything(hub, ni, recorder)
 
 
+def test_mark_motion_serializes_with_active_ni_stream_reads(monkeypatch):
+    ni = _scan()
+    entered, release = threading.Event(), threading.Event()
+    marked = threading.Event()
+
+    def block_first_read(_task: FakeTask) -> None:
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(timeout=2)
+
+    ni.on_read = block_first_read
+    hub, recorder = _recorder(monkeypatch, ni)
+    recorder.arm(REQUEST)
+    ni.advance(40)
+    assert entered.wait(timeout=2)
+
+    marker_thread = threading.Thread(target=lambda: (recorder.mark_motion(), marked.set()))
+    marker_thread.start()
+    try:
+        assert not marked.wait(timeout=0.02)
+    finally:
+        release.set()
+    marker_thread.join(timeout=2)
+    assert marked.is_set()
+    recorder.abort()
+    assert _closed_everything(hub, ni, recorder)
+
+
 def test_arm_coerced_clock_rate_closes_every_task_before_starting(monkeypatch):
     ni = FakeNi()
 

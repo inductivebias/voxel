@@ -137,7 +137,7 @@ class _Pass:
         self._worker.start()
 
     def mark_motion(self) -> None:
-        with self._state_lock:
+        with self._read_lock, self._state_lock:
             self._associator().mark_motion(self._acquired())
 
     def finish(self, timeout_s: float) -> RecordedPass:
