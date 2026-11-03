@@ -1,9 +1,12 @@
 import asyncio
+import sys
 import threading
+from pathlib import Path
 from typing import ClassVar
 
 import pytest
-from rigup.node import LocalNode
+from rigup.config import NodeConfig
+from rigup.node import LocalNode, SubprocessNode
 
 from rigup import Device, DeviceConfig, Rig, RigConfig
 
@@ -70,3 +73,19 @@ async def test_build_repeated_cancellation_closes_late_constructor_result() -> N
     assert _ConstructingDevice.instances[-1].closed
     assert not node.devices
     await node.close()
+
+
+async def test_subprocess_node_open_fails_fast_and_cleans_up_when_child_exits_early(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    real_exec = asyncio.create_subprocess_exec
+
+    async def crashing_exec(*_args: object, **_kwargs: object) -> asyncio.subprocess.Process:
+        return await real_exec(sys.executable, "-c", "raise SystemExit(2)")
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", crashing_exec)
+    node = SubprocessNode("crash", NodeConfig(kind="subprocess"))
+    with pytest.raises(RuntimeError, match="exited during startup"):
+        await asyncio.wait_for(node.open(), timeout=5.0)
+    assert node._process is None
+    assert node._ipc_dir is None or not Path(node._ipc_dir).exists()

@@ -2,11 +2,13 @@
 
 import logging
 import os
+import socket
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
 
+import psutil
 import uvicorn
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -124,6 +126,27 @@ def create_app(
     return app
 
 
+def _allowed_hosts(host: str) -> tuple[str, ...]:
+    """Return the Host header values accepted when serving on ``host``."""
+    hosts: dict[str, None] = dict.fromkeys(("localhost", "127.0.0.1", "[::1]", host))
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return tuple(hosts)
+    hosts[System.local_ip()] = None
+    for candidate in (System.hostname(), socket.getfqdn()):
+        name = candidate.strip().lower().rstrip(".")
+        if name:
+            hosts[name] = None
+            short = name.split(".", 1)[0]
+            hosts[short] = None
+            hosts[f"{short}.local"] = None
+    with suppress(Exception):
+        for addrs in psutil.net_if_addrs().values():
+            for addr in addrs:
+                if addr.family == socket.AF_INET and addr.address:
+                    hosts[addr.address] = None
+    return tuple(hosts)
+
+
 def serve(*, host: str, port: int = 8000, debug: bool = False) -> None:
     """Run the Voxel web application as the sole hardware owner."""
     load_voxel_env()
@@ -151,7 +174,7 @@ def serve(*, host: str, port: int = 8000, debug: bool = False) -> None:
         create_app(
             Station(StationConfig.load()),
             password=password,
-            allowed_hosts=tuple({"localhost", "127.0.0.1", "[::1]", host, *([System.local_ip()] if remote else [])}),
+            allowed_hosts=_allowed_hosts(host),
             allowed_origins=("http://localhost:5173", "http://127.0.0.1:5173") if debug else (),
         ),
         host=host,

@@ -32,6 +32,7 @@ class SubprocessNode(TransportNode):
         super().__init__(node_id, ZMQTransportClient())
         self._process: asyncio.subprocess.Process | None = None
         self._ipc_dir: str | None = None
+        self._ready: bool = False
 
     async def open(self) -> None:
         address = self._resolve_address()
@@ -44,25 +45,45 @@ class SubprocessNode(TransportNode):
             bind_addr = f"ipc://{address.path}"
             self._ipc_dir = str(Path(address.path).parent)
 
-        self._process = await asyncio.create_subprocess_exec(
-            sys.executable,
-            "-m",
-            "rigup.node",
-            self.node_id,
-            bind_addr,
-        )
+        try:
+            self._process = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-m",
+                "rigup.node",
+                self.node_id,
+                bind_addr,
+            )
 
-        await self._transport.connect(address)
-        self._start_log_relay()  # subscribe before the child binds so its startup logs aren't missed
+            await self._transport.connect(address)
+            self._start_log_relay()  # subscribe before the child binds so its startup logs aren't missed
 
-        # DEALER queues messages until the peer binds, so this PING will
-        # be delivered once the daemon's ROUTER is up. Generous timeout
-        # covers cold Python startup + import time.
-        await call(self._transport, Action.PING, PingPayload(), PingPayload, timeout_s=30.0)
+            # DEALER queues messages until the peer binds, so this PING will
+            # be delivered once the daemon's ROUTER is up. Generous timeout
+            # covers cold Python startup + import time.
+            ping_task = asyncio.create_task(
+                call(self._transport, Action.PING, PingPayload(), PingPayload, timeout_s=30.0)
+            )
+            exit_task = asyncio.create_task(self._process.wait())
+            try:
+                done, _ = await asyncio.wait({ping_task, exit_task}, return_when=asyncio.FIRST_COMPLETED)
+                if exit_task in done and not ping_task.done():
+                    rc = exit_task.result()
+                    raise RuntimeError(f"SubprocessNode '{self.node_id}' exited during startup (returncode={rc})")
+                await ping_task
+            finally:
+                for task in (ping_task, exit_task):
+                    if not task.done():
+                        task.cancel()
+                        with suppress(asyncio.CancelledError):
+                            await task
+            self._ready = True
+        except BaseException:
+            await self.close()
+            raise
         self._log.info("SubprocessNode %s ready at %s (pid=%d)", self.node_id, address, self._process.pid)
 
     async def close(self) -> None:
-        if self._process is not None and self._process.returncode is None:
+        if self._ready and self._process is not None and self._process.returncode is None:
             # An unverified device close retains the process and transport for recovery.
             await asyncio.wait_for(self.close_all_devices(), timeout=5.0)
             with suppress(Exception):
@@ -70,6 +91,7 @@ class SubprocessNode(TransportNode):
                     send_notify(self._transport, Notify.SHUTDOWN, ShutdownPayload(reason="orchestrator close")),
                     timeout=2.0,
                 )
+        self._ready = False
 
         self._stop_log_relay()
         await self._transport.close()

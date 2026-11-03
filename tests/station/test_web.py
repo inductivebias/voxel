@@ -5,8 +5,8 @@ from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from vxl.station import Station
-from vxl.system import StationConfig
-from vxl.web.app import create_app
+from vxl.system import StationConfig, System
+from vxl.web.app import _allowed_hosts, create_app
 
 
 def test_web_control_requires_authentication_and_accepts_same_origin_session_cookie(
@@ -49,3 +49,16 @@ def test_web_control_rejects_unauthenticated_websocket(station_config: StationCo
         ):
             pass
         assert disconnected.value.code == 1008
+
+
+def test_allowed_hosts_includes_local_hostnames_and_interface_ips_when_remote(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assert _allowed_hosts("127.0.0.1") == ("localhost", "127.0.0.1", "[::1]")
+    monkeypatch.setattr(System, "local_ip", staticmethod(lambda: "192.168.1.10"))
+    monkeypatch.setattr(System, "hostname", staticmethod(lambda: "BenchRig.lan"))
+    hosts = _allowed_hosts("0.0.0.0")  # noqa: S104
+    assert "192.168.1.10" in hosts
+    assert "benchrig" in hosts
+    assert "benchrig.local" in hosts
+    assert "benchrig.lan" in hosts
