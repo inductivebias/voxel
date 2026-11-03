@@ -21,13 +21,46 @@
 
   const cameraLayout = pref<'separate' | 'overlay'>('preview:camera-layout', 'separate');
   const crosshairVisible = prefs.viewer.crosshairVisible;
-  let crosshairPos = $state.raw<{ normX: number; normY: number }>({ normX: 0.5, normY: 0.5 });
+  const crosshairIndependent = prefs.viewer.crosshairIndependent;
+  const DEFAULT_CROSSHAIR_POS = { normX: 0.5, normY: 0.5 } as const;
+  let sharedCrosshairPos = $state.raw<{ normX: number; normY: number }>(DEFAULT_CROSSHAIR_POS);
+  const crosshairPositions = new SvelteMap<string, { normX: number; normY: number }>();
+  let activeCrosshairCamera = $state<string | 'all'>('all');
+
   const visibleChannels = $derived(previewer.channels.filter((channel) => channel.name && channel.visible));
+  function cameraKey(channel: PreviewChannel): string {
+    return channel.config?.detection ?? channel.name ?? String(channel.idx);
+  }
+  const cameraOptions = $derived.by(() => {
+    const options: { id: string; label: string }[] = [];
+    for (const channel of visibleChannels) {
+      const id = cameraKey(channel);
+      if (options.some((opt) => opt.id === id)) continue;
+      options.push({ id, label: displayName(id) });
+    }
+    return options;
+  });
   // Channels sharing one sensor remain composited; independent cameras get individual canvases.
-  const hasMultipleCameras = $derived(
-    new Set(visibleChannels.map((channel) => channel.config?.detection).filter(Boolean)).size > 1
-  );
+  const hasMultipleCameras = $derived(cameraOptions.length > 1);
   const showSeparate = $derived(hasMultipleCameras && cameraLayout.get() === 'separate');
+
+  function getCrosshairPos(cameraId?: string): { normX: number; normY: number } {
+    if (!crosshairIndependent.get() || !cameraId) return sharedCrosshairPos;
+    return crosshairPositions.get(cameraId) ?? DEFAULT_CROSSHAIR_POS;
+  }
+
+  function setCrosshairPos(pos: { normX: number; normY: number }, cameraId?: string | 'all') {
+    if (!crosshairIndependent.get() || !cameraId || cameraId === 'all') {
+      sharedCrosshairPos = pos;
+      for (const cam of cameraOptions) crosshairPositions.set(cam.id, pos);
+      return;
+    }
+    crosshairPositions.set(cameraId, pos);
+  }
+
+  function centerCrosshair() {
+    setCrosshairPos(DEFAULT_CROSSHAIR_POS, activeCrosshairCamera);
+  }
 
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   const separateCanvases = new SvelteMap<number, HTMLCanvasElement>();
@@ -75,28 +108,58 @@
   }
 
   // Pan/zoom on the canvas element itself, so overlay siblings (controls, navigator) never trip it.
-  function setupPanZoom(el: HTMLCanvasElement): () => void {
+  function setupPanZoom(el: HTMLCanvasElement, cameraId?: string): () => void {
     let isPanning = false;
     let isDraggingCrosshair = false;
+    let dragTargetCamera: string | 'all' | undefined = cameraId;
     let panStartX = 0;
     let panStartY = 0;
     let startViewport = { ...previewer.viewport };
 
-    const updateCrosshair = (e: MouseEvent) => {
+    const normalizedPoint = (e: MouseEvent) => {
       const rect = el.getBoundingClientRect();
-      if (rect.width <= 0 || rect.height <= 0) return;
-      crosshairPos = {
+      if (rect.width <= 0 || rect.height <= 0) return null;
+      return {
         normX: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
         normY: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height))
       };
+    };
+
+    const resolveOverlayTarget = (pt: { normX: number; normY: number }): string | 'all' | undefined => {
+      if (cameraId) return cameraId;
+      if (!crosshairIndependent.get() || cameraOptions.length <= 1) return cameraOptions[0]?.id ?? 'all';
+      if (activeCrosshairCamera !== 'all') return activeCrosshairCamera;
+      // In overlay mode with "All" selected and per-camera enabled, pick the nearest camera crosshair.
+      let nearestId = cameraOptions[0].id;
+      let nearestDist = Infinity;
+      for (const cam of cameraOptions) {
+        const pos = getCrosshairPos(cam.id);
+        const dist = Math.hypot(pt.normX - pos.normX, pt.normY - pos.normY);
+        if (dist < nearestDist) {
+          nearestDist = dist;
+          nearestId = cam.id;
+        }
+      }
+      return nearestId;
+    };
+
+    const updateCrosshair = (e: MouseEvent) => {
+      const pt = normalizedPoint(e);
+      if (!pt) return;
+      setCrosshairPos(pt, dragTargetCamera ?? activeCrosshairCamera);
     };
 
     const pointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return;
       el.setPointerCapture(e.pointerId);
       if (crosshairVisible.get()) {
+        const pt = normalizedPoint(e);
+        dragTargetCamera = pt ? resolveOverlayTarget(pt) : cameraId;
+        if (cameraId && crosshairIndependent.get()) {
+          activeCrosshairCamera = cameraId;
+        }
         isDraggingCrosshair = true;
-        updateCrosshair(e);
+        if (pt) setCrosshairPos(pt, dragTargetCamera);
         return;
       }
       isPanning = true;
@@ -159,7 +222,7 @@
   function registerChannelCanvas(el: HTMLCanvasElement, channel: PreviewChannel) {
     separateCanvases.set(channel.idx, el);
     needsRedraw = true;
-    const teardown = setupPanZoom(el);
+    const teardown = setupPanZoom(el, cameraKey(channel));
     return {
       destroy() {
         separateCanvases.delete(channel.idx);
@@ -208,10 +271,16 @@
     };
   });
 
-  function sampleAtCrosshair(channelName?: string) {
+  function sampleAtCrosshair(pos: { normX: number; normY: number }, channelName?: string, cameraId?: string) {
     void previewer.redrawGeneration;
     const aspect = viewW > 0 && viewH > 0 ? viewW / viewH : 1;
-    return previewer.samplePixel(crosshairPos.normX, crosshairPos.normY, aspect, channelName);
+    const samples = previewer.samplePixel(pos.normX, pos.normY, aspect, channelName);
+    if (!channelName && cameraId && crosshairIndependent.get() && hasMultipleCameras) {
+      return samples.filter((s) =>
+        visibleChannels.some((ch) => cameraKey(ch) === cameraId && ch.name === s.channelName)
+      );
+    }
+    return samples;
   }
 
   // ── Scale bar ──
@@ -249,27 +318,25 @@
   <div class="h-2 rounded-full bg-fg" style:width="{bar?.barPx ?? 0}px"></div>
 {/snippet}
 
-{#snippet crosshairOverlay(channelName?: string)}
+{#snippet crosshairOverlay(opts?: { channelName?: string; cameraId?: string; cameraLabel?: string })}
   {#if crosshairVisible.get()}
-    {@const samples = sampleAtCrosshair(channelName)}
+    {@const pos = getCrosshairPos(opts?.cameraId)}
+    {@const samples = sampleAtCrosshair(pos, opts?.channelName, opts?.cameraId)}
+    <div class="pointer-events-none absolute inset-x-0 z-10 h-px bg-fg/70 halo" style:top="{pos.normY * 100}%"></div>
+    <div class="pointer-events-none absolute inset-y-0 z-10 w-px bg-fg/70 halo" style:left="{pos.normX * 100}%"></div>
     <div
-      class="pointer-events-none absolute inset-x-0 z-10 h-px bg-fg/70 halo"
-      style:top="{crosshairPos.normY * 100}%"
-    ></div>
-    <div
-      class="pointer-events-none absolute inset-y-0 z-10 w-px bg-fg/70 halo"
-      style:left="{crosshairPos.normX * 100}%"
-    ></div>
-    <div
-      class="pointer-events-none absolute z-10 flex flex-col gap-0.5 frame-overlay px-2 py-1 font-mono text-xs text-fg tabular-nums {crosshairPos.normX >
+      class="pointer-events-none absolute z-10 flex flex-col gap-0.5 frame-overlay px-2 py-1 font-mono text-xs text-fg tabular-nums {pos.normX >
       0.7
         ? '-translate-x-2'
-        : 'translate-x-2'} {crosshairPos.normY > 0.8 ? '-translate-y-2' : 'translate-y-2'}"
-      style:left={crosshairPos.normX > 0.7 ? undefined : `${crosshairPos.normX * 100}%`}
-      style:right={crosshairPos.normX > 0.7 ? `${(1 - crosshairPos.normX) * 100}%` : undefined}
-      style:top={crosshairPos.normY > 0.8 ? undefined : `${crosshairPos.normY * 100}%`}
-      style:bottom={crosshairPos.normY > 0.8 ? `${(1 - crosshairPos.normY) * 100}%` : undefined}
+        : 'translate-x-2'} {pos.normY > 0.8 ? '-translate-y-2' : 'translate-y-2'}"
+      style:left={pos.normX > 0.7 ? undefined : `${pos.normX * 100}%`}
+      style:right={pos.normX > 0.7 ? `${(1 - pos.normX) * 100}%` : undefined}
+      style:top={pos.normY > 0.8 ? undefined : `${pos.normY * 100}%`}
+      style:bottom={pos.normY > 0.8 ? `${(1 - pos.normY) * 100}%` : undefined}
     >
+      {#if opts?.cameraLabel}
+        <span class="text-2xs font-sans text-fg-muted">{opts.cameraLabel}</span>
+      {/if}
       {#if samples.length > 0}
         <span class="text-fg-muted">({samples[0].sensorX}, {samples[0].sensorY})</span>
         {#if samples.length === 1}
@@ -301,7 +368,7 @@
             use:registerChannelCanvas={channel}
             class="size-full {crosshairVisible.get() ? 'cursor-crosshair' : ''}"
           ></canvas>
-          {@render crosshairOverlay(channel.name)}
+          {@render crosshairOverlay({ channelName: channel.name, cameraId: cameraKey(channel) })}
           <div class="pointer-events-none absolute top-2 left-2 rounded bg-canvas/80 px-2 py-1 text-sm text-fg">
             {displayName(channel.config?.detection ?? channel.name ?? '')} · {channel.label}
           </div>
@@ -311,7 +378,13 @@
   {:else}
     <canvas bind:this={canvasEl} use:panZoomAction class="size-full {crosshairVisible.get() ? 'cursor-crosshair' : ''}"
     ></canvas>
-    {@render crosshairOverlay()}
+    {#if hasMultipleCameras && crosshairIndependent.get()}
+      {#each cameraOptions as cam (cam.id)}
+        {@render crosshairOverlay({ cameraId: cam.id, cameraLabel: cam.label })}
+      {/each}
+    {:else}
+      {@render crosshairOverlay({ cameraId: cameraOptions[0]?.id })}
+    {/if}
   {/if}
 
   {#if hasMultipleCameras}
@@ -338,7 +411,13 @@
   <!-- Center the ui-sm toolbar, including its p-1 padding and panel border; the minimap expands below it. -->
   <!-- top-[calc((var(--pane-header-height)-var(--ui-sm))/2-var(--spacing)-1px)] -->
   <div class="pointer-events-none absolute top-2 left-3 z-10 w-58">
-    <PreviewNavigationControls {previewer} />
+    <PreviewNavigationControls
+      {previewer}
+      cameras={cameraOptions}
+      {activeCrosshairCamera}
+      onSelectCrosshairCamera={(id) => (activeCrosshairCamera = id)}
+      onCenterCrosshair={centerCrosshair}
+    />
   </div>
 
   <div class="pointer-events-none absolute bottom-3 left-3 z-10 w-58">

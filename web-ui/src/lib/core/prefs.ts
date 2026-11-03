@@ -55,7 +55,8 @@ export const prefs = {
     mode: pref<ViewerMode>('ui:viewer:mode', 'fov'),
     channelsVisible: pref('ui:viewer:channels-visible', true),
     navigatorVisible: pref('ui:viewer:navigator-visible', false),
-    crosshairVisible: pref('ui:viewer:crosshair-visible', false)
+    crosshairVisible: pref('ui:viewer:crosshair-visible', false),
+    crosshairIndependent: pref('ui:viewer:crosshair-independent', true)
   },
 
   stage: {

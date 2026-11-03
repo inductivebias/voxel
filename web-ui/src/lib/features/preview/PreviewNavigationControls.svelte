@@ -10,14 +10,30 @@
   import { isFullViewport } from './render';
   import { DEFAULT_VIEWPORT, type PreviewSession, wheelZoomFactor } from './session.svelte';
 
-  interface Props {
-    previewer: PreviewSession;
+  interface CrosshairCameraOption {
+    id: string;
+    label: string;
   }
 
-  let { previewer }: Props = $props();
+  interface Props {
+    previewer: PreviewSession;
+    cameras?: CrosshairCameraOption[];
+    activeCrosshairCamera?: string | 'all';
+    onSelectCrosshairCamera?: (cameraId: string | 'all') => void;
+    onCenterCrosshair?: () => void;
+  }
+
+  let {
+    previewer,
+    cameras = [],
+    activeCrosshairCamera = 'all',
+    onSelectCrosshairCamera,
+    onCenterCrosshair
+  }: Props = $props();
 
   const navigatorVisible = prefs.viewer.navigatorVisible;
   const crosshairVisible = prefs.viewer.crosshairVisible;
+  const crosshairIndependent = prefs.viewer.crosshairIndependent;
   let minimapEl = $state<HTMLDivElement | null>(null);
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let drawing = false;
@@ -150,6 +166,70 @@
       />
     </button>
   </div>
+
+  {#if crosshairVisible.get()}
+    <div class="flex flex-col gap-1 border-t border-line-muted p-1.5 text-xs">
+      <div class="flex items-center justify-between gap-1">
+        <button
+          type="button"
+          onclick={onCenterCrosshair}
+          class="bg-element cursor-pointer rounded px-2 py-0.5 text-fg transition-colors hover:bg-element-hover"
+        >
+          Center
+        </button>
+        {#if cameras.length > 1}
+          <div class="flex items-center gap-0.5 rounded bg-canvas/60 p-0.5">
+            <button
+              type="button"
+              onclick={() => crosshairIndependent.set(true)}
+              class="cursor-pointer rounded-xs px-1.5 py-0.5 transition-colors {crosshairIndependent.get()
+                ? 'bg-element-selected text-fg'
+                : 'text-fg-muted hover:text-fg'}"
+              aria-pressed={crosshairIndependent.get()}
+            >
+              Per camera
+            </button>
+            <button
+              type="button"
+              onclick={() => crosshairIndependent.set(false)}
+              class="cursor-pointer rounded-xs px-1.5 py-0.5 transition-colors {!crosshairIndependent.get()
+                ? 'bg-element-selected text-fg'
+                : 'text-fg-muted hover:text-fg'}"
+              aria-pressed={!crosshairIndependent.get()}
+            >
+              Linked
+            </button>
+          </div>
+        {/if}
+      </div>
+      {#if cameras.length > 1 && crosshairIndependent.get()}
+        <div class="flex flex-wrap items-center gap-0.5">
+          <button
+            type="button"
+            onclick={() => onSelectCrosshairCamera?.('all')}
+            class="cursor-pointer rounded-xs px-1.5 py-0.5 transition-colors {activeCrosshairCamera === 'all'
+              ? 'bg-element-selected text-fg'
+              : 'text-fg-muted hover:text-fg'}"
+            aria-pressed={activeCrosshairCamera === 'all'}
+          >
+            All
+          </button>
+          {#each cameras as cam (cam.id)}
+            <button
+              type="button"
+              onclick={() => onSelectCrosshairCamera?.(cam.id)}
+              class="cursor-pointer rounded-xs px-1.5 py-0.5 transition-colors {activeCrosshairCamera === cam.id
+                ? 'bg-element-selected text-fg'
+                : 'text-fg-muted hover:text-fg'}"
+              aria-pressed={activeCrosshairCamera === cam.id}
+            >
+              {cam.label}
+            </button>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
 
   {#if navigatorVisible.get()}
     <div class="border-t border-line-muted p-1.5">
