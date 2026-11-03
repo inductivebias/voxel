@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
@@ -103,8 +103,13 @@ def _write_json(target: Path | S3Path, payload: Mapping[str, Any]) -> None:
     target.write_text(f"{json.dumps(payload, indent=2)}\n", encoding="utf-8")
 
 
+def _unique_laser_channels(chans: Iterable["Channel"]) -> list["Channel"]:
+    """Return one channel per distinct illumination laser, preserving channel order."""
+    return list({ch.laser.uid: ch for ch in chans}.values())
+
+
 async def _disable_lasers_and_halt(
-    chans: list["Channel"], axis: ContinuousAxisHandle, *, halt: bool
+    chans: Sequence["Channel"], axis: ContinuousAxisHandle, *, halt: bool
 ) -> tuple[list[Any], list[Exception]]:
     """Disable every laser output, halting the scan axis in the same moment when ``halt`` is set.
 
@@ -1188,14 +1193,15 @@ class Instrument:
         self._preview_source_ids.clear()
         self._preview_positions.clear()
 
+        laser_chans = _unique_laser_channels(chans)
         try:
             await self._inhibit_laser_outputs()
-            await _gather_hardware(*(ch.prepare_laser() for ch in chans))
+            await _gather_hardware(*(ch.prepare_laser() for ch in laser_chans))
             await _gather_hardware(*(ch.camera.start_preview() for ch in chans))
             await self._reset_preview()
             with suppress(NotImplementedError, RuntimeError):
                 await self._hal.stage.scanning_axis.reset_ttl_stepper()
-            await _gather_hardware(*(ch.enable_laser_output() for ch in chans))
+            await _gather_hardware(*(ch.enable_laser_output() for ch in laser_chans))
             await self._start_signal_generators()
             await self._activity.set(PreviewActivity(channels=tuple(ch.uid for ch in chans)))
         except BaseException:
@@ -1222,7 +1228,8 @@ class Instrument:
 
     async def _teardown_preview(self, chans: Sequence[Channel]) -> None:
         """Inhibit output, stop generation, then stop the cameras; finish every step before reporting failures."""
-        results = await asyncio.gather(*(ch.disable_laser_output() for ch in chans), return_exceptions=True)
+        laser_chans = _unique_laser_channels(chans)
+        results = await asyncio.gather(*(ch.disable_laser_output() for ch in laser_chans), return_exceptions=True)
         results.extend(await asyncio.gather(self._stop_signal_generators(), return_exceptions=True))
         results.extend(await asyncio.gather(*(ch.camera.stop_preview() for ch in chans), return_exceptions=True))
         if errors := [result for result in results if isinstance(result, BaseException)]:
@@ -1715,7 +1722,7 @@ class Instrument:
             planned = await self._plan_pass(volume) if progress is not None else None
             await self._inhibit_laser_outputs()
             await self._apply_profile(volume.profile)
-            await _gather_hardware(*(ch.prepare_laser() for ch in channels.values()))
+            await _gather_hardware(*(ch.prepare_laser() for ch in _unique_laser_channels(channels.values())))
             await self._update_acquisition(manifest, phase=AcquisitionPhase.POSITIONING)
             await _gather_hardware(
                 self._hal.stage.x.move_abs(volume.x, wait=True),
@@ -1807,7 +1814,7 @@ class Instrument:
             frames = min(batch_z, volume.frames_total - batch_idx * batch_z)
             await _gather_hardware(*(ch.camera.begin_batch(frames) for ch in channels.values()))
             if batch_idx == 0:
-                await _gather_hardware(*(ch.enable_laser_output() for ch in channels.values()))
+                await _gather_hardware(*(ch.enable_laser_output() for ch in _unique_laser_channels(channels.values())))
             await self._start_signal_generators()
             async with asyncio.timeout(30.0 + 2 * frames * period):
                 while True:
@@ -1930,7 +1937,7 @@ class Instrument:
             )
         )
         await _gather_hardware(*(ch.camera.begin_batch(planned.division.cycles) for ch in channels.values()))
-        await _gather_hardware(*(ch.enable_laser_output() for ch in channels.values()))
+        await _gather_hardware(*(ch.enable_laser_output() for ch in _unique_laser_channels(channels.values())))
         pacing = await generator.start_paced(planned.division)
         await recorder.mark_motion()
         progress.moving = True
@@ -2019,9 +2026,11 @@ class Instrument:
         rather than blocking cleanup indefinitely.
         """
 
-        def _report(label: str, results: list[Any], *, collect: bool = False) -> list[Exception]:
+        def _report(
+            label: str, targets: Sequence[Channel], results: list[Any], *, collect: bool = False
+        ) -> list[Exception]:
             errors: list[Exception] = []
-            for ch, result in zip(chans, results, strict=True):
+            for ch, result in zip(targets, results, strict=True):
                 if isinstance(result, BaseException):
                     logger.error("cleanup: %s failed for %s", label, ch.uid, exc_info=result)
                     if collect:
@@ -2030,8 +2039,9 @@ class Instrument:
 
         unfinished = progress is not None and not progress.finished
         halt = unfinished and progress is not None and progress.moving
-        laser_results, errors = await _disable_lasers_and_halt(chans, scanning_axis, halt=halt)
-        errors[:0] = _report("disable_laser_output", laser_results, collect=True)
+        laser_chans = _unique_laser_channels(chans)
+        laser_results, errors = await _disable_lasers_and_halt(laser_chans, scanning_axis, halt=halt)
+        errors[:0] = _report("disable_laser_output", laser_chans, laser_results, collect=True)
         try:
             await self._stop_signal_generators()
         except Exception as error:

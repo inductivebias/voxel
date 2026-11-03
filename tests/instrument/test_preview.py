@@ -4,6 +4,7 @@ import numpy as np
 import pytest
 
 from vxl.instrument import IdleActivity, Instrument, OperationRejectedError, PreviewActivity
+from vxl.instrument.core import Channel
 from vxl.preview import PreviewFrame, PreviewLayer, PreviewSourceEmission, PreviewViewport
 from vxl.preview.protocol import StagePosition
 
@@ -261,3 +262,25 @@ async def test_preview_position_survives_stop_but_not_stream_reset(
         assert not instrument._preview_positions
     finally:
         unsub()
+
+
+async def test_preview_deduplicates_shared_laser_commands_across_channels(
+    opened_instrument: Instrument, preview_operations: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instrument, events = opened_instrument, preview_operations
+    await instrument.select_route("excitation_side", "left")
+    gfp = instrument._channels["gfp"]
+    gfp_cam2 = Channel(uid="gfp_cam2", camera=gfp.camera, laser=gfp.laser)
+    instrument._channels["gfp_cam2"] = gfp_cam2
+    monkeypatch.setattr(Instrument, "active_channels", property(lambda _self: {"gfp": gfp, "gfp_cam2": gfp_cam2}))
+    monkeypatch.setattr(instrument, "_preview_channels", SimpleNamespace(value=("gfp", "gfp_cam2")))
+
+    events.clear()
+    await instrument.start_preview()
+    assert events.count("laser_488.set_modulation_mode") == 1
+    assert events.count("laser_488.source_enable") == 1
+    assert events.count("laser_488.output_enable") == 1
+
+    events.clear()
+    await instrument.stop_preview()
+    assert events.count("laser_488.output_disable") == 1
