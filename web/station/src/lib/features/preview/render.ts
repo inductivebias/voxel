@@ -1,4 +1,5 @@
 import type { ColormapCatalog, PreviewViewport } from '$lib/core/model/types';
+import { fittedDrawBounds } from '$lib/core/utils/vec';
 import { getWebGPUDevice } from '$lib/core/utils/wgpu';
 
 import PREVIEW_SHADER from './preview.wgsl?raw';
@@ -216,7 +217,7 @@ const FULL_VIEWPORT: PreviewViewport = { x: 0, y: 0, w: 1, h: 1 };
 /** Shared raw-frame GPU storage and renderer. Individual canvases only own their WebGPU context. */
 export class PreviewGpuRenderer {
   readonly #channels = new Map<string, GpuChannel>();
-  readonly #contexts = new WeakMap<HTMLCanvasElement, GPUCanvasContext>();
+  readonly #contexts = new WeakMap<HTMLCanvasElement, { context: GPUCanvasContext; device: GPUDevice }>();
   readonly #errorHandler: (message: string) => void;
   #resourcesPromise: Promise<Resources>;
   #generation = 0;
@@ -303,11 +304,9 @@ export class PreviewGpuRenderer {
     const { maxW, maxH } = channelBoundingBox(visible);
     if (maxW <= 0 || maxH <= 0) return [];
 
-    const viewportAspect = (viewport.w * maxW) / (viewport.h * maxH);
-    const drawW = canvasAspect > viewportAspect ? viewportAspect / canvasAspect : 1;
-    const drawH = canvasAspect > viewportAspect ? 1 : canvasAspect / viewportAspect;
-    const u = (normX - (1 - drawW) / 2) / drawW;
-    const v = (normY - (1 - drawH) / 2) / drawH;
+    const bounds = fittedDrawBounds(canvasAspect, viewport, maxW / maxH);
+    const u = (normX - bounds.x) / bounds.w;
+    const v = (normY - bounds.y) / bounds.h;
     if (u < 0 || u >= 1 || v < 0 || v >= 1) return [];
 
     const boundingX = viewport.x + u * viewport.w;
@@ -375,12 +374,11 @@ export class PreviewGpuRenderer {
 
     const { maxW, maxH } = channelBoundingBox(visible);
     if (maxW > 0 && maxH > 0) {
-      const viewportAspect = (viewport.w * maxW) / (viewport.h * maxH);
-      const canvasAspect = canvas.width / canvas.height;
-      const drawHeight = canvasAspect > viewportAspect ? canvas.height : canvas.width / viewportAspect;
-      const drawWidth = canvasAspect > viewportAspect ? drawHeight * viewportAspect : canvas.width;
-      const drawX = (canvas.width - drawWidth) / 2;
-      const drawY = (canvas.height - drawHeight) / 2;
+      const bounds = fittedDrawBounds(canvas.width / canvas.height, viewport, maxW / maxH);
+      const drawWidth = bounds.w * canvas.width;
+      const drawHeight = bounds.h * canvas.height;
+      const drawX = bounds.x * canvas.width;
+      const drawY = bounds.y * canvas.height;
 
       for (const channel of visible) {
         const name = channel.name!;
@@ -472,19 +470,19 @@ export class PreviewGpuRenderer {
   }
 
   #context(canvas: HTMLCanvasElement, resources: Resources): GPUCanvasContext {
-    let context = this.#contexts.get(canvas);
-    if (!context) {
-      const created = canvas.getContext('webgpu');
-      if (!created) throw new Error('Unable to create a WebGPU canvas context.');
-      context = created;
-      this.#contexts.set(canvas, context);
+    const existing = this.#contexts.get(canvas);
+    if (existing && existing.device === resources.device) {
+      return existing.context;
     }
+    const context = existing?.context ?? canvas.getContext('webgpu');
+    if (!context) throw new Error('Unable to create a WebGPU canvas context.');
     context.configure({
       device: resources.device,
       format: resources.format,
       alphaMode: 'premultiplied',
       usage: GPUTextureUsage.RENDER_ATTACHMENT | GPUTextureUsage.COPY_SRC
     });
+    this.#contexts.set(canvas, { context, device: resources.device });
     return context;
   }
 

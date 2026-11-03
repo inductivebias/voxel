@@ -31,3 +31,25 @@ export function parseVec2D(val: unknown): Vec2D | null {
 export function clampTopLeft(value: number, viewSize: number): number {
   return Math.max(0, Math.min(value, 1 - viewSize));
 }
+
+export interface NormalizedRect {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
+/** Normalized [0, 1] canvas rectangle occupied by an aspect-fitted viewport. */
+export function fittedDrawBounds(
+  canvasAspect: number,
+  viewport: { w: number; h: number },
+  boundingAspect: number
+): NormalizedRect {
+  const viewportAspect = (viewport.w / viewport.h) * boundingAspect;
+  if (!Number.isFinite(canvasAspect) || canvasAspect <= 0 || !Number.isFinite(viewportAspect) || viewportAspect <= 0) {
+    return { x: 0, y: 0, w: 1, h: 1 };
+  }
+  const w = canvasAspect > viewportAspect ? viewportAspect / canvasAspect : 1;
+  const h = canvasAspect > viewportAspect ? 1 : canvasAspect / viewportAspect;
+  return { x: (1 - w) / 2, y: (1 - h) / 2, w, h };
+}

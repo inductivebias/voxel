@@ -4,7 +4,7 @@
   import { SvelteMap } from 'svelte/reactivity';
 
   import { prefs } from '$lib/core/prefs';
-  import { clampTopLeft } from '$lib/core/utils/vec';
+  import { clampTopLeft, fittedDrawBounds } from '$lib/core/utils/vec';
   import { RadioBar } from '@voxel/kit';
   import { displayName } from '@voxel/kit/format';
   import { pref } from '@voxel/kit/pref';
@@ -177,11 +177,13 @@
       }
       if (!isPanning) return;
       const rect = el.getBoundingClientRect();
-      const dx = ((e.clientX - panStartX) / rect.width) * previewer.viewport.w;
-      const dy = ((e.clientY - panStartY) / rect.height) * previewer.viewport.h;
-      const newX = clampTopLeft(startViewport.x - dx, previewer.viewport.w);
-      const newY = clampTopLeft(startViewport.y - dy, previewer.viewport.h);
-      previewer.setViewport({ x: newX, y: newY, w: previewer.viewport.w, h: previewer.viewport.h });
+      if (rect.width <= 0 || rect.height <= 0) return;
+      const bounds = fittedDrawBounds(rect.width / rect.height, startViewport, previewer.boundingBoxAspect);
+      const dx = ((e.clientX - panStartX) / (rect.width * bounds.w)) * startViewport.w;
+      const dy = ((e.clientY - panStartY) / (rect.height * bounds.h)) * startViewport.h;
+      const newX = clampTopLeft(startViewport.x - dx, startViewport.w);
+      const newY = clampTopLeft(startViewport.y - dy, startViewport.h);
+      previewer.setViewport({ x: newX, y: newY, w: startViewport.w, h: startViewport.h });
     };
 
     const pointerUp = (e: PointerEvent) => {
@@ -194,11 +196,15 @@
     const wheel = (e: WheelEvent) => {
       e.preventDefault();
       const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
       const vp = previewer.viewport;
+      const bounds = fittedDrawBounds(rect.width / rect.height, vp, previewer.boundingBoxAspect);
       // Keep the sensor point under the cursor fixed on screen.
       const mouseX = (e.clientX - rect.left) / rect.width;
       const mouseY = (e.clientY - rect.top) / rect.height;
-      previewer.zoomBy(wheelZoomFactor(e), vp.x + mouseX * vp.w, vp.y + mouseY * vp.h, mouseX, mouseY);
+      const u = Math.max(0, Math.min(1, (mouseX - bounds.x) / bounds.w));
+      const v = Math.max(0, Math.min(1, (mouseY - bounds.y) / bounds.h));
+      previewer.zoomBy(wheelZoomFactor(e), vp.x + u * vp.w, vp.y + v * vp.h, u, v);
     };
 
     el.addEventListener('pointerdown', pointerDown, { passive: true });
@@ -217,6 +223,7 @@
   }
 
   function panZoomAction(el: HTMLCanvasElement) {
+    needsRedraw = true;
     const teardown = setupPanZoom(el);
     return { destroy: teardown };
   }
@@ -299,9 +306,8 @@
 
     const vp = previewer.viewport;
     // Use the same frame-or-FOV geometry as the navigation controls, including before streaming.
-    const vpAspect = (vp.w / vp.h) * previewer.boundingBoxAspect;
-    const canvasAspect = cw / ch;
-    const drawW = canvasAspect > vpAspect ? ch * vpAspect : cw;
+    const bounds = fittedDrawBounds(cw / ch, vp, previewer.boundingBoxAspect);
+    const drawW = bounds.w * cw;
 
     const umPerPx = (vp.w * fovW) / drawW;
     if (!Number.isFinite(umPerPx) || umPerPx <= 0) return null;
