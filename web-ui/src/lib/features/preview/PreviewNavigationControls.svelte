@@ -5,7 +5,7 @@
   import { prefs } from '$lib/core/prefs';
   import { clampTopLeft } from '$lib/core/utils';
   import { NumberBox } from '$lib/kit';
-  import { ChevronDown } from '$lib/kit/icons';
+  import { ChevronDown, Crosshair } from '$lib/kit/icons';
 
   import { isFullViewport } from './render';
   import { DEFAULT_VIEWPORT, type PreviewSession, wheelZoomFactor } from './session.svelte';
@@ -17,6 +17,7 @@
   let { previewer }: Props = $props();
 
   const navigatorVisible = prefs.viewer.navigatorVisible;
+  const crosshairVisible = prefs.viewer.crosshairVisible;
   let minimapEl = $state<HTMLDivElement | null>(null);
   let canvasEl = $state<HTMLCanvasElement | null>(null);
   let drawing = false;
@@ -122,6 +123,18 @@
     <NumberBox model={previewer.panXModel} prefix="X" decimals={2} class="min-w-0 bg-transparent pr-0.5 pl-0" />
     <NumberBox model={previewer.panYModel} prefix="Y" decimals={2} class="min-w-0 bg-transparent pr-0.5 pl-0" />
     <NumberBox model={previewer.zoomModel} prefix="K" class="min-w-0 bg-transparent pr-0.5 pl-0" />
+    <button
+      type="button"
+      onclick={() => crosshairVisible.set(!crosshairVisible.get())}
+      class="flex h-6 w-5 shrink-0 cursor-pointer items-center justify-center rounded transition-colors hover:bg-element-hover hover:text-fg {crosshairVisible.get()
+        ? 'bg-element-selected text-fg'
+        : 'text-fg-muted'}"
+      aria-pressed={crosshairVisible.get()}
+      aria-label="Toggle pixel crosshair"
+      title={crosshairVisible.get() ? 'Hide pixel crosshair' : 'Show pixel crosshair'}
+    >
+      <Crosshair width="14" height="14" />
+    </button>
     <button
       type="button"
       onclick={() => navigatorVisible.set(!navigatorVisible.get())}

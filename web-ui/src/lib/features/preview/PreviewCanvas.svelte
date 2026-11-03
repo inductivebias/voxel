@@ -3,6 +3,7 @@
   import { onMount } from 'svelte';
   import { SvelteMap } from 'svelte/reactivity';
 
+  import { prefs } from '$lib/core/prefs';
   import { clampTopLeft, displayName, pref } from '$lib/core/utils';
   import { RadioBar } from '$lib/kit';
 
@@ -19,6 +20,8 @@
   let { previewer, fov }: Props = $props();
 
   const cameraLayout = pref<'separate' | 'overlay'>('preview:camera-layout', 'separate');
+  const crosshairVisible = prefs.viewer.crosshairVisible;
+  let hover = $state.raw<{ normX: number; normY: number; aspect: number } | null>(null);
   const visibleChannels = $derived(previewer.channels.filter((channel) => channel.name && channel.visible));
   // Channels sharing one sensor remain composited; independent cameras get individual canvases.
   const hasMultipleCameras = $derived(
@@ -78,6 +81,16 @@
     let panStartY = 0;
     let startViewport = { ...previewer.viewport };
 
+    const updateHover = (e: MouseEvent) => {
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0 || rect.height <= 0) return;
+      hover = {
+        normX: Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width)),
+        normY: Math.max(0, Math.min(1, (e.clientY - rect.top) / rect.height)),
+        aspect: rect.width / rect.height
+      };
+    };
+
     const pointerDown = (e: PointerEvent) => {
       if (e.button !== 0) return;
       el.setPointerCapture(e.pointerId);
@@ -88,6 +101,7 @@
     };
 
     const pointerMove = (e: PointerEvent) => {
+      updateHover(e);
       if (!isPanning) return;
       const rect = el.getBoundingClientRect();
       const dx = ((e.clientX - panStartX) / rect.width) * previewer.viewport.w;
@@ -103,8 +117,13 @@
       isPanning = false;
     };
 
+    const pointerLeave = () => {
+      hover = null;
+    };
+
     const wheel = (e: WheelEvent) => {
       e.preventDefault();
+      updateHover(e);
       const rect = el.getBoundingClientRect();
       const vp = previewer.viewport;
       // Keep the sensor point under the cursor fixed on screen.
@@ -116,12 +135,14 @@
     el.addEventListener('pointerdown', pointerDown, { passive: true });
     el.addEventListener('pointermove', pointerMove, { passive: true });
     el.addEventListener('pointerup', pointerUp, { passive: true });
+    el.addEventListener('pointerleave', pointerLeave, { passive: true });
     el.addEventListener('wheel', wheel, { passive: false });
 
     return () => {
       el.removeEventListener('pointerdown', pointerDown);
       el.removeEventListener('pointermove', pointerMove);
       el.removeEventListener('pointerup', pointerUp);
+      el.removeEventListener('pointerleave', pointerLeave);
       el.removeEventListener('wheel', wheel);
     };
   }
@@ -183,6 +204,11 @@
     };
   });
 
+  function sampleAtHover(channelName?: string) {
+    void previewer.redrawGeneration;
+    return hover ? previewer.samplePixel(hover.normX, hover.normY, hover.aspect, channelName) : [];
+  }
+
   // ── Scale bar ──
   // Pick a "nice" round bar length that fits ~15-25% of the canvas width.
   const NICE_STEPS = [1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000];
@@ -218,12 +244,53 @@
   <div class="h-2 rounded-full bg-fg" style:width="{bar?.barPx ?? 0}px"></div>
 {/snippet}
 
+{#snippet crosshairOverlay(channelName?: string)}
+  {#if crosshairVisible.get() && hover}
+    {@const samples = sampleAtHover(channelName)}
+    <div class="pointer-events-none absolute inset-x-0 z-10 h-px bg-fg/70 halo" style:top="{hover.normY * 100}%"></div>
+    <div class="pointer-events-none absolute inset-y-0 z-10 w-px bg-fg/70 halo" style:left="{hover.normX * 100}%"></div>
+    <div
+      class="pointer-events-none absolute z-10 flex flex-col gap-0.5 frame-overlay px-2 py-1 font-mono text-xs text-fg tabular-nums {hover.normX >
+      0.7
+        ? '-translate-x-2'
+        : 'translate-x-2'} {hover.normY > 0.8 ? '-translate-y-2' : 'translate-y-2'}"
+      style:left={hover.normX > 0.7 ? undefined : `${hover.normX * 100}%`}
+      style:right={hover.normX > 0.7 ? `${(1 - hover.normX) * 100}%` : undefined}
+      style:top={hover.normY > 0.8 ? undefined : `${hover.normY * 100}%`}
+      style:bottom={hover.normY > 0.8 ? `${(1 - hover.normY) * 100}%` : undefined}
+    >
+      {#if samples.length > 0}
+        <span class="text-fg-muted">({samples[0].sensorX}, {samples[0].sensorY})</span>
+        {#if samples.length === 1}
+          <span>I = {samples[0].value}</span>
+        {:else}
+          {#each samples as sample (sample.channelName)}
+            <div class="flex items-center gap-1.5">
+              {#if sample.color}
+                <span class="size-2 rounded-full" style:background-color={sample.color}></span>
+              {/if}
+              <span class="text-fg-muted">{sample.label}</span>
+              <span class="ml-auto">{sample.value}</span>
+            </div>
+          {/each}
+        {/if}
+      {:else}
+        <span class="text-fg-muted">--</span>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
+
 <div class="relative size-full">
   {#if showSeparate}
     <div class="grid size-full grid-cols-2 gap-2 p-2">
       {#each visibleChannels as channel (channel.idx)}
         <div class="relative min-h-0 min-w-0 overflow-hidden rounded-md bg-black">
-          <canvas use:registerChannelCanvas={channel} class="size-full"></canvas>
+          <canvas
+            use:registerChannelCanvas={channel}
+            class="size-full {crosshairVisible.get() ? 'cursor-crosshair' : ''}"
+          ></canvas>
+          {@render crosshairOverlay(channel.name)}
           <div class="pointer-events-none absolute top-2 left-2 rounded bg-canvas/80 px-2 py-1 text-sm text-fg">
             {displayName(channel.config?.detection ?? channel.name ?? '')} · {channel.label}
           </div>
@@ -231,7 +298,9 @@
       {/each}
     </div>
   {:else}
-    <canvas bind:this={canvasEl} use:panZoomAction class="size-full"></canvas>
+    <canvas bind:this={canvasEl} use:panZoomAction class="size-full {crosshairVisible.get() ? 'cursor-crosshair' : ''}"
+    ></canvas>
+    {@render crosshairOverlay()}
   {/if}
 
   {#if hasMultipleCameras}

@@ -16,7 +16,7 @@ import { emissionToPreviewColor, isValidHex } from '$lib/kit/themes/colors';
 
 import { FRAME_HISTORY_MS } from './arrivals';
 import type { DecodedPreviewFrame, PreviewLayer, PreviewSourceHeader, StagePosition } from './protocol';
-import { channelBoundingBox, PreviewGpuRenderer } from './render';
+import { channelBoundingBox, PreviewGpuRenderer, type PreviewPixelSample } from './render';
 import { PreviewStream } from './stream';
 
 export interface AutoLevelsPreference {
@@ -286,6 +286,16 @@ export class PreviewSession {
 
   renderFull(canvas: HTMLCanvasElement, channel?: PreviewChannel): Promise<void> {
     return this.#renderer.renderFull(canvas, this.channels, this.catalog, channel?.name);
+  }
+
+  samplePixel(
+    normX: number,
+    normY: number,
+    canvasAspect: number,
+    channelName?: string,
+    viewport = this.viewport
+  ): PreviewPixelSample[] {
+    return this.#renderer.samplePixel(normX, normY, canvasAspect, this.channels, viewport, this.catalog, channelName);
   }
 
   dispose(): void {

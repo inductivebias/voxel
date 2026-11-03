@@ -147,6 +147,7 @@ export function colormapGradient(stops: string[]): string {
 
 export interface PreviewRenderChannel {
   name?: string;
+  label?: string | null;
   visible: boolean;
   rotationDeg: number;
   sensorWidth: number;
@@ -156,9 +157,36 @@ export interface PreviewRenderChannel {
   resolvedColormap: string | null;
 }
 
+export interface PreviewPixelSample {
+  channelName: string;
+  label: string;
+  color: string | null;
+  sensorX: number;
+  sensorY: number;
+  value: number;
+}
+
+export function samplePlanePixel(
+  header: PreviewSourceHeader,
+  bytes: Uint8Array,
+  sensorX: number,
+  sensorY: number
+): number | null {
+  const [rx, ry, rw, rh] = normalizedRect(header);
+  if (sensorX < rx || sensorX >= rx + rw || sensorY < ry || sensorY >= ry + rh) return null;
+  const uvX = Math.max(0, Math.min(0.999999, (sensorX - rx) / rw));
+  const uvY = Math.max(0, Math.min(0.999999, (sensorY - ry) / rh));
+  const px = Math.min(Math.floor(uvX * header.width), header.width - 1);
+  const py = Math.min(Math.floor(uvY * header.height), header.height - 1);
+  const idx = py * header.width + px;
+  const pixels = header.width * header.height;
+  return bytes[idx] | (bytes[pixels + idx] << 8);
+}
+
 interface TexturePlanes {
   low: GPUTexture;
   high: GPUTexture;
+  bytes: Uint8Array;
   header: PreviewSourceHeader;
   deliveryStreamId: string;
   deliverySeq: number;
@@ -259,6 +287,66 @@ export class PreviewGpuRenderer {
     channelName?: string
   ): Promise<void> {
     await this.#render(canvas, channels, FULL_VIEWPORT, catalog, channelName);
+  }
+
+  samplePixel(
+    normX: number,
+    normY: number,
+    canvasAspect: number,
+    channels: readonly PreviewRenderChannel[],
+    viewport: PreviewViewport,
+    catalog: ColormapCatalog,
+    channelName?: string
+  ): PreviewPixelSample[] {
+    if (!Number.isFinite(canvasAspect) || canvasAspect <= 0) return [];
+    const visible = channels.filter((channel) => channel.visible && channel.name && this.#channels.has(channel.name));
+    const { maxW, maxH } = channelBoundingBox(visible);
+    if (maxW <= 0 || maxH <= 0) return [];
+
+    const viewportAspect = (viewport.w * maxW) / (viewport.h * maxH);
+    const drawW = canvasAspect > viewportAspect ? viewportAspect / canvasAspect : 1;
+    const drawH = canvasAspect > viewportAspect ? 1 : canvasAspect / viewportAspect;
+    const u = (normX - (1 - drawW) / 2) / drawW;
+    const v = (normY - (1 - drawH) / 2) / drawH;
+    if (u < 0 || u >= 1 || v < 0 || v >= 1) return [];
+
+    const boundingX = viewport.x + u * viewport.w;
+    const boundingY = viewport.y + v * viewport.h;
+    const samples: PreviewPixelSample[] = [];
+
+    for (const channel of visible) {
+      const name = channel.name!;
+      if (channelName !== undefined && name !== channelName) continue;
+      const stored = this.#channels.get(name);
+      if (!stored) continue;
+      const rotation = normalizedQuarterTurns(channel.rotationDeg);
+      const swapped = rotation % 2 !== 0;
+      const scaleX = (swapped ? channel.sensorHeight : channel.sensorWidth) / maxW;
+      const scaleY = (swapped ? channel.sensorWidth : channel.sensorHeight) / maxH;
+      const channelX = (boundingX - (1 - scaleX) / 2) / scaleX;
+      const channelY = (boundingY - (1 - scaleY) / 2) / scaleY;
+      if (channelX < 0 || channelX >= 1 || channelY < 0 || channelY >= 1) continue;
+
+      const [sensorX, sensorY] = toSensorPoint(channelX, channelY, rotation);
+      const detail = viewportFrameCovers(stored.viewport?.header, viewport, channel.rotationDeg)
+        ? stored.viewport
+        : undefined;
+      const overview = stored.overview;
+      const value =
+        (detail ? samplePlanePixel(detail.header, detail.bytes, sensorX, sensorY) : null) ??
+        (overview ? samplePlanePixel(overview.header, overview.bytes, sensorX, sensorY) : null);
+      if (value === null) continue;
+
+      samples.push({
+        channelName: name,
+        label: channel.label ?? name,
+        color: resolveColormapColor(channel.resolvedColormap, catalog),
+        sensorX: Math.min(Math.floor(sensorX * channel.sensorWidth), channel.sensorWidth - 1),
+        sensorY: Math.min(Math.floor(sensorY * channel.sensorHeight), channel.sensorHeight - 1),
+        value
+      });
+    }
+    return samples;
   }
 
   async #render(
@@ -438,6 +526,7 @@ export class PreviewGpuRenderer {
     return {
       low,
       high,
+      bytes,
       header,
       deliveryStreamId: frame.delivery.delivery_cursor.stream_id,
       deliverySeq: frame.delivery.delivery_cursor.seq
@@ -483,6 +572,19 @@ export class PreviewGpuRenderer {
 
 function normalizedQuarterTurns(degrees: number): number {
   return ((Math.round(degrees / 90) % 4) + 4) % 4;
+}
+
+function toSensorPoint(stageX: number, stageY: number, rotationQuarterTurns: number): [number, number] {
+  switch (rotationQuarterTurns) {
+    case 1:
+      return [stageY, 1 - stageX];
+    case 2:
+      return [1 - stageX, 1 - stageY];
+    case 3:
+      return [1 - stageY, stageX];
+    default:
+      return [stageX, stageY];
+  }
 }
 
 function normalizedRect(header?: PreviewSourceHeader): [number, number, number, number] {
