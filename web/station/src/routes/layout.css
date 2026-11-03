@@ -1,0 +1,49 @@
+@import 'tailwindcss';
+@import '@voxel/kit/style.css';
+
+/* The kit is its own package, so Tailwind scans its files too. */
+@source '../../../kit/src';
+
+/* The sizes of the station window's frame. */
+:root {
+  --pane-header-height: calc(var(--ui-lg) + 3 * var(--ui-step));
+  --pane-footer-height: calc(var(--ui-lg) + 4 * var(--ui-step));
+  --app-bar-height: calc(var(--ui-lg) + 5 * var(--ui-step));
+  --rail-width: 5rem;
+}
+
+@theme inline {
+  --spacing-pane-header: var(--pane-header-height);
+  --spacing-pane-footer: var(--pane-footer-height);
+  --spacing-app-bar: var(--app-bar-height);
+  --spacing-rail: var(--rail-width);
+}
+
+.nss {
+  vector-effect: non-scaling-stroke;
+}
+
+@utility page-body {
+  @apply min-h-0 flex-1 overflow-y-auto px-3 pt-1 pb-4;
+  scrollbar-gutter: stable;
+
+  :where(& > *) {
+    max-width: var(--container-4xl);
+  }
+}
+
+/* One part of the top bar. Each pane has its own part, and the parts line up as 1 bar. */
+@utility app-bar {
+  @apply flex h-app-bar shrink-0 items-center border-b border-line-muted bg-shell;
+}
+
+/* The bar at the top of each tab in the bottom panel of the center pane. Finding things goes on the left; view
+   options and actions on the right, after an `ml-auto`. */
+@utility bottom-panel-bar {
+  @apply flex h-9 shrink-0 items-center gap-2 px-2;
+}
+
+/* The framed list under a bottom panel bar. It scrolls. */
+@utility bottom-panel-box {
+  @apply mx-2 mb-3 min-h-0 flex-1 overflow-y-auto frame-sunken text-sm;
+}

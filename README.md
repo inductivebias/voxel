@@ -30,15 +30,15 @@ storage, and records operational history through web and desktop interfaces.
 ## Try the simulated microscope
 
 Voxel currently requires Python 3.13+, [uv](https://docs.astral.sh/uv/), and
-[Nub](https://nubjs.com/) for building the web interface.
+[Vite+](https://viteplus.dev/) for building the web interface.
 
 ```bash
 git clone https://github.com/AllenNeuralDynamics/voxel.git
 cd voxel
 
 uv sync --all-packages --extra web
-nub install --cwd web-ui --frozen-lockfile
-nub run --cwd web-ui build
+vp -C web install --frozen-lockfile
+vp -C web/station build
 
 uv run vxl station init --name my-microscope
 uv run vxl serve
@@ -125,7 +125,8 @@ interfaces; the other distributions have narrower library boundaries.
 | [`vxl-records`](records/) | SQLite-backed acquisition, preset, and log records |
 | [`ome-zarr-writer`](omezarr/) | Streaming multiscale OME-Zarr writing |
 | [`vxlib`](vxlib/) | Shared reactive primitives, schemas, and utilities |
-| [`web-ui`](web-ui/) | SvelteKit frontend compiled into `vxl.web` package data |
+| [`web/station`](web/station/) | SvelteKit frontend compiled into `vxl.web` package data |
+| [`web/kit`](web/kit/) | Shared Svelte UI kit used by the web apps |
 
 The non-published [`bench`](bench/) workspace contains OME-Zarr performance and behavior benchmarks.
 
@@ -135,7 +136,7 @@ Choose only the application extras needed for your work, or install the complete
 
 ```bash
 uv sync --all-packages --all-extras --all-groups
-nub install --cwd web-ui --frozen-lockfile
+vp -C web install --frozen-lockfile
 uvx pre-commit install
 ```
 
@@ -146,7 +147,7 @@ uv run ruff check
 uv run ruff format --check
 uv run basedpyright
 uv run pytest
-nub run --cwd web-ui check
+vp -C web run -r check
 ```
 
 The default type check covers the core and drivers supported by the standard environment.
@@ -161,7 +162,7 @@ and acquisition finalization. Increase it explicitly for a storage target that n
 Capture deadlines are calculated separately from the imaging recipe. A cleanup failure keeps capture
 busy until the instrument is closed and reopened, rather than permitting reuse of uncertain hardware.
 
-For frontend development, run `nub run --cwd web-ui dev` beside `uv run vxl serve`. Build the frontend and Python
+For frontend development, run `vp -C web/station dev` beside `uv run vxl serve`. Build the frontend and Python
 release artifacts together with `uv run scripts/build.py`.
 
 Package-specific boundaries and workflows are documented in their respective READMEs. Types and docstrings remain
