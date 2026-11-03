@@ -1,6 +1,7 @@
 from collections import deque
 from collections.abc import Iterator
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 from serial.tools.list_ports_common import ListPortInfo
@@ -152,6 +153,35 @@ def test_discover_obis_port_probes_only_obis_and_closes_every_connection(
     for transport in transports.values():
         assert transport.close_calls == 1
         assert all(command.endswith("?") for command in transport.writes)
+
+
+def test_discover_obis_port_deduplicates_aliases_for_same_physical_device(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    physical = tmp_path / "ttyACM0"
+    physical.touch()
+    raw_alias = tmp_path / "dev" / "ttyACM0"
+    stable_alias = tmp_path / "dev" / "serial" / "by-id" / "obis"
+    raw_alias.parent.mkdir()
+    stable_alias.parent.mkdir(parents=True)
+    raw_alias.symlink_to(physical)
+    stable_alias.symlink_to(physical)
+
+    opened: list[str] = []
+    transport = FakeTransport()
+
+    def open_transport(port: str, **_kwargs: object) -> FakeTransport:
+        opened.append(port)
+        return transport
+
+    monkeypatch.setattr(obis, "SerialTransport", open_transport)
+    ports = [ListPortInfo(str(raw_alias)), ListPortInfo(str(stable_alias))]
+    for port in ports:
+        port.vid, port.pid = obis.OBIS_USB_ID
+
+    assert obis.discover_obis_port("123456", 1.0, ports) == str(stable_alias)
+    assert opened == [str(stable_alias)]
+    assert transport.close_calls == 1
 
 
 def open_source(monkeypatch: pytest.MonkeyPatch, transport: FakeTransport, **kwargs: object) -> obis.ObisSource:

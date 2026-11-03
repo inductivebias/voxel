@@ -17,7 +17,7 @@ class SerialTransport:
     _QUIET_BYTE_TIMES = 4
 
     def __init__(self, port: str, baud: int = 115200, timeout: float = 0.5):
-        self.ser = serial.Serial(port=port, baudrate=baud, timeout=timeout, write_timeout=timeout)
+        self.ser = serial.Serial(port=port, baudrate=baud, timeout=timeout, write_timeout=timeout, exclusive=True)
         # Reentrant so the helpers below can be called from inside `transaction()`, which is where
         # a protocol layer holding the port needs them.
         self._lock = threading.RLock()

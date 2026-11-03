@@ -20,6 +20,7 @@ for warm-up to finish.
 """
 
 import math
+import os
 import time
 from collections.abc import Iterable
 from typing import override
@@ -216,8 +217,13 @@ def discover_obis_port(
     ports: Iterable[ListPortInfo] | None = None,
 ) -> str:
     """Find an OBIS module by querying internal serials on OBIS USB interfaces."""
+    by_physical_path: dict[str, list[ListPortInfo]] = {}
+    for port in list_ports.comports() if ports is None else ports:
+        if (port.vid, port.pid) == OBIS_USB_ID:
+            by_physical_path.setdefault(os.path.realpath(port.device), []).append(port)
     candidates = [
-        port for port in (list_ports.comports() if ports is None else ports) if (port.vid, port.pid) == OBIS_USB_ID
+        min(aliases, key=lambda port: ("/dev/serial/by-id/" not in port.device, port.device))
+        for aliases in by_physical_path.values()
     ]
     matches: list[str] = []
     failures: list[str] = []

@@ -7,8 +7,15 @@ from vxl_drivers.serial import SerialTransport
 
 def test_transaction_holds_exclusive_access_across_write_and_read() -> None:
     port = Mock()
-    with patch("vxl_drivers.serial.serial.Serial", return_value=port):
+    with patch("vxl_drivers.serial.serial.Serial", return_value=port) as mock_serial:
         transport = SerialTransport("test")
+    mock_serial.assert_called_once_with(
+        port="test",
+        baudrate=115200,
+        timeout=0.5,
+        write_timeout=0.5,
+        exclusive=True,
+    )
 
     started = threading.Event()
     completed = threading.Event()
