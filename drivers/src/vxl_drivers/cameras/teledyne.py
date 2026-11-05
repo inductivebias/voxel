@@ -387,6 +387,30 @@ class PyvcamDevice:
             except Exception:
                 return None
 
+    def acquisition_rate_limit(self, exposure_mode: int, exposure_us: int) -> float:
+        """Refresh PVCAM's setup-dependent timing without starting sensor exposure."""
+        with self._lock:
+            camera = self._camera
+            out = self.expose_out_mode()
+            pvc = import_module("pyvcam.pvc")
+            pvc.setup_live(camera.handle, camera.rois, camera.exp_time, exposure_mode | out, 2, None)
+            readout = float(camera.readout_time) * 1e-6
+            if not math.isfinite(readout) or readout <= 0:
+                raise RuntimeError("PVCAM returned invalid readout timing")
+            exposure = exposure_us * 1e-6
+            # Kinetix First Row overlaps readout and exposure; other expose-out modes
+            # are deliberately treated conservatively until their overlap is established.
+            period = max(exposure, readout) if out == 0 else exposure + readout
+            for attr in ("clear_time", "pre_trigger_delay", "post_trigger_delay"):
+                try:
+                    delay = float(getattr(camera, attr)) * 1e-9
+                except AttributeError:
+                    continue
+                if not math.isfinite(delay) or delay < 0:
+                    raise RuntimeError(f"PVCAM returned invalid {attr}")
+                period += delay
+            return 1 / period
+
     def start_live(self, buffer_frame_count: int) -> None:
         with self._lock:
             self._camera.start_live(buffer_frame_count=buffer_frame_count, reset_frame_counter=True)
@@ -753,6 +777,23 @@ class Kinetix(Camera):
             self._exposure_us = min(max(round(exposure_time_ms * 1000), minimum_us), maximum_us)
             self._commit()
 
+    @property
+    @describe(label="Acquisition Rate Limit", units="Hz", stream=True)
+    def acquisition_rate_limit_hz(self) -> float | None:
+        """SDK timing for edge-triggered acquisition, cached until camera settings change."""
+        with self._lock:
+            if self._running:
+                return None  # Never expose a stale limit while settings may be queued.
+            if not self._timing_queried:
+                self._timing_queried = True
+                try:
+                    self._timing_limit = self._device.acquisition_rate_limit(
+                        self._trigger_modes[TriggerMode.ON], self._exposure_us
+                    )
+                except (AttributeError, RuntimeError):
+                    return None
+            return self._timing_limit
+
     @numeric(minimum=0.0, step=0.01)
     @describe(label="Frame Rate", units="Hz", stream=True)
     def frame_rate_hz(self) -> float:
@@ -814,6 +855,8 @@ class Kinetix(Camera):
             self._apply_settings()
 
     def _apply_settings(self) -> None:
+        self._timing_limit: float | None = None
+        self._timing_queried = False
         mode = self._current_mode()
         self._device.set_readout(mode.port, mode.speed, self._gain_index)
         self._device.set_geometry(self._roi.x, self._roi.y, self._roi.w, self._roi.h, self._binning)

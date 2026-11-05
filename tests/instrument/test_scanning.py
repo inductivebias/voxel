@@ -136,3 +136,43 @@ def test_line_scan_rejects_short_or_fractional_encoder_runway(runway_s: float) -
     )
     assert planned is None
     assert any("runway" in violation for violation in violations)
+
+
+@pytest.mark.parametrize("rate", [7.13, 9.77])
+def test_camera_timing_sets_speed_and_rounds_runway_to_encoder_edges(rate: float) -> None:
+    planned, violations = plan_continuous_pass(
+        z_start=26060,
+        z_step=80,
+        frames=50,
+        signals=make_signals(),
+        scan=SCAN,
+        info=INFO,
+        pacing=PACING,
+        limits=(0, 210000),
+        runway_s=1,
+        camera_rate_hz=rate,
+    )
+    assert violations == []
+    assert planned is not None
+    assert planned.speed == pytest.approx(80 * rate)
+    assert (26060 - planned.start) / INFO.edge_spacing == pytest.approx(
+        round((26060 - planned.start) / INFO.edge_spacing)
+    )
+
+
+def test_auto_rate_respects_daq_rearm_budget() -> None:
+    planned, violations = plan_continuous_pass(
+        z_start=26060,
+        z_step=80,
+        frames=50,
+        signals=make_signals(),
+        scan=SCAN,
+        info=INFO,
+        pacing=PACING,
+        limits=(0, 210000),
+        runway_s=1,
+        camera_rate_hz=1000,
+    )
+    assert violations == []
+    assert planned is not None
+    assert planned.speed / 80 < 1 / (0.065 + SCAN.rearm_margin_s)

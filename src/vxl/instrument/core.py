@@ -1740,9 +1740,9 @@ class Instrument:
         capture_error: BaseException | None = None
         progress = _PassProgress() if self._uses_continuous(volume) else None
         try:
-            planned = await self._plan_pass(volume) if progress is not None else None
             await self._inhibit_laser_outputs()
             await self._apply_profile(volume.profile)
+            planned = await self._plan_pass(volume) if progress is not None else None
             profile = self._store.value.imaging.profiles[volume.profile]
             await _gather_hardware(
                 *(ch.prepare_laser(profile.lasers[ch.laser.uid]) for ch in self._profile_lasers(profile))
@@ -1898,6 +1898,14 @@ class Instrument:
         for volume in volumes:
             if not self._uses_continuous(volume):
                 continue
+            # Automatic timing must be queried after this volume's profile has been applied.
+            if volume.scan is not None and volume.scan.camera_rate_fraction is not None:
+                scan = self._hal.topology.continuous_scan
+                if scan is None or scan.axis != volume.scan.axis:
+                    found["X-Scan axis must match the configured encoder axis"] = None
+                for message in await self._hold_violations(volume):
+                    found[message] = None
+                continue
             _, violations = await self._plan_volume_pass(volume)
             for violation in violations:
                 found[f"Task '{volume.task}' / profile '{volume.profile}': {violation}"] = None
@@ -1941,6 +1949,24 @@ class Instrument:
                 violations.append(f"held {name.upper()} must already be stationary at {target:g} µm (now {position:g})")
         return violations
 
+    async def _camera_scan_rate(
+        self, profile: ProfileConfig, fraction: float, speed_tolerance: float
+    ) -> tuple[float | None, list[str]]:
+        rates: list[float] = []
+        errors: list[str] = []
+        for camera_id in {self._channel_config(uid).detection for uid in profile.channels}:
+            try:
+                limit = await self._hal.cameras[camera_id].props.get_value("acquisition_rate_limit_hz")
+                if limit is None or not math.isfinite(float(limit)) or float(limit) <= 0:
+                    errors.append(f"camera '{camera_id}' has no valid acquisition timing")
+                else:
+                    rates.append(float(limit))
+            except Exception as error:
+                errors.append(f"camera '{camera_id}' timing query failed: {error}")
+        if errors or not rates:
+            return None, errors or ["scan profile has no camera timing"]
+        return min(rates) * fraction / (1 + speed_tolerance), []
+
     async def _plan_volume_pass(self, volume: PlannedVolume) -> tuple[ContinuousPass | None, list[str]]:
         scan = self._hal.topology.continuous_scan
         if scan is None:
@@ -1949,13 +1975,18 @@ class Instrument:
             return None, [f"the DAQ encoder is configured for {scan.axis.upper()}, not {volume.scan.axis.upper()}"]
         profile = self._store.value.imaging.profiles[volume.profile]
         violations = await self._hold_violations(volume)
+        camera_rate = None
+        if volume.scan is not None and volume.scan.camera_rate_fraction is not None:
+            camera_rate, timing_errors = await self._camera_scan_rate(
+                profile, volume.scan.camera_rate_fraction, scan.speed_tolerance
+            )
+            violations.extend(timing_errors)
         if set(profile.sync) != {scan.generator}:
             violations.append(f"line scan profile must sync exactly generator '{scan.generator}'")
         if volume.scan is not None:
             stage_ids = {self._hal.topology.stage.x, self._hal.topology.stage.y, self._hal.topology.stage.z}
-            for signals in profile.sync.values():
-                if stage_ids.intersection(signals.waveforms):
-                    violations.append("line scan profiles must not contain stage-step waveforms")
+            if any(stage_ids.intersection(signals.waveforms) for signals in profile.sync.values()):
+                violations.append("line scan profiles must not contain stage-step waveforms")
         if volume.scan is not None and scan.generator in profile.sync:
             signals = profile.sync[scan.generator]
             fastest_period_ms = 1000 * (float(signals.duration) + float(signals.rest_time)) / (1 + scan.speed_tolerance)
@@ -1966,7 +1997,7 @@ class Instrument:
                 exposure = profile.props.get(camera_id, {}).get("exposure_time_ms")
                 if exposure is None:
                     exposure = await self._hal.cameras[camera_id].props.get_value("exposure_time_ms")
-                if float(exposure) >= fastest_period_ms:
+                if camera_rate is None and float(exposure) >= fastest_period_ms:
                     violations.append(f"camera '{camera_id}' exposure must be shorter than {fastest_period_ms:g} ms")
         if violations:
             return None, violations
@@ -1979,6 +2010,7 @@ class Instrument:
             z_start=volume.scan.start if volume.scan else volume.z_start,
             z_step=volume.z_step,
             runway_s=volume.scan.runway_s if volume.scan else None,
+            camera_rate_hz=camera_rate,
             frames=volume.frames_total,
             signals=self._store.value.imaging.profiles[volume.profile].sync[scan.generator],
             scan=scan,

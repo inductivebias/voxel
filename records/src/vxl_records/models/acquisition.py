@@ -92,6 +92,7 @@ class LineScan(RecordModel):
     end: float = Field(allow_inf_nan=False)
     spacing: float = Field(gt=0, allow_inf_nan=False)
     runway_s: float = Field(default=1, gt=0, allow_inf_nan=False)
+    camera_rate_fraction: float | None = Field(default=0.95, gt=0, lt=1, allow_inf_nan=False)
 
     @model_validator(mode="after")
     def _check_window(self) -> Self:

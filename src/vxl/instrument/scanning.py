@@ -49,6 +49,7 @@ def plan_continuous_pass(
     pacing: EdgePacing,
     limits: tuple[float, float],
     runway_s: float | None = None,
+    camera_rate_hz: float | None = None,
 ) -> tuple[ContinuousPass | None, list[str]]:
     """Plan the pass that images ``frames`` planes ``z_step`` apart from ``z_start``.
 
@@ -57,6 +58,13 @@ def plan_continuous_pass(
     """
     period = float(signals.duration) + float(signals.rest_time)
     cycle = float(signals.duration)
+    if camera_rate_hz is not None:
+        if not math.isfinite(camera_rate_hz) or camera_rate_hz <= 0:
+            return None, ["camera rate must be finite and positive"]
+        period = max(
+            1 / camera_rate_hz,
+            (cycle + scan.rearm_margin_s + 1 / float(signals.sample_rate)) * (1 + scan.speed_tolerance),
+        )
     speed = z_step / period
     edge = info.edge_spacing
     fastest = speed * (1 + scan.speed_tolerance)
@@ -95,6 +103,9 @@ def plan_continuous_pass(
     if runway_s is not None:
         runway = speed * runway_s
         edges = runway / edge
+        if camera_rate_hz is not None:
+            edges = math.ceil(edges)
+            runway = edges * edge
         if not math.isclose(edges, round(edges), rel_tol=1e-9, abs_tol=1e-9):
             violations.append("runway distance must be a whole number of encoder edges")
         requested_start = z_start - runway

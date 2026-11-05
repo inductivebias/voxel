@@ -1,6 +1,7 @@
 import asyncio
 import json
 from pathlib import Path, PurePosixPath
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -246,7 +247,9 @@ async def add_line(instrument: Instrument, *, axis: str = "x", y: float = 0) -> 
             xy=XYDefinition(mode=XYMode.EXPLICIT_POINTS, points=[Point2D(x=0, y=y)]),
             z=ZRange(start=0, end=0),
             profiles=["single_gfp"],
-            scan=LineScan.model_validate({"axis": axis, "start": 1000, "end": 1160, "spacing": 80, "runway_s": 0.1}),
+            scan=LineScan.model_validate(
+                {"camera_rate_fraction": None, "axis": axis, "start": 1000, "end": 1160, "spacing": 80, "runway_s": 0.1}
+            ),
         )
     )
 
@@ -312,7 +315,7 @@ async def test_cancelling_x_line_halts_x_and_keeps_y_z_fixed(
             xy=XYDefinition(mode=XYMode.EXPLICIT_POINTS, points=[Point2D(x=0, y=0)]),
             z=ZRange(start=0, end=0),
             profiles=["single_gfp"],
-            scan=LineScan(axis="x", start=1000, end=9000, spacing=80, runway_s=0.1),
+            scan=LineScan(camera_rate_fraction=None, axis="x", start=1000, end=9000, spacing=80, runway_s=0.1),
         )
     )
     axis = instrument._hal.stage.x
@@ -335,3 +338,27 @@ async def test_cancelling_x_line_halts_x_and_keeps_y_z_fixed(
     assert await instrument._hal.stage.z.get_position() == 0
     assert await instrument._hal.recorders["scan_recorder"].get_state() == "idle"
     assert writer.batches == [100]
+
+
+@pytest.mark.parametrize("limits", [(83.0, 100.0), (40.0, 83.0), (None, 83.0)])
+async def test_automatic_rate_uses_slowest_camera_and_rejects_missing_timing(
+    opened_instrument: Instrument, monkeypatch: pytest.MonkeyPatch, limits: tuple[float | None, float]
+) -> None:
+    instrument = opened_instrument
+    with monkeypatch.context() as patch:
+        profile = instrument.active_profile.model_copy(update={"channels": ["a", "b"]})
+        patch.setattr(instrument, "_channel_config", lambda uid: SimpleNamespace(detection=uid))
+        for uid, limit in zip(("a", "b"), limits, strict=True):
+
+            async def get_value(name, result=limit):
+                assert name == "acquisition_rate_limit_hz"
+                return result
+
+            patch.setitem(instrument._hal.cameras, uid, SimpleNamespace(props=SimpleNamespace(get_value=get_value)))
+        rate, errors = await instrument._camera_scan_rate(profile, 0.95, 0.05)
+        if limits[0] is None:
+            assert rate is None
+            assert errors
+        else:
+            assert not errors
+            assert rate == pytest.approx(min(limits[0], limits[1]) * 0.95 / 1.05)

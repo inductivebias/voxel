@@ -83,7 +83,13 @@ export interface HALConfig {
   devices: Record<string, DeviceConfig>;
   nodes: Record<string, NodeConfig>;
   stage: StageConfig;
-  continuous_scan?: { axis: 'x' | 'y' | 'z'; generator: string; recorder: string } | null;
+  continuous_scan?: {
+    axis: 'x' | 'y' | 'z';
+    generator: string;
+    recorder: string;
+    speed_tolerance: number;
+    rearm_margin_s: number;
+  } | null;
   detection: Record<string, DetectionAssemblyConfig>;
   illumination: Record<string, IlluminationAssemblyConfig>;
   optical_routing: OpticalRoutingConfig;
@@ -261,6 +267,7 @@ export interface LineScan {
   end: number;
   spacing: number;
   runway_s: number;
+  camera_rate_fraction?: number | null;
 }
 
 /** Persisted acquisition intent expanded into concrete volumes by the instrument. */

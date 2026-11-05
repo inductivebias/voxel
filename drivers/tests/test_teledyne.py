@@ -1,5 +1,6 @@
 import asyncio
 import sys
+import threading
 import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -900,3 +901,42 @@ def test_controller_preview_recovers_from_a_stale_acquisition(
         assert not device.live
 
     asyncio.run(asyncio.wait_for(run(), timeout=5.0))
+
+
+@pytest.mark.parametrize(("out", "period"), [(0, 0.012), (1, 0.022), (2, 0.022)])
+def test_query_timing_sets_up_external_mode_without_starting(
+    monkeypatch: pytest.MonkeyPatch, out: int, period: float
+) -> None:
+    calls = []
+    native = SimpleNamespace(handle=1, rois=["roi"], exp_time=10000, exp_out_mode=out, readout_time=12000)
+    device = object.__new__(teledyne.PyvcamDevice)
+    device._camera = native
+    device._lock = threading.RLock()
+    device.expose_out_modes = {"mode": out}
+    monkeypatch.setattr(
+        teledyne, "import_module", lambda _: SimpleNamespace(setup_live=lambda *args: calls.append(args))
+    )
+    assert device.acquisition_rate_limit(EDGE, 10000) == pytest.approx(1 / period)
+    assert calls == [(1, ["roi"], 10000, EDGE | out, 2, None)]
+
+
+def test_timing_limit_cached_and_invalidated_by_settings(
+    camera: tuple[teledyne.Kinetix, FakeDevice], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    cam, device = camera
+    calls = []
+
+    def query(mode, exposure):
+        calls.append((mode, exposure))
+        return 80.0
+
+    monkeypatch.setattr(device, "acquisition_rate_limit", query, raising=False)
+    assert cam.acquisition_rate_limit_hz == 80
+    assert cam.acquisition_rate_limit_hz == 80
+    assert len(calls) == 1
+    cam.exposure_time_ms = 20
+    assert cam.acquisition_rate_limit_hz == 80
+    assert len(calls) == 2
+    cam.binning = 2
+    assert cam.acquisition_rate_limit_hz == 80
+    assert len(calls) == 3

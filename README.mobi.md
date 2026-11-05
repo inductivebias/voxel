@@ -54,9 +54,23 @@ The hardware configuration's `axis` identifies the axis
 whose encoder is wired to the DAQ; it defaults to `z` for existing continuous-volume setups.
 There is no need to remap the physical stage axes.
 
-The profile's DAQ `duration + rest_time` sets the nominal frame period. Speed is sample spacing
-divided by that period; runway distance is speed times runway time. For example, 0.5 µm sampling
-with a 12.5 ms period yields 40 µm/s. A 34–40 mm window has 12,000 samples and, with one second
+X-Scan tasks default to automatic camera timing (`scan.camera_rate_fraction: 0.95`). After
+applying each profile, the controller queries each camera's acquisition rate limit, selects the
+slowest, and applies the fraction and configured stage-speed tolerance. Speed is sampling times
+that safe rate, further limited by the DAQ waveform duration, re-arm margin, and one sample tick.
+Changing the DAQ rest time alone does not set automatic scan speed. Set `camera_rate_fraction`
+to `null` to retain manual DAQ-period timing. Legacy continuous Z volumes keep manual timing.
+
+The Kinetix driver prepares a two-frame PVCAM continuous buffer without starting exposure, then
+reads the resulting readout and available clearing/trigger delays. First Row uses overlapping
+exposure/readout timing; other expose-out modes use the conservative sum. Timing is cached until
+camera settings change and unavailable during live acquisition. A missing or invalid limit prevents
+automatic scanning. These SDK limits do not guarantee storage throughput. Task timing estimates
+require the selected profile to be applied without divergent camera settings; actual timing is
+queried again before motion. The saved `scan.json` records the executed speed.
+
+Runway distance is speed times runway time, rounded outward to encoder edges in automatic mode.
+For example, a manual 12.5 ms period with 0.5 µm sampling yields 40 µm/s. A 34–40 mm window has 12,000 samples and, with one second
 of runway per side, travels from 33.960 to 40.040 mm. Runway time specifies distance at cruising
 speed, not the exact time spent accelerating.
 

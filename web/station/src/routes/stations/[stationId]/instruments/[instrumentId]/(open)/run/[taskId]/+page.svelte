@@ -217,6 +217,27 @@
     patchTask({ profiles });
   }
 
+  function scanPeriod(profileId: string): number | null {
+    if (!instrument || !task?.scan) return null;
+    const profile = instrument.imaging.profiles[profileId];
+    const wiring = instrument.hal.continuous_scan;
+    if (!profile || !wiring) return null;
+    const sync = profile.sync[wiring.generator];
+    if (!sync) return null;
+    if (task.scan.camera_rate_fraction === null) return sync.duration + sync.rest_time;
+    if (profileId !== instrument.activeProfileId) return null;
+    const cameraIds = [...new Set(profile.channels.map((id) => instrument.imaging.channels[id].detection))];
+    const limits = cameraIds.map((id) => {
+      const divergence = instrument.divergence.get(id);
+      if (divergence?.roiChanged || divergence?.changed.size) return null;
+      return instrument.devices.get(id)?.getProp('acquisition_rate_limit_hz')?.value;
+    });
+    if (!limits.length || limits.some((v) => typeof v !== 'number' || !Number.isFinite(v) || v <= 0)) return null;
+    const tolerance = 1 + wiring.speed_tolerance;
+    const rate = (Math.min(...(limits as number[])) * (task.scan.camera_rate_fraction ?? 0.95)) / tolerance;
+    return Math.max(1 / rate, (sync.duration + wiring.rearm_margin_s + 1 / sync.sample_rate) * tolerance);
+  }
+
   function profileLabel(profileId: string): string {
     return instrument?.imaging.profiles[profileId]?.label || displayName(profileId);
   }
@@ -349,13 +370,17 @@
           </p>
           {#each task.profiles as profileId}
             {@const sync = Object.values(instrument.imaging.profiles[profileId]?.sync ?? {})[0]}
-            {#if sync}
-              {@const period = sync.duration + sync.rest_time}
+            {@const period = scanPeriod(profileId)}
+            {#if sync && period !== null}
               {@const speed = task.scan.spacing / period}
               <div class="text-sm text-fg-muted">
                 <p class="font-medium text-fg">{profileLabel(profileId)}</p>
                 <ul class="mt-1 list-disc space-y-0.5 pl-5 tabular-nums">
-                  <li>Frame rate: {(1 / period).toFixed(2)} Hz (nominal)</li>
+                  <li>
+                    Frame rate: {(1 / period).toFixed(2)} Hz ({task.scan.camera_rate_fraction === null
+                      ? 'manual DAQ timing'
+                      : 'automatic camera timing'})
+                  </li>
                   <li>{task.scan.axis.toUpperCase()} stage speed: {speed.toFixed(3)} µm/s</li>
                   <li>
                     Frames per camera: {Math.round(
@@ -375,10 +400,15 @@
                   </li>
                 </ul>
                 <p class="mt-2">
-                  Frame rate comes from the profile's DAQ timing; sampling sets the stage speed and encoder trigger
-                  spacing.
+                  Automatic timing uses the slower camera with a safety margin and respects DAQ re-arm time. Timing is
+                  checked again after applying the profile at scan start.
                 </p>
               </div>
+            {:else}
+              <p class="text-sm text-fg-muted">
+                {profileLabel(profileId)}: automatic timing will be calculated after the profile is applied and camera
+                timing is available. Exposure, sensor mode, ROI and binning determine the rate.
+              </p>
             {/if}
           {/each}
         </div>
