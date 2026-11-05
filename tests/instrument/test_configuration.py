@@ -3,6 +3,7 @@ import re
 import pytest
 from pydantic import ValidationError
 
+from vxl.instrument import Instrument
 from vxl.instrument.config import ImagingProtocol, InstrumentConfig
 
 
@@ -63,3 +64,24 @@ def test_legacy_channel_laser_migrates_without_overriding_explicit_selection() -
     assert "illumination" not in protocol.channels["camera"].model_dump()
     assert ImagingProtocol.model_validate(protocol.model_dump()) == protocol
     assert data["channels"]["camera"]["illumination"] == "laser_488"
+
+
+async def test_telemetry_does_not_recompute_profile_geometry(
+    opened_instrument: Instrument, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instrument = opened_instrument
+    calls = []
+    original = instrument._compute_profile_fovs
+
+    def compute():
+        calls.append(True)
+        return original()
+
+    monkeypatch.setattr(instrument.profile_fovs, "_fn", lambda _: compute())
+    await instrument._device_props_updates.emit(("camera_1", {}))
+    assert not calls
+    prop = instrument._hal.cameras["camera_1"].pixel_size_um
+    value = prop.value
+    assert value is not None
+    await prop._notify(value)
+    assert calls

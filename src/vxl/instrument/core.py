@@ -197,7 +197,7 @@ class Illumination:
     async def prepare_laser(self, modulation_mode: str) -> None:
         """Establish the profile's modulation mode with output inhibited."""
         await self.disable_laser_output()
-        mode = self.laser.props.cache.get("modulation_mode")
+        mode = self.laser.props.cached_model("modulation_mode")
         if mode is None or mode.value != modulation_mode:
             await self.laser.call("source_disable")
             await self.laser.call("set_modulation_mode", modulation_mode)
@@ -249,7 +249,6 @@ class Instrument:
         self.fov: ReactiveQuery[tuple[float, float]] = ReactiveQuery(fn=self._compute_current_fov)
         self.profile_fovs = Computed[dict[str, dict[str, Bounds]]](
             self._store,
-            self._device_props_updates,
             fn=self._compute_profile_fovs,
         )
         self.planned_volumes = Computed[list[PlannedVolume]](
@@ -369,6 +368,9 @@ class Instrument:
                     )
                     for device_id, handle in self._hal.devices.items()
                 ]
+                for camera in self._hal.cameras.values():
+                    for prop in (camera.pixel_size_um, camera.sensor_size_px):
+                        self._device_unsubs.append(prop.subscribe(lambda _: self.profile_fovs.refresh()))
                 await self._refresh_device_props()
                 await self._validate_continuous_scan()
                 self._validate_startup()
@@ -870,7 +872,7 @@ class Instrument:
                 laser = self._hal.lasers.get(uid)
                 if laser is None:
                     continue
-                mode = laser.props.cache.get("modulation_mode")
+                mode = laser.props.cached_model("modulation_mode")
                 if mode is None or requested not in (mode.options or []):
                     violations.append(
                         Violation(
@@ -1459,7 +1461,7 @@ class Instrument:
             self._ensure_idle("change profile lasers")
             for uid, requested in patch.lasers.items():
                 laser = self._hal.lasers.get(uid)
-                mode = laser.props.cache.get("modulation_mode") if laser is not None else None
+                mode = laser.props.cached_model("modulation_mode") if laser is not None else None
                 if mode is None or requested not in (mode.options or []):
                     raise OperationRejectedError(f"Laser '{uid}' does not support {requested} modulation")
         imaging = self._store.value.imaging

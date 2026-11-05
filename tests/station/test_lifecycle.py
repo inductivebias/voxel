@@ -8,7 +8,7 @@ from vxl_records import PlannedVolume, VoxelRecords
 from vxlib.history import HistoryState
 from vxlib.reactivity import Cell, Emitter, ReactiveQuery
 
-from rigup import DeviceInterface, DeviceProps
+from rigup import DeviceInterface, DeviceProps, PropertyModel
 from vxl.instrument import (
     Activity,
     Bounds,
@@ -236,3 +236,20 @@ async def test_history_updates_reach_feed_and_unsubscribe_on_session_close(
     snapshot = await station.feed.snapshot()
     assert snapshot.cursor == closed.cursor
     assert snapshot.session is None
+
+
+async def test_property_update_reuses_other_device_snapshots(station: Station, instrument: FakeInstrument) -> None:
+    for uid in ("camera_1", "camera_2"):
+        instrument.device_interfaces[uid] = DeviceInterface(uid=uid, type="camera", commands={}, properties={})
+        instrument.device_props[uid] = {"value": PropertyModel(value=1)}
+    await station.open_session("instrument")
+    before = station.state.value.session
+    assert before is not None
+    # Full-cache reads after opening would see this poison value; a delta must use only its payload.
+    instrument.device_props = {}
+    await instrument.device_props_updates.emit(("camera_1", {"value": PropertyModel(value=2)}))
+    after = station.state.value.session
+    assert after is not None
+    assert after.instrument.devices["camera_1"].props["value"].value == 2
+    assert after.instrument.devices["camera_2"] is before.instrument.devices["camera_2"]
+    assert before.instrument.devices["camera_1"].props["value"].value == 1

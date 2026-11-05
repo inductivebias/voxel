@@ -22,6 +22,7 @@ if TYPE_CHECKING:
 
     from vxlib.lifecycle import Teardown
 
+    from rigup import DeviceProps
     from vxl.system import StationConfig
 
 
@@ -179,7 +180,7 @@ class Station:
                 self._session_teardowns.append(instrument.profile_fovs.subscribe(self._refresh_session_view))
                 self._session_teardowns.append(instrument.planned_volumes.subscribe(self._refresh_session_view))
                 self._session_teardowns.append(instrument.default.subscribe(self._refresh_session_view))
-                self._session_teardowns.append(instrument.device_props_updates.subscribe(self._refresh_session_view))
+                self._session_teardowns.append(instrument.device_props_updates.subscribe(self._refresh_device_view))
                 self._session_teardowns.append(instrument.preview.subscribe(self._feed.publish_preview))
                 session_view = self._build_session_view(instrument)
             except BaseException as launch_error:
@@ -285,6 +286,20 @@ class Station:
 
         self._instrument = None
         await self._state.set(StationState())
+
+    async def _refresh_device_view(self, update: tuple[str, DeviceProps]) -> None:
+        """Replace one streamed device snapshot without copying every device's cache."""
+        current = self._state.value
+        if current.status not in {StationStatus.ACTIVE, StationStatus.CLOSING} or current.session is None:
+            return
+        device_id, props = update
+        view = current.session.instrument
+        device = view.devices.get(device_id)
+        if device is None:
+            return
+        devices = {**view.devices, device_id: device.model_copy(update={"props": dict(props)})}
+        session = current.session.model_copy(update={"instrument": view.model_copy(update={"devices": devices})})
+        await self._state.set(current.model_copy(update={"session": session}))
 
     async def _refresh_session_view(self, _value: object) -> None:
         instrument = self._instrument
