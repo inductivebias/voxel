@@ -193,7 +193,16 @@ class CameraController(DeviceController["Camera"]):
     @property
     @describe(label="Writer Metrics", stream=True)
     def writer_metrics(self) -> list[BatchMetrics]:
-        return self._writer.batches if self._writer else []
+        """Recent started batches for live status; full history is saved in metrics.json."""
+        if self._writer is None:
+            return []
+        recent: list[BatchMetrics] = []
+        for batch in reversed(self._writer.batches):
+            if batch.collecting.started is not None:
+                recent.append(batch)
+                if len(recent) == 64:
+                    break
+        return list(reversed(recent))
 
     def _on_preview_frame(self, frame: PreviewFrame) -> None:
         task = self._publish_tasks.get(frame.header.layer)
