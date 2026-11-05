@@ -102,3 +102,15 @@ export function createAreaTask(
     iteration: 'position_major'
   };
 }
+
+/** An encoder-paced sweep; the other two axes are held at this anchor. */
+export function createLineTask(
+  position: Point2D & { z: number },
+  profile: string,
+  axis: 'x' | 'y' | 'z' = 'x'
+): AcquisitionTask {
+  return {
+    ...createPositionTask([{ x: position.x, y: position.y }], profile, { start: position.z, end: position.z }),
+    scan: { axis, start: position[axis], end: position[axis] + 100, spacing: 0.5, runway_s: 1 }
+  };
+}

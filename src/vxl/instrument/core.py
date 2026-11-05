@@ -5,7 +5,7 @@ import json
 import logging
 import math
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass
 from enum import StrEnum
@@ -103,13 +103,8 @@ def _write_json(target: Path | S3Path, payload: Mapping[str, Any]) -> None:
     target.write_text(f"{json.dumps(payload, indent=2)}\n", encoding="utf-8")
 
 
-def _unique_laser_channels(chans: Iterable["Channel"]) -> list["Channel"]:
-    """Return one channel per distinct illumination laser, preserving channel order."""
-    return list({ch.laser.uid: ch for ch in chans}.values())
-
-
 async def _disable_lasers_and_halt(
-    chans: Sequence["Channel"], axis: ContinuousAxisHandle, *, halt: bool
+    chans: Sequence["Illumination"], axis: ContinuousAxisHandle, *, halt: bool
 ) -> tuple[list[Any], list[Exception]]:
     """Disable every laser output, halting the scan axis in the same moment when ``halt`` is set.
 
@@ -190,12 +185,22 @@ class Channel:
 
     uid: str
     camera: CameraHandle
+
+
+@dataclass(frozen=True)
+class Illumination:
+    """One profile-selected laser, independent of every detection channel."""
+
+    uid: str
     laser: DeviceHandle
 
-    async def prepare_laser(self) -> None:
-        """Establish digital modulation and accommodate source startup with output inhibited."""
+    async def prepare_laser(self, modulation_mode: str) -> None:
+        """Establish the profile's modulation mode with output inhibited."""
         await self.disable_laser_output()
-        await self.laser.call("set_modulation_mode", "digital")
+        mode = self.laser.props.cache.get("modulation_mode")
+        if mode is None or mode.value != modulation_mode:
+            await self.laser.call("source_disable")
+            await self.laser.call("set_modulation_mode", modulation_mode)
         await self.laser.call("source_enable", wait=True)
 
     async def enable_laser_output(self) -> None:
@@ -748,7 +753,7 @@ class Instrument:
             ]
             if not volumes:
                 raise OperationRejectedError("No tasks planned — add tasks before acquiring")
-            if self._hal.topology.continuous_scan is not None and (violations := await self._pass_violations(volumes)):
+            if violations := await self._pass_violations(volumes):
                 raise OperationRejectedError("; ".join(violations))
             await self._stop_preview()
             await self._activity.set(CaptureActivity())
@@ -856,23 +861,24 @@ class Instrument:
 
     def _imaging_laser_ids(self) -> set[str]:
         imaging = self._store.value.imaging
-        return {imaging.channels[ch].illumination for profile in imaging.profiles.values() for ch in profile.channels}
+        return {uid for profile in imaging.profiles.values() for uid in profile.lasers}
 
     def _laser_modulation_violations(self) -> list[Violation]:
         violations = []
-        for uid in sorted(self._imaging_laser_ids()):
-            laser = self._hal.lasers.get(uid)
-            if laser is None:  # HAL reports unavailable or incorrectly classified devices.
-                continue
-            mode = laser.props.cache.get("modulation_mode")
-            if mode is None or "digital" not in (mode.options or []):
-                violations.append(
-                    Violation(
-                        code="imaging.laser.digital_unsupported",
-                        msg=f"Imaging laser '{uid}' must support digital modulation.",
-                        loc=("hal", "illumination", uid),
+        for profile_id, profile in self._store.value.imaging.profiles.items():
+            for uid, requested in profile.lasers.items():
+                laser = self._hal.lasers.get(uid)
+                if laser is None:
+                    continue
+                mode = laser.props.cache.get("modulation_mode")
+                if mode is None or requested not in (mode.options or []):
+                    violations.append(
+                        Violation(
+                            code="imaging.laser.modulation_unsupported",
+                            msg=f"Imaging laser '{uid}' does not support {requested} modulation.",
+                            loc=("imaging", "profiles", profile_id, "lasers", uid),
+                        )
                     )
-                )
         return violations
 
     def _autosave_policy_violations(self, interfaces: Mapping[str, DeviceInterface]) -> list[Violation]:
@@ -1067,11 +1073,11 @@ class Instrument:
                     f"recorder '{scan.recorder}' records.",
                     loc,
                 )
-        if await self._hal.stage.scanning_axis.get_continuous_scan_info() is None:
+        if await getattr(self._hal.stage, scan.axis).get_continuous_scan_info() is None:
             violation(
                 "scanner",
-                f"Stage z axis '{self._hal.topology.stage.z}' cannot scan continuously.",
-                ("hal", "stage", "z"),
+                f"Stage {scan.axis} axis cannot scan continuously.",
+                ("hal", "stage", scan.axis),
             )
 
         imaging = self._store.value.imaging
@@ -1115,7 +1121,6 @@ class Instrument:
             uid: Channel(
                 uid=uid,
                 camera=self._hal.cameras[config.detection],
-                laser=self._hal.lasers[config.illumination],
             )
             for uid, config in self._store.value.imaging.channels.items()
         }
@@ -1193,10 +1198,10 @@ class Instrument:
         self._preview_source_ids.clear()
         self._preview_positions.clear()
 
-        laser_chans = _unique_laser_channels(chans)
+        laser_chans = self._profile_lasers(self.active_profile)
         try:
             await self._inhibit_laser_outputs()
-            await _gather_hardware(*(ch.prepare_laser() for ch in laser_chans))
+            await _gather_hardware(*(ch.prepare_laser(self.active_profile.lasers[ch.laser.uid]) for ch in laser_chans))
             await _gather_hardware(*(ch.camera.start_preview() for ch in chans))
             await self._reset_preview()
             with suppress(NotImplementedError, RuntimeError):
@@ -1228,7 +1233,7 @@ class Instrument:
 
     async def _teardown_preview(self, chans: Sequence[Channel]) -> None:
         """Inhibit output, stop generation, then stop the cameras; finish every step before reporting failures."""
-        laser_chans = _unique_laser_channels(chans)
+        laser_chans = self._all_lasers()
         results = await asyncio.gather(*(ch.disable_laser_output() for ch in laser_chans), return_exceptions=True)
         results.extend(await asyncio.gather(self._stop_signal_generators(), return_exceptions=True))
         results.extend(await asyncio.gather(*(ch.camera.stop_preview() for ch in chans), return_exceptions=True))
@@ -1338,6 +1343,12 @@ class Instrument:
         if profile_id != previous_id:
             await self._preview_excluded.set(frozenset())
 
+    def _all_lasers(self) -> list[Illumination]:
+        return [Illumination(uid, laser) for uid, laser in self._hal.lasers.items()]
+
+    def _profile_lasers(self, profile: ProfileConfig) -> list[Illumination]:
+        return [Illumination(uid, self._hal.lasers[uid]) for uid in profile.lasers]
+
     async def _apply_settings(self) -> None:
         """Apply the active profile's saved settings. Caller owns the runtime transition."""
         profile = self.active_profile
@@ -1444,6 +1455,13 @@ class Instrument:
 
     async def _write_profile(self, value: tuple[str, ProfilePatch]) -> Change[tuple[str, ProfilePatch]]:
         profile_id, patch = value
+        if "lasers" in patch.model_fields_set:
+            self._ensure_idle("change profile lasers")
+            for uid, requested in patch.lasers.items():
+                laser = self._hal.lasers.get(uid)
+                mode = laser.props.cache.get("modulation_mode") if laser is not None else None
+                if mode is None or requested not in (mode.options or []):
+                    raise OperationRejectedError(f"Laser '{uid}' does not support {requested} modulation")
         imaging = self._store.value.imaging
         if profile_id not in imaging.profiles:
             raise OperationRejectedError(f"No such profile '{profile_id}'")
@@ -1607,7 +1625,8 @@ class Instrument:
                     x=point.x,
                     y=point.y,
                     z_start=z.start,
-                    z_step=state.imaging.profiles[profile].z_step,
+                    z_step=task.scan.spacing if task.scan else state.imaging.profiles[profile].z_step,
+                    scan=task.scan,
                     z_end=z.end,
                     routes=routes,
                 )
@@ -1707,7 +1726,7 @@ class Instrument:
         )
         settings = self._store.value.output
         channels = {uid: self._channels[uid] for uid in self._store.value.imaging.profiles[volume.profile].channels}
-        scanning_axis = self._hal.stage.scanning_axis
+        scanning_axis = self._volume_scan_axis(volume)
         num_frames = volume.frames_total
         batch_z = settings.batch_z
         subpath = PurePosixPath(
@@ -1717,23 +1736,21 @@ class Instrument:
         )
         frames_done = 0
         capture_error: BaseException | None = None
-        progress = _PassProgress() if self._hal.topology.continuous_scan is not None else None
+        progress = _PassProgress() if self._uses_continuous(volume) else None
         try:
             planned = await self._plan_pass(volume) if progress is not None else None
             await self._inhibit_laser_outputs()
             await self._apply_profile(volume.profile)
-            await _gather_hardware(*(ch.prepare_laser() for ch in _unique_laser_channels(channels.values())))
-            await self._update_acquisition(manifest, phase=AcquisitionPhase.POSITIONING)
+            profile = self._store.value.imaging.profiles[volume.profile]
             await _gather_hardware(
-                self._hal.stage.x.move_abs(volume.x, wait=True),
-                self._hal.stage.y.move_abs(volume.y, wait=True),
-                # A continuous pass starts its lead-in before the first plane.
-                self._hal.stage.z.move_abs(volume.z_start if planned is None else planned.start, wait=True),
+                *(ch.prepare_laser(profile.lasers[ch.laser.uid]) for ch in self._profile_lasers(profile))
             )
+            await self._update_acquisition(manifest, phase=AcquisitionPhase.POSITIONING)
+            await self._position_volume(volume, planned, progress)
             await self._update_acquisition(manifest, phase=AcquisitionPhase.CONFIGURING)
             async with self._lock:
                 await self._ensure_routes(volume.routes)
-            if planned is None:
+            if planned is None and num_frames > 1:
                 await scanning_axis.configure_ttl_stepper(TTLStepperConfig(step_mode=StepMode.RELATIVE))
                 await scanning_axis.queue_relative_move(volume.z_step)
             manifest = await self._open_stacks(manifest, volume_index, subpath, channels)
@@ -1814,7 +1831,12 @@ class Instrument:
             frames = min(batch_z, volume.frames_total - batch_idx * batch_z)
             await _gather_hardware(*(ch.camera.begin_batch(frames) for ch in channels.values()))
             if batch_idx == 0:
-                await _gather_hardware(*(ch.enable_laser_output() for ch in _unique_laser_channels(channels.values())))
+                await _gather_hardware(
+                    *(
+                        ch.enable_laser_output()
+                        for ch in self._profile_lasers(self._store.value.imaging.profiles[volume.profile])
+                    )
+                )
             await self._start_signal_generators()
             async with asyncio.timeout(30.0 + 2 * frames * period):
                 while True:
@@ -1872,21 +1894,89 @@ class Instrument:
         """Every reason a planned volume's continuous pass cannot run, once per task and profile."""
         found: dict[str, None] = {}
         for volume in volumes:
+            if not self._uses_continuous(volume):
+                continue
             _, violations = await self._plan_volume_pass(volume)
             for violation in violations:
                 found[f"Task '{volume.task}' / profile '{volume.profile}': {violation}"] = None
         return list(found)
 
+    async def _position_volume(
+        self, volume: PlannedVolume, planned: ContinuousPass | None, progress: "_PassProgress | None"
+    ) -> None:
+        if volume.scan is not None and planned is not None:
+            if violations := await self._hold_violations(volume):
+                raise OperationRejectedError("; ".join(violations))
+            if progress is not None:
+                progress.moving = True
+            await self._volume_scan_axis(volume).move_abs(planned.start, wait=True)
+            if progress is not None:
+                progress.moving = False
+        else:
+            await _gather_hardware(
+                self._hal.stage.x.move_abs(volume.x, wait=True),
+                self._hal.stage.y.move_abs(volume.y, wait=True),
+                self._hal.stage.z.move_abs(volume.z_start if planned is None else planned.start, wait=True),
+            )
+
+    def _uses_continuous(self, volume: PlannedVolume) -> bool:
+        scan = self._hal.topology.continuous_scan
+        return volume.scan is not None or (scan is not None and scan.axis == "z")
+
+    def _volume_scan_axis(self, volume: PlannedVolume) -> ContinuousAxisHandle:
+        return getattr(self._hal.stage, volume.scan.axis if volume.scan else "z")
+
+    async def _hold_violations(self, volume: PlannedVolume) -> list[str]:
+        if volume.scan is None:
+            return []
+        violations = []
+        for name, target in (("x", volume.x), ("y", volume.y), ("z", volume.z_start)):
+            if name == volume.scan.axis:
+                continue
+            axis = getattr(self._hal.stage, name)
+            position = await axis.get_position()
+            if await axis.is_moving() or abs(position - target) > 1.0:
+                violations.append(f"held {name.upper()} must already be stationary at {target:g} µm (now {position:g})")
+        return violations
+
     async def _plan_volume_pass(self, volume: PlannedVolume) -> tuple[ContinuousPass | None, list[str]]:
-        scan = self._continuous_scan()
-        axis = self._hal.stage.scanning_axis
+        scan = self._hal.topology.continuous_scan
+        if scan is None:
+            return None, ["line scans require an encoder-paced continuous_scan hardware configuration"]
+        if volume.scan is not None and volume.scan.axis != scan.axis:
+            return None, [f"the DAQ encoder is configured for {scan.axis.upper()}, not {volume.scan.axis.upper()}"]
+        profile = self._store.value.imaging.profiles[volume.profile]
+        violations = await self._hold_violations(volume)
+        if set(profile.sync) != {scan.generator}:
+            violations.append(f"line scan profile must sync exactly generator '{scan.generator}'")
+        if volume.scan is not None:
+            stage_ids = {self._hal.topology.stage.x, self._hal.topology.stage.y, self._hal.topology.stage.z}
+            for signals in profile.sync.values():
+                if stage_ids.intersection(signals.waveforms):
+                    violations.append("line scan profiles must not contain stage-step waveforms")
+        if volume.scan is not None and scan.generator in profile.sync:
+            signals = profile.sync[scan.generator]
+            fastest_period_ms = 1000 * (float(signals.duration) + float(signals.rest_time)) / (1 + scan.speed_tolerance)
+            for channel_id in profile.channels:
+                camera_id = self._store.value.imaging.channels[channel_id].detection
+                if camera_id not in signals.waveforms:
+                    violations.append(f"camera '{camera_id}' needs a trigger waveform")
+                exposure = profile.props.get(camera_id, {}).get("exposure_time_ms")
+                if exposure is None:
+                    exposure = await self._hal.cameras[camera_id].props.get_value("exposure_time_ms")
+                if float(exposure) >= fastest_period_ms:
+                    violations.append(f"camera '{camera_id}' exposure must be shorter than {fastest_period_ms:g} ms")
+        if violations:
+            return None, violations
+        axis = self._volume_scan_axis(volume)
         info = await axis.get_continuous_scan_info()
         pacing = await self._hal.signal_generators[scan.generator].get_edge_pacing()
         if info is None or pacing is None:
             raise RuntimeError("the continuous-scan axis and generator lost the capabilities checked at startup")
         return plan_continuous_pass(
-            z_start=volume.z_start,
+            z_start=volume.scan.start if volume.scan else volume.z_start,
             z_step=volume.z_step,
+            runway_s=volume.scan.runway_s if volume.scan else None,
             frames=volume.frames_total,
             signals=self._store.value.imaging.profiles[volume.profile].sync[scan.generator],
             scan=scan,
@@ -1916,12 +2006,12 @@ class Instrument:
         teardown what to undo if any step fails.
         """
         scan = self._continuous_scan()
-        axis = self._hal.stage.scanning_axis
+        axis = self._volume_scan_axis(volume)
         generator = self._hal.signal_generators[scan.generator]
         recorder = self._hal.recorders[scan.recorder]
         info = await axis.get_continuous_scan_info()
         if info is None:
-            raise RuntimeError(f"stage z axis '{self._hal.topology.stage.z}' cannot scan continuously")
+            raise RuntimeError(f"stage {scan.axis} axis cannot scan continuously")
 
         progress.prepared = True
         prepared = await axis.prepare_continuous_scan(planned.start, planned.speed)
@@ -1937,7 +2027,12 @@ class Instrument:
             )
         )
         await _gather_hardware(*(ch.camera.begin_batch(planned.division.cycles) for ch in channels.values()))
-        await _gather_hardware(*(ch.enable_laser_output() for ch in _unique_laser_channels(channels.values())))
+        await _gather_hardware(
+            *(
+                ch.enable_laser_output()
+                for ch in self._profile_lasers(self._store.value.imaging.profiles[volume.profile])
+            )
+        )
         pacing = await generator.start_paced(planned.division)
         await recorder.mark_motion()
         progress.moving = True
@@ -1952,7 +2047,8 @@ class Instrument:
         record = {
             "task": volume.task,
             "profile": volume.profile,
-            "axis": self._hal.topology.stage.z,
+            "axis": getattr(self._hal.topology.stage, volume.scan.axis if volume.scan else "z"),
+            "line_scan": volume.scan.model_dump() if volume.scan else None,
             "plan": {
                 "z_start": volume.z_start,
                 "z_step": volume.z_step,
@@ -2027,7 +2123,7 @@ class Instrument:
         """
 
         def _report(
-            label: str, targets: Sequence[Channel], results: list[Any], *, collect: bool = False
+            label: str, targets: Sequence[Channel | Illumination], results: list[Any], *, collect: bool = False
         ) -> list[Exception]:
             errors: list[Exception] = []
             for ch, result in zip(targets, results, strict=True):
@@ -2039,7 +2135,7 @@ class Instrument:
 
         unfinished = progress is not None and not progress.finished
         halt = unfinished and progress is not None and progress.moving
-        laser_chans = _unique_laser_channels(chans)
+        laser_chans = self._all_lasers()
         laser_results, errors = await _disable_lasers_and_halt(laser_chans, scanning_axis, halt=halt)
         errors[:0] = _report("disable_laser_output", laser_chans, laser_results, collect=True)
         try:

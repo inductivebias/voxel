@@ -1,6 +1,7 @@
 """Durable acquisition manifests."""
 
 import datetime
+import math
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Annotated, Literal, Self
@@ -83,6 +84,27 @@ class AcquisitionFailure(RecordModel):
     message: str = Field(min_length=1)
 
 
+class LineScan(RecordModel):
+    """Positive, encoder-paced sweep in micrometres; the acquisition end is exclusive."""
+
+    axis: Literal["x", "y", "z"] = "x"
+    start: float = Field(allow_inf_nan=False)
+    end: float = Field(allow_inf_nan=False)
+    spacing: float = Field(gt=0, allow_inf_nan=False)
+    runway_s: float = Field(default=1, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _check_window(self) -> Self:
+        count = (self.end - self.start) / self.spacing
+        if count < 1 or not math.isclose(count, round(count), rel_tol=1e-9, abs_tol=1e-9):
+            raise ValueError("line scan end must exceed start by a whole number of sample spacings")
+        return self
+
+    @property
+    def frames_total(self) -> int:
+        return round((self.end - self.start) / self.spacing)
+
+
 class PlannedVolume(RecordModel):
     """One fully resolved volume in acquisition order."""
 
@@ -94,6 +116,7 @@ class PlannedVolume(RecordModel):
     z_step: float = Field(gt=0, allow_inf_nan=False)
     z_end: float = Field(allow_inf_nan=False)
     routes: dict[str, str] = Field(default_factory=dict)
+    scan: LineScan | None = None
 
     @model_validator(mode="after")
     def _check_z_range(self) -> Self:
@@ -104,6 +127,8 @@ class PlannedVolume(RecordModel):
     @property
     def frames_total(self) -> int:
         """Number of frames in this resolved volume."""
+        if self.scan is not None:
+            return self.scan.frames_total
         return int((self.z_end - self.z_start) / self.z_step) + 1
 
 

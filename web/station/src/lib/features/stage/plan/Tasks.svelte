@@ -46,10 +46,10 @@
       const seen = new SvelteSet<string>();
       for (const footprint of Object.values(instrument.profileFovs[volume.profile] ?? {})) {
         const bounds = {
-          minX: volume.x + footprint.min.x,
-          minY: volume.y + footprint.min.y,
-          maxX: volume.x + footprint.max.x,
-          maxY: volume.y + footprint.max.y
+          minX: (volume.scan?.axis === 'x' ? volume.scan.start : volume.x) + footprint.min.x,
+          minY: (volume.scan?.axis === 'y' ? volume.scan.start : volume.y) + footprint.min.y,
+          maxX: (volume.scan?.axis === 'x' ? volume.scan.end : volume.x) + footprint.max.x,
+          maxY: (volume.scan?.axis === 'y' ? volume.scan.end : volume.y) + footprint.max.y
         };
         if (!Object.values(bounds).every(Number.isFinite) || bounds.maxX <= bounds.minX || bounds.maxY <= bounds.minY)
           continue;
@@ -209,7 +209,7 @@
   <Path volumes={instrument.plannedVolumes} {taskVisible} {color} />
 </Group>
 
-{#if selected}
+{#if selected && !selected.scan}
   {#key selected.id}
     {#if selected.xy.mode === 'bounding_box'}
       <BoundsEditor

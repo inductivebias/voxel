@@ -1,5 +1,6 @@
 import asyncio
 from pathlib import Path, PurePosixPath
+from typing import Literal
 
 import pytest
 from vxl_records import (
@@ -27,6 +28,7 @@ from vxl.instrument import (
     XYMode,
     ZRange,
 )
+from vxl.instrument.config import ProfilePatch
 
 
 class _Writer:
@@ -169,3 +171,37 @@ async def test_profile_preparation_failure_still_stops_daq_and_finalizes_volume(
     assert writer.released
     laser = instrument._hal.lasers["laser_488"]
     assert not (await laser.props.get("is_output_enabled")).ok["is_output_enabled"].value
+
+
+@pytest.mark.parametrize(
+    "selected", [{}, {"laser_561": "software"}, {"laser_488": "software", "laser_561": "software"}]
+)
+async def test_capture_uses_profile_lasers_independently_of_camera(
+    opened_instrument: Instrument,
+    writer: _Writer,
+    monkeypatch: pytest.MonkeyPatch,
+    records: SQLiteRecords,
+    selected: dict[str, Literal["software", "digital", "analog"]],
+) -> None:
+    instrument = opened_instrument
+    await instrument.update_profile(ProfilePatch(lasers=selected))
+    observed = []
+
+    async def start():
+        enabled = set()
+        for uid, laser in instrument._hal.lasers.items():
+            if await laser.props.get_value("is_output_enabled"):
+                enabled.add(uid)
+                assert await laser.props.get_value("modulation_mode") == "software"
+        observed.append(enabled)
+
+    monkeypatch.setattr(instrument._hal.signal_generators["daq"], "start", start)
+    manifest = await instrument.start_acquisition(
+        AcquisitionRequest(storage=StorageSpec(path=PurePosixPath("independent-lasers")))
+    )
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=5)
+    assert (await records.acquisitions.get(manifest.id)).status is AcquisitionStatus.COMPLETED
+    assert observed == [set(selected)]
+    assert writer.released
+    for laser in instrument._hal.lasers.values():
+        assert not await laser.props.get_value("is_output_enabled")

@@ -45,3 +45,21 @@ def test_channel_filters_must_exactly_cover_detection_filter_wheels(instrument_c
     assert violations({**channel.filters, "illumination_side_selector": "left"}) == [
         ("imaging.channel.filter.unexpected", ("imaging", "channels", "gfp", "filters", "illumination_side_selector"))
     ]
+
+
+def test_legacy_channel_laser_migrates_without_overriding_explicit_selection() -> None:
+    data = {
+        "channels": {"camera": {"detection": "camera_1", "illumination": "laser_488"}},
+        "profiles": {
+            "cw": {"channels": ["camera"], "z_step": 1},
+            "explicit": {"channels": ["camera"], "z_step": 1, "lasers": {"laser_561": "software"}},
+            "dark": {"channels": ["camera"], "z_step": 1, "lasers": {}},
+        },
+    }
+    protocol = ImagingProtocol.model_validate(data)
+    assert protocol.profiles["cw"].lasers == {"laser_488": "software"}
+    assert protocol.profiles["explicit"].lasers == {"laser_561": "software"}
+    assert protocol.profiles["dark"].lasers == {}
+    assert "illumination" not in protocol.channels["camera"].model_dump()
+    assert ImagingProtocol.model_validate(protocol.model_dump()) == protocol
+    assert data["channels"]["camera"]["illumination"] == "laser_488"

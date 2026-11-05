@@ -1,6 +1,7 @@
 /** TypeScript models mirroring the Voxel API wire types. */
 import type { PropSnapshot } from '@voxel/kit/models';
 
+import type { ModulationMode } from './device.svelte';
 import type { PropertyInfo } from './device.svelte';
 
 /** A device's construction recipe: target class + init kwargs. */
@@ -82,6 +83,7 @@ export interface HALConfig {
   devices: Record<string, DeviceConfig>;
   nodes: Record<string, NodeConfig>;
   stage: StageConfig;
+  continuous_scan?: { axis: 'x' | 'y' | 'z'; generator: string; recorder: string } | null;
   detection: Record<string, DetectionAssemblyConfig>;
   illumination: Record<string, IlluminationAssemblyConfig>;
   optical_routing: OpticalRoutingConfig;
@@ -183,10 +185,9 @@ export interface SensorROI {
   h: number;
 }
 
-/** A channel: a detection + illumination path pairing with filter positions. */
+/** A channel: a detection path with filter positions. */
 export interface ChannelConfig {
   detection: string;
-  illumination: string;
   filters: DiscreteAxisPositions;
   desc: string;
   label?: string | null;
@@ -195,6 +196,7 @@ export interface ChannelConfig {
 
 /** A named profile: its channels, per-AO-device timing, device props/setup, and ROIs. */
 export interface ProfileConfig {
+  lasers: Record<string, ModulationMode>;
   channels: string[];
   z_step: number;
   sync: Record<string, Signals>;
@@ -253,8 +255,17 @@ export interface XYDefinition {
 /** Whether a task iterates positions or profiles in its outer loop. */
 export type IterationOrder = 'position_major' | 'profile_major';
 
+export interface LineScan {
+  axis: 'x' | 'y' | 'z';
+  start: number;
+  end: number;
+  spacing: number;
+  runway_s: number;
+}
+
 /** Persisted acquisition intent expanded into concrete volumes by the instrument. */
 export interface AcquisitionTask {
+  scan?: LineScan | null;
   id: string;
   xy: XYDefinition;
   profiles: string[];
@@ -326,6 +337,7 @@ export interface Change<T> {
 
 /** Edit a profile's top-level fields. */
 export interface ProfilePatch {
+  lasers?: Record<string, ModulationMode>;
   z_step?: number | null;
   desc?: string | null;
   label?: string | null;
@@ -350,6 +362,7 @@ export interface WriterPatch {
 
 /** Edit fields on one persisted acquisition task. */
 export interface TaskPatch {
+  scan?: LineScan | null;
   xy?: XYDefinition;
   profiles?: string[];
   z?: ZDefinition;
@@ -451,6 +464,7 @@ export interface AcquisitionDataset {
 
 /** One fully resolved volume in acquisition order. */
 export interface PlannedVolume {
+  scan?: LineScan | null;
   task: string;
   profile: string;
   x: number;

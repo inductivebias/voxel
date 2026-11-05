@@ -87,7 +87,6 @@
       <div class="grid grid-cols-2 gap-x-2.5 gap-y-2">
         <Field label="Name" id="channel-name">{@render nameField()}</Field>
         <Field label="Emission (nm)" id="channel-emission">{@render emissionField()}</Field>
-        {@render readonlyField('Laser', displayName(channel.illumination))}
         {@render readonlyField('Camera', displayName(channel.detection))}
         {#each Object.entries(channel.filters) as [wheelId, filter] (wheelId)}
           {@render readonlyField(displayName(wheelId), filter)}

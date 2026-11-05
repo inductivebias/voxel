@@ -55,7 +55,6 @@ export interface Channel {
   label: string;
   emission?: number;
   camera: CameraHandle;
-  laser: LaserHandle;
   filters: FilterSetting[];
   auxilliary: DeviceHandle[];
 }
@@ -169,15 +168,13 @@ export class Instrument {
     return profile.channels.flatMap((id) => {
       const ch = this.imaging.channels[id];
       const camera = this.cameras.get(ch?.detection ?? '');
-      const laser = this.lasers.get(ch?.illumination ?? '');
-      if (!ch || !camera || !laser) return [];
+      if (!ch || !camera) return [];
       const det = this.hal.detection[ch.detection];
-      const ill = this.hal.illumination[ch.illumination];
       const filters: FilterSetting[] = (det?.filter_wheels ?? []).flatMap((wheelId) => {
         const wheel = this.discreteAxes.get(wheelId);
         return wheel ? [{ wheel, filter: ch.filters[wheelId] ?? '' }] : [];
       });
-      const auxilliary = [...(det?.aux_devices ?? []), ...(ill?.aux_devices ?? [])].flatMap((auxId) => {
+      const auxilliary = [...(det?.aux_devices ?? [])].flatMap((auxId) => {
         const d = this.devices.get(auxId);
         return d ? [d] : [];
       });
@@ -187,7 +184,6 @@ export class Instrument {
           label: ch.label || displayName(id),
           emission: ch.emission ?? undefined,
           camera,
-          laser,
           filters,
           auxilliary
         }
@@ -222,9 +218,9 @@ export class Instrument {
     };
     for (const ch of this.activeChannels) {
       add(ch.camera);
-      add(ch.laser);
       for (const aux of ch.auxilliary) add(aux);
     }
+    for (const laser of this.lasers.values()) add(laser);
     for (const sig of Object.values(profile.sync))
       for (const id of Object.keys(sig.waveforms)) {
         const device = this.devices.get(id);

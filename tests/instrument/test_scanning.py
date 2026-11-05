@@ -98,3 +98,41 @@ def test_plan_continuous_pass_refuses_a_cycle_that_cannot_rearm_at_the_speed_tol
     assert fits is not None
     assert planned is None
     assert any("do not fit between planes" in violation for violation in violations)
+
+
+def test_mobi_line_window_and_one_second_runways() -> None:
+    planned, violations = plan_continuous_pass(
+        z_start=34000,
+        z_step=0.5,
+        frames=12000,
+        signals=make_signals(duration="10 ms", rest_time="2.5 ms"),
+        scan=SCAN,
+        info=INFO.model_copy(update={"edge_spacing": 0.1}),
+        pacing=PACING,
+        limits=(0, 100000),
+        runway_s=1,
+    )
+    assert not violations
+    assert planned is not None
+    assert planned.start == 33960
+    assert planned.end == 40040
+    assert planned.speed == 40
+    assert planned.division == EdgeDivision(cycles=12000, divider=5, initial_delay=401)
+    assert planned.first_exposure == pytest.approx((34000, 34000.5))
+
+
+@pytest.mark.parametrize("runway_s", [0.001, 1.001])
+def test_line_scan_rejects_short_or_fractional_encoder_runway(runway_s: float) -> None:
+    planned, violations = plan_continuous_pass(
+        z_start=34000,
+        z_step=0.5,
+        frames=12000,
+        signals=make_signals(duration="10 ms", rest_time="2.5 ms"),
+        scan=SCAN,
+        info=INFO.model_copy(update={"edge_spacing": 0.1}),
+        pacing=PACING,
+        limits=(0, 100000),
+        runway_s=runway_s,
+    )
+    assert planned is None
+    assert any("runway" in violation for violation in violations)

@@ -16,15 +16,18 @@ export interface SpectrumLine {
   emission: number | null;
 }
 
-export function channelSpectrum(selected: PageInstrument, channel: ChannelConfig): SpectrumLine {
-  return { laser: laserWavelength(selected, channel.illumination), emission: channel.emission ?? null };
+export function channelSpectrum(_selected: PageInstrument, channel: ChannelConfig): SpectrumLine {
+  return { laser: null, emission: channel.emission ?? null };
 }
 
 export function profileSpectrum(selected: PageInstrument, profile: ProfileConfig): SpectrumLine[] {
-  return profile.channels.flatMap((channelId) => {
-    const channel = selected.imaging?.channels[channelId];
-    return channel ? [channelSpectrum(selected, channel)] : [];
-  });
+  return [
+    ...Object.keys(profile.lasers ?? {}).map((id) => ({ laser: laserWavelength(selected, id), emission: null })),
+    ...profile.channels.flatMap((channelId) => {
+      const channel = selected.imaging?.channels[channelId];
+      return channel ? [channelSpectrum(selected, channel)] : [];
+    })
+  ];
 }
 
 function laserWavelength(selected: PageInstrument, laserId: string): number | null {

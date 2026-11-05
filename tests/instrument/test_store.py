@@ -113,8 +113,8 @@ def test_load_config_collects_independent_semantic_violations(tmp_path: Path, in
             ("config", "hal", "illumination", "laser_561", "aux_devices", 0),
         ),
         (
-            "imaging.channel.illumination_missing",
-            ("config", "default", "imaging", "channels", "gfp", "illumination"),
+            "imaging.profile.illumination_missing",
+            ("config", "default", "imaging", "profiles", "single_gfp", "lasers", "missing_illumination"),
         ),
     ]
 

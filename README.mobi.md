@@ -44,6 +44,40 @@ test entry points in the [driver catalog](drivers/README.md). Continuous acquisi
 existing stepwise acquisition remains available. Its planner is in
 [`src/vxl/instrument/scanning.py`](src/vxl/instrument/scanning.py).
 
+## X-Scan tasks
+
+With `hal.continuous_scan` configured, **+ X-Scan** sits beside Position and Area in the
+Run page. Select the physical axis, a positive scan window (end exclusive), and sampling in
+micrometres. A compact list under each profile shows the nominal frame rate, stage speed, frame
+count, scan duration, runway, and total travel. New tasks use one second of runway per side.
+The hardware configuration's `axis` identifies the axis
+whose encoder is wired to the DAQ; it defaults to `z` for existing continuous-volume setups.
+There is no need to remap the physical stage axes.
+
+The profile's DAQ `duration + rest_time` sets the nominal frame period. Speed is sample spacing
+divided by that period; runway distance is speed times runway time. For example, 0.5 µm sampling
+with a 12.5 ms period yields 40 µm/s. A 34–40 mm window has 12,000 samples and, with one second
+of runway per side, travels from 33.960 to 40.040 mm. Runway time specifies distance at cruising
+speed, not the exact time spent accelerating.
+
+The other axes must already be stationary within 1 µm of the saved hold positions. Use their
+crosshair buttons to adopt the current positions. X-Scan tasks never issue motion commands to
+those held axes. Profiles must have camera triggers and no stage-step waveforms. Preflight
+checks the configured encoder axis, spacing, runway, travel limits, exposure time, and DAQ
+re-arm budget. Camera readout throughput still needs to be verified on the actual cameras.
+
+Acquisition arms the recorder and all profile cameras before encoder-paced motion. Selected
+lasers use the profile's independent illumination modes. Cancellation halts the scan axis,
+inhibits laser output, and restores scan settings. The manifest's `scan` and each volume's
+`scan.json` retain the physical axis and scan window. OME-Zarr's first spatial dimension remains
+the image-stack depth, with the sample spacing; it does not denote physical stage Z for an X/Y
+sweep. Interpret it with the manifest and recorded exposure positions.
+
+The encoder has an unknown initial phase: nominal sample locations are not exact absolute
+position comparisons. `scan.json` records measured exposure locations and validates their
+spacing and counts. Existing Z-volume continuous configurations retain their prior behavior;
+Position/Area tasks on an X/Y continuous-scan configuration retain stepwise Z behavior.
+
 ## Status and verification
 
 The former `x-scan` and `steve-harden-voxel` work is consolidated into `mobi`, preserving the

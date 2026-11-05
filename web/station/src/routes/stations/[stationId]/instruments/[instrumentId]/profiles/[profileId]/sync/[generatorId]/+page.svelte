@@ -114,9 +114,7 @@
     let portIndex = 0;
     for (const id of waveformIds) {
       const device = instrument?.devices.get(id);
-      const emission = instrument?.activeChannels.find(
-        (channel) => channel.camera.id === id || channel.laser.id === id
-      )?.emission;
+      const emission = instrument?.activeChannels.find((channel) => channel.camera.id === id)?.emission;
       result[id] =
         (device && resolveDeviceColor(device.role, device.roleIndex, emission)) || waveformPortColor(portIndex++);
     }
@@ -129,7 +127,6 @@
       label: channel.label,
       deviceIds: [
         channel.camera.id,
-        channel.laser.id,
         ...channel.filters.map((filter) => filter.wheel.id),
         ...channel.auxilliary.map((device) => device.id)
       ]

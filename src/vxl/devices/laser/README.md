@@ -160,9 +160,11 @@ finally:
 
 ## Microscope integration and pending work
 
-Digital preview supplies exposure-synchronized gates; live intensity changes adjust the saved level.
-Analog intensity changes require DAQ waveform updates. Manual viewing can select software mode or hold an external
-input active. The microscope owns DAQ mapping and keeps inputs inactive during configuration.
+Profiles select lasers independently of detection channels through a `lasers` mapping from device UID to modulation
+mode. `software` supplies CW output for the preview or capture interval; `digital` uses external gates, and `analog`
+uses an external intensity signal. All selected cameras acquire in parallel under the selected illumination.
+Laser preparation applies the explicit mode with output inhibited. Changing camera preview selection does not change
+the selected lasers. Stop and failure cleanup inhibit every laser output.
 
 Named waveform groups remain a proposed approach: `frame` for acquisition and, for example, `laser_488` for continuous
 light without camera triggers. These would be alternative configurations of one generator. The current NI generator

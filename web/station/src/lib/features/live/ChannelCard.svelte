@@ -10,7 +10,6 @@
     type Prop
   } from '$lib/core/model';
   import type { ChannelCardRows } from '$lib/core/prefs';
-  import LaserPowerPlot from '$lib/features/devices/LaserPowerPlot.svelte';
   import LinkToggle from '$lib/features/imaging/LinkToggle.svelte';
   import PropertyDivergenceDot from '$lib/features/imaging/PropertyDivergenceDot.svelte';
   import { issues, issueText, LEVEL_TEXT } from '$lib/features/issues';
@@ -50,18 +49,7 @@
   } = $props();
   const label = $derived(channel.label || displayName(channel.id));
   const camera = $derived(channel.camera);
-  const laser = $derived(channel.laser);
   const picked = $derived(pick.has(channel.id));
-
-  const laserUnavailable = $derived(deviceLocked(laser, instrument));
-  // Keep repeated edits to the same setting responsive while its writes finish.
-  function settingDisabled(prop: Prop | undefined): boolean {
-    return (
-      laserUnavailable ||
-      laser.pendingCommands.size > 0 ||
-      [...laser.pendingProperties.keys()].some((name) => name !== prop?.info.name)
-    );
-  }
 
   // The wheels this channel sets a filter on. LiveFilterWheels shows them, and says when Restore can move them back.
   let filterWheels = $state<LiveFilterWheels>();
@@ -232,37 +220,12 @@
         title={label}>{label}</a
       >
     </h3>
-    <div
-      class="flex min-w-0 items-center"
-      role="group"
-      aria-label={`${displayName(laser.id)} to ${displayName(camera.id)}`}
-    >
-      {@render deviceChip(laser.id)}
-      <!-- The connector carries the channel color: the light path from the laser to the camera. -->
-      <span class="h-0.5 w-4 shrink-0" style:background-color={accent} aria-hidden="true"></span>
+    <div class="flex min-w-0 items-center" role="group" aria-label={displayName(camera.id)}>
       {@render deviceChip(camera.id)}
     </div>
   </header>
   <!-- Rows have no outlines, so they sit further apart than outlined rows would. -->
   <div class="flex min-w-0 flex-col gap-3 p-2.5">
-    {#if rows.plots}
-      <LaserPowerPlot {laser} />
-    {/if}
-    {@render setting({
-      name: 'Source',
-      deviceId: laser.id,
-      prop: laser.sourcePowerSetpoint,
-      locked: settingDisabled(laser.sourcePowerSetpoint),
-      measured: laser.sourcePower
-    })}
-    {@render setting({
-      name: 'Output',
-      deviceId: laser.id,
-      prop: laser.outputLevel,
-      locked: settingDisabled(laser.outputLevel) || !laser.outputLevelActive,
-      measured: laser.outputPower,
-      note: laser.outputLevelActive ? undefined : 'External analog modulation controls intensity'
-    })}
     {@render setting({
       name: 'Exposure',
       deviceId: camera.id,

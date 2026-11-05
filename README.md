@@ -92,6 +92,14 @@ finally:
 An instrument directory contains `config.yaml`, the hardware definition and configured defaults, and `state.json`,
 the current operator-editable acquisition state.
 
+Detection channels define cameras and filter positions. Each profile selects its detection channels and its lasers
+independently: all selected cameras acquire in parallel under the same selected illumination. For example,
+`lasers: {laser_488: software, laser_561: software}` enables both sources in CW mode during preview or acquisition;
+`lasers: {}` captures without enabling illumination. Modulation is explicit and does not depend on DAQ waveforms.
+The Lasers page has a **scan** selection switch and a saved modulation mode for each laser in the active profile.
+Change these selections while idle. Disabling a camera's preview does not deselect any laser. Stop and failure cleanup
+inhibit every laser output. Older configurations with channel-level illumination are migrated on load to profile selections.
+
 ## How Voxel fits together
 
 ```mermaid

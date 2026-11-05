@@ -38,7 +38,7 @@ async def test_imaging_requires_digital_support_before_any_source_is_enabled(
     monkeypatch.setattr(SimulatedLaser, "source_enable", enable)
     with pytest.raises(StartupError) as caught:
         await instrument.open()
-    assert [v.code for v in caught.value.violations] == ["imaging.laser.digital_unsupported"]
+    assert [v.code for v in caught.value.violations] == ["imaging.laser.modulation_unsupported"]
     assert not enabled
 
 

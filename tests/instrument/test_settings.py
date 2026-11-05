@@ -37,8 +37,9 @@ async def test_autosave_merges_accepted_values_and_ignores_other_writes(
         "source_power_setpoint_mw": 40,
         "output_level_percent": 25,
     }
-    saved = instrument_store.value
     (await instrument.set_device_properties("laser_561", {"output_level_percent": 10})).unwrap()
+    assert instrument.active_profile.props["laser_561"] == {"output_level_percent": 10}
+    saved = instrument_store.value
     camera = instrument.active_channels["gfp"].camera
     (await camera.props.set(exposure_time_ms=5)).unwrap()
     await camera.props.refresh()  # Observations do not save internal workflow writes.

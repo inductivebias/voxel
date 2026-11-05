@@ -94,16 +94,6 @@
     aria-label={channelLabel(channelId, channel)}
   >
     <div class="flex min-w-0 flex-wrap items-center gap-1 border-b border-line-faint p-2.5" aria-label="Light path">
-      <a
-        href={deviceHref(selected.params, channel.illumination)}
-        class="inline-flex overflow-hidden rounded-sm bg-element-bg text-sm/5 text-fg transition-colors hover:bg-element-hover focus-visible:outline-2 focus-visible:outline-focus"
-        title="Open this laser"
-      >
-        <span class="px-1.5">{displayName(channel.illumination)}</span>
-        {#if line.laser != null}
-          <span class="border-l border-line-faint px-1.5 font-mono text-fg-muted">{line.laser} nm</span>
-        {/if}
-      </a>
       {#each filters as [wheelId, filter], index (wheelId)}
         {#if index === 0}
           <span class="flex min-w-6 flex-1 items-center text-fg-faint" aria-hidden="true">

@@ -1,9 +1,11 @@
 from types import SimpleNamespace
+from typing import Literal
 
 import numpy as np
 import pytest
 
-from vxl.instrument import IdleActivity, Instrument, OperationRejectedError, PreviewActivity
+from vxl.instrument import IdleActivity, Instrument, InstrumentBusyError, OperationRejectedError, PreviewActivity
+from vxl.instrument.config import ProfilePatch
 from vxl.instrument.core import Channel
 from vxl.preview import PreviewFrame, PreviewLayer, PreviewSourceEmission, PreviewViewport
 from vxl.preview.protocol import StagePosition
@@ -123,7 +125,7 @@ async def test_failed_daq_start_inhibits_output_and_stops_camera(
     monkeypatch.setattr(instrument._hal.signal_generators["daq"], "start", fail)
     with pytest.raises(ExceptionGroup):
         await instrument.start_preview()
-    assert events[-3:] == ["laser_488.output_disable", "daq.stop", "camera.stop"]
+    assert events[-4:] == ["laser_488.output_disable", "laser_561.output_disable", "daq.stop", "camera.stop"]
     assert isinstance(instrument.activity.value, IdleActivity)
 
 
@@ -270,7 +272,7 @@ async def test_preview_deduplicates_shared_laser_commands_across_channels(
     instrument, events = opened_instrument, preview_operations
     await instrument.select_route("excitation_side", "left")
     gfp = instrument._channels["gfp"]
-    gfp_cam2 = Channel(uid="gfp_cam2", camera=gfp.camera, laser=gfp.laser)
+    gfp_cam2 = Channel(uid="gfp_cam2", camera=gfp.camera)
     instrument._channels["gfp_cam2"] = gfp_cam2
     monkeypatch.setattr(Instrument, "active_channels", property(lambda _self: {"gfp": gfp, "gfp_cam2": gfp_cam2}))
     monkeypatch.setattr(instrument, "_preview_channels", SimpleNamespace(value=("gfp", "gfp_cam2")))
@@ -284,3 +286,28 @@ async def test_preview_deduplicates_shared_laser_commands_across_channels(
     events.clear()
     await instrument.stop_preview()
     assert events.count("laser_488.output_disable") == 1
+
+
+@pytest.mark.parametrize(
+    "selected", [{}, {"laser_561": "software"}, {"laser_488": "software", "laser_561": "software"}]
+)
+async def test_preview_lasers_are_selected_independently_of_camera(
+    opened_instrument: Instrument,
+    preview_operations: list[str],
+    selected: dict[str, Literal["software", "digital", "analog"]],
+) -> None:
+    instrument = opened_instrument
+    assert preview_operations == []
+    await instrument.update_profile(ProfilePatch(lasers=selected))
+    assert instrument.active_profile.channels == ["gfp"]
+    await instrument.select_route("excitation_side", "left")
+    await instrument.start_preview()
+    for uid, laser in instrument._hal.lasers.items():
+        assert await laser.props.get_value("is_output_enabled") == (uid in selected)
+        if uid in selected:
+            assert await laser.props.get_value("modulation_mode") == "software"
+    with pytest.raises(InstrumentBusyError):
+        await instrument.update_profile(ProfilePatch(lasers={}))
+    await instrument.stop_preview()
+    for laser in instrument._hal.lasers.values():
+        assert not await laser.props.get_value("is_output_enabled")

@@ -15,6 +15,7 @@
   import { deviceHref } from '$lib/navigation';
   import PageHeader from '$lib/shell/PageHeader.svelte';
   import { NumberBox, RadioBar, Section, Select, Slider, Switch } from '@voxel/kit';
+  import { reportFailure } from '@voxel/kit/failures';
   import { Loader } from '@voxel/kit/icons';
 
   type Setting = {
@@ -26,7 +27,11 @@
     note?: string;
   };
 
-  const MODE_LABELS: Record<ModulationMode, string> = { software: 'Software', digital: 'Digital', analog: 'Analog' };
+  const MODE_LABELS: Record<ModulationMode, string> = {
+    software: 'CW (software)',
+    digital: 'Digital',
+    analog: 'Analog'
+  };
   const COMMAND_LABELS: Record<string, string> = {
     source_enable: 'Enabling source',
     source_disable: 'Disabling source',
@@ -36,6 +41,26 @@
   };
 
   const instrument = $derived.by(getOpenInstrument());
+
+  function selectLaser(laser: LaserHandle, on: boolean): void {
+    const lasers = { ...instrument.activeProfile?.lasers };
+    if (on) lasers[laser.id] = 'software';
+    else delete lasers[laser.id];
+    reportFailure(instrument.updateProfile({ lasers }));
+  }
+
+  function saveMode(laser: LaserHandle, mode: ModulationMode): void {
+    reportFailure(instrument.updateProfile({ lasers: { ...instrument.activeProfile?.lasers, [laser.id]: mode } }));
+  }
+
+  async function toggleOutput(laser: LaserHandle, on: boolean): Promise<void> {
+    if (on) {
+      await laser.enableSource(true);
+      await laser.enableOutput(true);
+    } else {
+      await laser.disableOutput();
+    }
+  }
 
   function reading(value: unknown): string {
     return typeof value === 'number' && Number.isFinite(value) ? Number(value.toPrecision(5)).toString() : '—';
@@ -63,13 +88,6 @@
   function commandLabel(laser: LaserHandle): string {
     const command = [...laser.pendingCommands][0];
     return (command && COMMAND_LABELS[command]) || 'Updating laser';
-  }
-
-  async function toggleOutput(laser: LaserHandle, on: boolean): Promise<void> {
-    if (on) {
-      await laser.enableSource(true);
-      await laser.enableOutput(true);
-    } else await laser.disableOutput();
   }
 </script>
 
@@ -135,20 +153,33 @@
 <div class="page-body">
   <div class="grid grid-cols-1 gap-3">
     {#each instrument.lasers.values() as laser (laser.id)}
-      {@const channel = instrument.activeChannels.find((channel) => channel.laser.id === laser.id)}
+      {@const selected = Object.hasOwn(instrument.activeProfile?.lasers ?? {}, laser.id)}
       {@const enabled = laser.outputEnabled?.value === true}
       {@const unavailable = deviceLocked(laser, instrument)}
       {@const commandRunning = laser.pendingCommands.size > 0}
       {@const modes = modesOf(laser)}
       <Section variant="raised">
         {#snippet heading()}
-          <a
-            href={deviceHref({ stationId: instrument.stationId, instrumentId: instrument.id }, laser.id)}
-            class="flex items-center gap-2 rounded-sm hover:underline focus-visible:outline-2 focus-visible:outline-focus"
-            title="Open laser device"
-          >
-            {@render deviceIdentity(laser.wavelength?.value ? `${laser.wavelength.value} nm` : laser.id, channel)}
-          </a>
+          <span class="inline-flex max-w-full items-center gap-2">
+            <a
+              href={deviceHref({ stationId: instrument.stationId, instrumentId: instrument.id }, laser.id)}
+              class="flex items-center gap-2 rounded-sm hover:underline focus-visible:outline-2 focus-visible:outline-focus"
+              title="Open laser device"
+            >
+              {@render deviceIdentity(laser.wavelength?.value ? `${laser.wavelength.value} nm` : laser.id)}
+            </a>
+            <span
+              class="inline-flex shrink-0 items-center"
+              title="Manually enable or inhibit laser output now, using its current modulation mode. In CW mode, enabling output turns on the beam immediately. This does not change scan selection."
+            >
+              <Switch
+                value={enabled}
+                disabled={unavailable || commandRunning}
+                onChange={(on) => reportFailure(toggleOutput(laser, on))}
+                aria-label="Manual laser output"
+              />
+            </span>
+          </span>
         {/snippet}
         {#snippet trailing()}
           <div class="flex items-center gap-1">
@@ -166,21 +197,25 @@
               {/if}
             </span>
             <RadioBar
-              value={modes.find((mode) => mode === laser.modulationMode?.value)}
+              value={instrument.activeProfile?.lasers[laser.id] ?? 'software'}
               options={modes}
               formatLabel={(mode) => MODE_LABELS[mode]}
-              onChange={(mode) => laser.setModulationMode(mode)}
-              disabled={unavailable || enabled}
+              onChange={(mode) => saveMode(laser, mode)}
+              disabled={unavailable || !selected || instrument.activity.kind !== 'idle'}
               size="xs"
               aria-label="Modulation mode"
-              title={enabled ? 'Disable output to change mode' : 'Modulation mode'}
+              title="Profile modulation mode; applied when preview or acquisition starts"
             />
-            <span title="Enable source and permit output; external modulation still controls emission">
+            <span
+              class="ml-2 inline-flex items-center gap-1"
+              title="Include this laser in the active profile's preview and acquisition. Voxel enables its output when preview or capture starts and inhibits it when stopped. Selecting this does not turn the laser on now."
+            >
+              <span class="text-sm">scan</span>
               <Switch
-                value={enabled}
-                disabled={unavailable}
-                onChange={(on) => toggleOutput(laser, on)}
-                aria-label="Card output permission"
+                value={selected}
+                onChange={(on) => selectLaser(laser, on)}
+                disabled={instrument.activity.kind !== 'idle' || instrument.edits.pending}
+                aria-label="Use laser in preview and scan"
               />
             </span>
           </div>

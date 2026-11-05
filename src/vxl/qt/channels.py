@@ -43,7 +43,7 @@ log = logging.getLogger(__name__)
 
 
 class ChannelSection(QWidget):
-    """Live device controls (camera + laser) for one channel of the active profile."""
+    """Live camera controls for one detection channel of the active profile."""
 
     def __init__(
         self, channel: Channel, config: ChannelConfig, devices: DevicesStore, parent: QWidget | None = None
@@ -60,11 +60,6 @@ class ChannelSection(QWidget):
         layout.addWidget(Flex.hstack(Text.section(label, color=color), Stretch(), spacing=Spacing.SM))
 
         layout.addWidget(CameraControl(camera))
-
-        laser = devices.get_adapter(config.illumination)
-        if laser is None:
-            raise ValueError(f"Channel '{channel.uid}': no adapter for illumination device '{config.illumination}'")
-        layout.addWidget(LaserControl(laser))
 
 
 class ChannelsPanel(QWidget):
@@ -135,6 +130,10 @@ class ChannelsPanel(QWidget):
                 config = configs.get(channel.uid)
                 if config is not None:
                     self._channels_box.add(ChannelSection(channel, config, self._devices))
+        for uid in self._instrument.active_profile.lasers:
+            laser = self._devices.get_adapter(uid)
+            if laser is not None:
+                self._channels_box.add(LaserControl(laser))
         self._channels_box.add_stretch()
 
     def _on_active_profile(self, profile_id: str) -> None:

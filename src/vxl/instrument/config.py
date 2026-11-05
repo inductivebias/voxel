@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal, Self
 
 from ome_zarr_writer import Compression, DownscaleType, ScaleLevel, WriterSettings
 from pydantic import Field, ValidationInfo, field_validator, model_validator
+from vxl_records import LineScan
 from vxlib.schema import FrozenModel, identifier
 
 from rigup import CommandRequest
@@ -32,7 +33,6 @@ class Patch(FrozenModel):
 
 class ChannelConfig(FrozenModel):
     detection: str
-    illumination: str
     filters: DiscreteAxisPositions = Field(default_factory=dict)
     desc: str = ""
     label: str | None = None
@@ -69,6 +69,7 @@ class ProfileConfig(FrozenModel):
     """
 
     channels: list[str] = Field(min_length=1)
+    lasers: dict[str, Literal["software", "digital", "analog"]] = Field(default_factory=dict)
     z_step: float = Field(..., gt=0, description="Axial step between frames in µm (one scan-axis move per frame)")
     sync: dict[str, Signals] = Field(default_factory=dict)
     props: dict[str, dict[str, Any]] = Field(default_factory=dict)
@@ -79,6 +80,7 @@ class ProfileConfig(FrozenModel):
 
 
 class ProfilePatch(Patch):
+    lasers: dict[str, Literal["software", "digital", "analog"]] = Field(default_factory=dict)
     z_step: Annotated[float, Field(gt=0)] | None = None
     desc: str | None = None
     label: str | None = None
@@ -120,17 +122,53 @@ class ImagingProtocol(FrozenModel):
             raise ValueError(f"at least one {(info.field_name or 'entry').rstrip('s')} must be present")
         return v
 
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_channel_illumination(cls, value: Any) -> Any:
+        """Read old protocols once; runtime illumination belongs only to profiles."""
+        if not isinstance(value, dict):
+            return value
+        channels = value.get("channels", {})
+        legacy = {
+            uid: ch["illumination"] for uid, ch in channels.items() if isinstance(ch, dict) and "illumination" in ch
+        }
+        if not legacy:
+            return value
+        profiles = {}
+        for uid, original in value.get("profiles", {}).items():
+            profile = dict(original)
+            if "lasers" not in profile:
+                waveforms = {
+                    port for signals in profile.get("sync", {}).values() for port in signals.get("waveforms", {})
+                }
+                profile["lasers"] = {
+                    legacy[ch]: "digital" if legacy[ch] in waveforms else "software"
+                    for ch in profile.get("channels", [])
+                    if ch in legacy
+                }
+            profiles[uid] = profile
+        return {
+            **value,
+            "channels": {
+                uid: {k: v for k, v in ch.items() if k != "illumination"} if isinstance(ch, dict) else ch
+                for uid, ch in channels.items()
+            },
+            "profiles": profiles,
+        }
+
     def get_profile_settable_devices(self, profile_id: str, hal: HardwareTopology) -> set[str]:
         profile = self.profiles[profile_id]
-        ids: set[str] = set()
+        ids: set[str] = set(hal.illumination)
         for ch_id in profile.channels:
             if (ch := self.channels.get(ch_id)) is None:
                 continue
-            ids.update({ch.detection, ch.illumination, *ch.filters})
+            ids.update({ch.detection, *ch.filters})
             if ch.detection in hal.detection:
                 ids.update(hal.detection[ch.detection].aux_devices)
-            if ch.illumination in hal.illumination:
-                ids.update(hal.illumination[ch.illumination].aux_devices)
+        for laser_id in profile.lasers:
+            ids.add(laser_id)
+            if laser_id in hal.illumination:
+                ids.update(hal.illumination[laser_id].aux_devices)
         for signals in profile.sync.values():
             ids.update(signals.waveforms.keys())
         return ids - hal.filter_wheels
@@ -166,16 +204,16 @@ class ImagingProtocol(FrozenModel):
                     )
                 )
 
-            if ch.illumination not in hal.illumination:
-                violations.append(
-                    Violation(
-                        code="imaging.channel.illumination_missing",
-                        msg=f"Illumination assembly '{ch.illumination}' is not configured.",
-                        loc=(*loc, "channels", ch_id, "illumination"),
-                    )
-                )
-
         for profile_id, profile in self.profiles.items():
+            for laser_id in profile.lasers:
+                if laser_id not in hal.illumination:
+                    violations.append(
+                        Violation(
+                            code="imaging.profile.illumination_missing",
+                            msg=f"Illumination assembly '{laser_id}' is not configured.",
+                            loc=(*loc, "profiles", profile_id, "lasers", laser_id),
+                        )
+                    )
             for generator_uid in profile.sync:
                 if generator_uid not in hal.device_uids:
                     violations.append(
@@ -189,7 +227,7 @@ class ImagingProtocol(FrozenModel):
             settable = self.get_profile_settable_devices(profile_id, hal)
             # setup runs arbitrary device commands (not props), so it may legitimately target filter
             # wheels — which are intentionally excluded from `settable` (props drive them via select).
-            setup_targets = settable | hal.filter_wheels
+            setup_targets = (settable - set(hal.illumination)) | set(profile.lasers) | hal.filter_wheels
 
             for device_id in profile.props:
                 if device_id not in settable:
@@ -414,10 +452,19 @@ class AcquisitionTask(FrozenModel):
 
     id: str = Field(min_length=1)
     xy: XYDefinition
+    scan: LineScan | None = None
     profiles: list[str] = Field(min_length=1)
     z: ZDefinition
     traversal: TileOrder = TileOrder.SNAKE_ROW
     iteration: IterationOrder = IterationOrder.POSITION_MAJOR
+
+    @model_validator(mode="after")
+    def _check_line_scan(self) -> Self:
+        if self.scan is not None and (
+            self.xy.mode != "explicit_points" or len(self.xy.points) != 1 or self.z.start != self.z.end
+        ):
+            raise ValueError("a line scan needs one anchor position and a fixed Z hold position")
+        return self
 
     @field_validator("profiles")
     @classmethod
@@ -430,6 +477,7 @@ class TaskPatch(Patch):
     """Fields that may be changed on an existing acquisition task."""
 
     xy: XYDefinition | None = None
+    scan: LineScan | None = None
     profiles: Annotated[list[str], Field(min_length=1)] | None = None
     z: ZDefinition | None = None
     traversal: TileOrder | None = None

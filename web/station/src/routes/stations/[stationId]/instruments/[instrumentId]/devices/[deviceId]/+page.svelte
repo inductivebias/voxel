@@ -26,8 +26,7 @@
   const found = $derived(instrument ? issues.about({ device: deviceId }) : []);
   const channels = $derived(
     Object.entries(selected.imaging?.channels ?? {}).filter(
-      ([, channel]) =>
-        channel.illumination === deviceId || channel.detection === deviceId || Object.hasOwn(channel.filters, deviceId)
+      ([, channel]) => channel.detection === deviceId || Object.hasOwn(channel.filters, deviceId)
     )
   );
   const autosave = $derived(config?.autosave === '*' ? 'All settings' : config?.autosave?.join(', '));

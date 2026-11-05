@@ -7,6 +7,7 @@
     convexHull,
     type EditContext,
     type IterationOrder,
+    type LineScan,
     type Point2D,
     pointBounds,
     resizePointsToBounds,
@@ -19,7 +20,17 @@
   import FieldRow from '$lib/features/run/FieldRow.svelte';
   import StageNumericField from '$lib/features/run/StageNumericField.svelte';
   import PageHeader from '$lib/shell/PageHeader.svelte';
-  import { Button, buttonVariants, Dialog, DropdownMenu, NumberInput, Section, Select, SpinBox } from '@voxel/kit';
+  import {
+    Button,
+    buttonVariants,
+    Dialog,
+    DropdownMenu,
+    NumberBox,
+    NumberInput,
+    Section,
+    Select,
+    SpinBox
+  } from '@voxel/kit';
   import { reportFailure } from '@voxel/kit/failures';
   import { displayName } from '@voxel/kit/format';
   import { Crosshair, GripVertical, Link, Plus, Trash, Unlink, X } from '@voxel/kit/icons';
@@ -100,6 +111,16 @@
   function patchTask(patch: TaskPatch, context: EditContext = {}): void {
     if (!instrument || !task || disabled) return;
     reportFailure(instrument.updateTask(task.id, patch, context));
+  }
+
+  function updateScan(patch: Partial<LineScan>, context: EditContext = {}): void {
+    if (task?.scan) patchTask({ scan: { ...task.scan, ...patch } }, context);
+  }
+
+  function updateHold(axis: 'x' | 'y' | 'z', value: number, context: EditContext): void {
+    if (!task) return;
+    if (axis === 'z') patchTask({ z: { type: 'fixed', start: value, end: value } }, context);
+    else patchTask({ xy: { ...task.xy, points: [{ ...task.xy.points[0], [axis]: value }] } }, context);
   }
 
   function updateLayoutPoints(points: Point2D[], context: EditContext = {}): void {
@@ -265,220 +286,319 @@
 {#if instrument && task}
   {@const stage = instrument.stage}
   <div class="flex page-body flex-col gap-4 pb-0!">
-    <Section heading="XY coverage" variant="bordered">
-      {#snippet trailing()}
-        <Select
-          class="w-42"
-          value={task.xy.mode}
-          options={xyModes}
-          formatLabel={(mode) => XY_MODE_LABELS[mode]}
-          {disabled}
-          onChange={setPointLayout}
-        />
-      {/snippet}
-
-      <div class="flex flex-col gap-3">
-        {#if task.xy.mode === 'bounding_box' && bounds}
-          <FieldRow label="Minimum">
-            <StageNumericField
-              stage={instrument.stage}
-              axis="x"
-              value={bounds.minX}
-              max={bounds.maxX}
-              prefix={stage.qualifiedLabel('x')}
-              {unit}
-              onEditStart={() => instrument.edits.hold()}
-              onChange={(value, edit) => updateBound('x', 'min', value, edit)}
-              {disabled}
-            />
-            <StageNumericField
-              stage={instrument.stage}
-              axis="y"
-              value={bounds.minY}
-              max={bounds.maxY}
-              prefix={stage.qualifiedLabel('y')}
-              {unit}
-              onEditStart={() => instrument.edits.hold()}
-              onChange={(value, edit) => updateBound('y', 'min', value, edit)}
+    {#if task.scan}
+      <Section heading="X-Scan" variant="bordered">
+        <div class="flex flex-col gap-3">
+          <FieldRow label="Axis">
+            <Select
+              value={task.scan.axis}
+              options={['x', 'y', 'z'] as const}
+              formatLabel={(axis) => axis.toUpperCase()}
+              onChange={(axis) => updateScan({ axis })}
               {disabled}
             />
           </FieldRow>
-          <FieldRow label="Maximum">
+          <FieldRow label="Window">
             <StageNumericField
               stage={instrument.stage}
-              axis="x"
-              value={bounds.maxX}
-              min={bounds.minX}
-              prefix={stage.qualifiedLabel('x')}
+              axis={task.scan.axis}
+              value={task.scan.start}
+              prefix="Start"
               {unit}
-              onEditStart={() => instrument.edits.hold()}
-              onChange={(value, edit) => updateBound('x', 'max', value, edit)}
+              onChange={(value, edit) => updateScan({ start: value }, edit)}
               {disabled}
             />
             <StageNumericField
               stage={instrument.stage}
-              axis="y"
-              value={bounds.maxY}
-              min={bounds.minY}
-              prefix={stage.qualifiedLabel('y')}
+              axis={task.scan.axis}
+              value={task.scan.end}
+              prefix="End"
               {unit}
-              onEditStart={() => instrument.edits.hold()}
-              onChange={(value, edit) => updateBound('y', 'max', value, edit)}
+              onChange={(value, edit) => updateScan({ end: value }, edit)}
               {disabled}
             />
           </FieldRow>
-        {:else}
-          <div class="mt-3 flex flex-col gap-2">
-            <Sortable.Root
-              items={sortablePoints}
-              key={(item) => item.key}
-              onReorder={reorderLayoutPoints}
-              layout="vertical"
-              flipDuration={120}
-              containerClass="max-h-68 min-h-0 shrink"
-              class="space-y-2"
-            >
-              {#snippet item(item: { key: string; point: Point2D }, index: number)}
-                <Sortable.Item
-                  {item}
-                  class="grid h-ui-sm grid-cols-[var(--spacing-ui-sm)_minmax(0,16rem)_minmax(0,1fr)_var(--spacing-ui-sm)_var(--spacing-ui-sm)] overflow-hidden rounded border border-control-line bg-element-bg transition-colors focus-within:border-focus hover:bg-element-hover"
-                >
-                  {#if task.xy.mode === 'explicit_points'}
-                    <Sortable.Handle
-                      {item}
-                      {disabled}
-                      class="flex size-ui-sm shrink-0 cursor-grab touch-none items-center justify-start text-fg-muted active:cursor-grabbing"
-                    >
-                      <GripVertical class="mx-0.5 size-3.5" />
-                    </Sortable.Handle>
-                  {:else}
-                    <span aria-hidden="true"></span>
-                  {/if}
-
-                  <div class="grid min-w-0 cursor-auto grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center">
-                    {@render coordinate(
-                      item.point.x,
-                      `Point ${index + 1} ${stage.qualifiedLabel('x')}`,
-                      (value, context) => updateLayoutPoint(index, 'x', value, context)
+          <FieldRow label="Sampling">
+            <NumberBox
+              value={task.scan.spacing}
+              min={0.001}
+              step={0.1}
+              suffix="µm"
+              aria-label="Sampling distance in micrometres"
+              onEditStart={() => instrument.edits.hold()}
+              onChange={(spacing, edit) => updateScan({ spacing }, edit)}
+              {disabled}
+            />
+          </FieldRow>
+          {#each ['x', 'y', 'z'] as const as axis}
+            {#if axis !== task.scan.axis}
+              <FieldRow label={`Hold ${axis.toUpperCase()}`}>
+                <StageNumericField
+                  stage={instrument.stage}
+                  {axis}
+                  value={axis === 'z' ? task.z.start : task.xy.points[0][axis]}
+                  {unit}
+                  onChange={(value, edit) => updateHold(axis, value, edit)}
+                  {disabled}
+                />
+              </FieldRow>
+            {/if}
+          {/each}
+          <p class="text-sm text-fg-muted">
+            The end position is exclusive. Held axes must already be at these positions; this task does not move them.
+          </p>
+          {#each task.profiles as profileId}
+            {@const sync = Object.values(instrument.imaging.profiles[profileId]?.sync ?? {})[0]}
+            {#if sync}
+              {@const period = sync.duration + sync.rest_time}
+              {@const speed = task.scan.spacing / period}
+              <div class="text-sm text-fg-muted">
+                <p class="font-medium text-fg">{profileLabel(profileId)}</p>
+                <ul class="mt-1 list-disc space-y-0.5 pl-5 tabular-nums">
+                  <li>Frame rate: {(1 / period).toFixed(2)} Hz (nominal)</li>
+                  <li>{task.scan.axis.toUpperCase()} stage speed: {speed.toFixed(3)} µm/s</li>
+                  <li>
+                    Frames per camera: {Math.round(
+                      (task.scan.end - task.scan.start) / task.scan.spacing
+                    ).toLocaleString()}
+                  </li>
+                  <li>Scan duration: {((task.scan.end - task.scan.start) / speed).toFixed(1)} s</li>
+                  <li>
+                    Runway per side: {task.scan.runway_s} s ({formatCoordinate(speed * task.scan.runway_s)}
+                    {unit.label})
+                  </li>
+                  <li>
+                    Total travel: {formatCoordinate(task.scan.start - speed * task.scan.runway_s)}–{formatCoordinate(
+                      task.scan.end + speed * task.scan.runway_s
                     )}
-                    <span class="px-0.5 text-fg-muted select-none">,</span>
-                    {@render coordinate(
-                      item.point.y,
-                      `Point ${index + 1} ${stage.qualifiedLabel('y')}`,
-                      (value, context) => updateLayoutPoint(index, 'y', value, context)
-                    )}
-                  </div>
+                    {unit.label}
+                  </li>
+                </ul>
+                <p class="mt-2">
+                  Frame rate comes from the profile's DAQ timing; sampling sets the stage speed and encoder trigger
+                  spacing.
+                </p>
+              </div>
+            {/if}
+          {/each}
+        </div>
+      </Section>
+    {:else}
+      <Section heading="XY coverage" variant="bordered">
+        {#snippet trailing()}
+          <Select
+            class="w-42"
+            value={task.xy.mode}
+            options={xyModes}
+            formatLabel={(mode) => XY_MODE_LABELS[mode]}
+            {disabled}
+            onChange={setPointLayout}
+          />
+        {/snippet}
 
-                  <span aria-hidden="true"></span>
-
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    class="h-full rounded-none border-y-0 border-r-0 border-l border-control-line text-fg-muted focus-visible:ring-offset-0 focus-visible:ring-inset"
-                    disabled={disabled || !canUseCurrentPoint(index)}
-                    aria-label={`Use current stage position for point ${index + 1}`}
-                    title="Use current stage position"
-                    onclick={() => useCurrentPoint(index)}
-                  >
-                    <Crosshair class="size-3.5" />
-                  </Button>
-                  <Button
-                    variant="ghost"
-                    size="icon-sm"
-                    class="h-full rounded-none border-y-0 border-r-0 border-l border-control-line text-fg-muted hover:text-danger-fg focus-visible:ring-offset-0 focus-visible:ring-inset"
-                    disabled={disabled || layoutPoints.length <= (task.xy.mode === 'explicit_points' ? 1 : 3)}
-                    aria-label={`Delete point ${index + 1}`}
-                    title={`Delete point ${index + 1}`}
-                    onclick={() => removeLayoutPoint(index)}
-                  >
-                    <Trash class="size-3.5" />
-                  </Button>
-                </Sortable.Item>
-              {/snippet}
-            </Sortable.Root>
-
-            <Button variant="dashed" disabled={disabled || !canAddPoint} onclick={addPoint}>
-              <Plus class="size-3.5" />
-              Add current point
-            </Button>
-          </div>
-        {/if}
-
-        {#if task.xy.mode !== 'explicit_points'}
-          <FieldRow label="Overlap" fieldsClass="*:basis-20">
-            {#snippet trailing()}
-              <button
-                type="button"
-                class={overlapLinked
-                  ? 'cursor-pointer text-fg transition-colors'
-                  : 'cursor-pointer text-fg-faint transition-colors hover:text-fg'}
+        <div class="flex flex-col gap-3">
+          {#if task.xy.mode === 'bounding_box' && bounds}
+            <FieldRow label="Minimum">
+              <StageNumericField
+                stage={instrument.stage}
+                axis="x"
+                value={bounds.minX}
+                max={bounds.maxX}
+                prefix={stage.qualifiedLabel('x')}
+                {unit}
+                onEditStart={() => instrument.edits.hold()}
+                onChange={(value, edit) => updateBound('x', 'min', value, edit)}
                 {disabled}
-                aria-label={overlapLinked ? 'Unlink X and Y overlap' : 'Link X and Y overlap'}
-                title={overlapLinked ? 'X and Y overlap are linked' : 'Link X and Y overlap'}
-                onclick={toggleOverlapLink}
+              />
+              <StageNumericField
+                stage={instrument.stage}
+                axis="y"
+                value={bounds.minY}
+                max={bounds.maxY}
+                prefix={stage.qualifiedLabel('y')}
+                {unit}
+                onEditStart={() => instrument.edits.hold()}
+                onChange={(value, edit) => updateBound('y', 'min', value, edit)}
+                {disabled}
+              />
+            </FieldRow>
+            <FieldRow label="Maximum">
+              <StageNumericField
+                stage={instrument.stage}
+                axis="x"
+                value={bounds.maxX}
+                min={bounds.minX}
+                prefix={stage.qualifiedLabel('x')}
+                {unit}
+                onEditStart={() => instrument.edits.hold()}
+                onChange={(value, edit) => updateBound('x', 'max', value, edit)}
+                {disabled}
+              />
+              <StageNumericField
+                stage={instrument.stage}
+                axis="y"
+                value={bounds.maxY}
+                min={bounds.minY}
+                prefix={stage.qualifiedLabel('y')}
+                {unit}
+                onEditStart={() => instrument.edits.hold()}
+                onChange={(value, edit) => updateBound('y', 'max', value, edit)}
+                {disabled}
+              />
+            </FieldRow>
+          {:else}
+            <div class="mt-3 flex flex-col gap-2">
+              <Sortable.Root
+                items={sortablePoints}
+                key={(item) => item.key}
+                onReorder={reorderLayoutPoints}
+                layout="vertical"
+                flipDuration={120}
+                containerClass="max-h-68 min-h-0 shrink"
+                class="space-y-2"
               >
-                {#if overlapLinked}<Link class="size-3" />{:else}<Unlink class="size-3" />{/if}
-              </button>
-            {/snippet}
-            <SpinBox
-              value={task.xy.overlap.x}
-              min={0}
-              max={0.99}
-              step={0.01}
-              bigStep={0.1}
-              displayScale={0.01}
-              decimals={0}
-              prefix="X"
-              suffix="%"
-              onEditStart={() => instrument.edits.hold()}
-              onChange={(value, edit) => updateOverlap('x', value, edit)}
-              {disabled}
-            />
-            <SpinBox
-              value={task.xy.overlap.y}
-              min={0}
-              max={0.99}
-              step={0.01}
-              bigStep={0.1}
-              displayScale={0.01}
-              decimals={0}
-              prefix="Y"
-              suffix="%"
-              onEditStart={() => instrument.edits.hold()}
-              onChange={(value, edit) => updateOverlap('y', value, edit)}
-              {disabled}
-            />
-          </FieldRow>
-        {/if}
-      </div>
-    </Section>
+                {#snippet item(item: { key: string; point: Point2D }, index: number)}
+                  <Sortable.Item
+                    {item}
+                    class="grid h-ui-sm grid-cols-[var(--spacing-ui-sm)_minmax(0,16rem)_minmax(0,1fr)_var(--spacing-ui-sm)_var(--spacing-ui-sm)] overflow-hidden rounded border border-control-line bg-element-bg transition-colors focus-within:border-focus hover:bg-element-hover"
+                  >
+                    {#if task.xy.mode === 'explicit_points'}
+                      <Sortable.Handle
+                        {item}
+                        {disabled}
+                        class="flex size-ui-sm shrink-0 cursor-grab touch-none items-center justify-start text-fg-muted active:cursor-grabbing"
+                      >
+                        <GripVertical class="mx-0.5 size-3.5" />
+                      </Sortable.Handle>
+                    {:else}
+                      <span aria-hidden="true"></span>
+                    {/if}
 
-    <Section heading="Z coverage" variant="bordered">
-      <FieldRow label="Range">
-        <StageNumericField
-          stage={instrument.stage}
-          axis="z"
-          value={task.z.start}
-          max={task.z.end}
-          prefix="Start"
-          {unit}
-          onEditStart={() => instrument.edits.hold()}
-          onChange={(value, edit) => updateZ('start', value, edit)}
-          {disabled}
-        />
-        <StageNumericField
-          stage={instrument.stage}
-          axis="z"
-          value={task.z.end}
-          min={task.z.start}
-          prefix="End"
-          {unit}
-          onEditStart={() => instrument.edits.hold()}
-          onChange={(value, edit) => updateZ('end', value, edit)}
-          {disabled}
-        />
-      </FieldRow>
-    </Section>
+                    <div class="grid min-w-0 cursor-auto grid-cols-[minmax(0,1fr)_auto_minmax(0,1fr)] items-center">
+                      {@render coordinate(
+                        item.point.x,
+                        `Point ${index + 1} ${stage.qualifiedLabel('x')}`,
+                        (value, context) => updateLayoutPoint(index, 'x', value, context)
+                      )}
+                      <span class="px-0.5 text-fg-muted select-none">,</span>
+                      {@render coordinate(
+                        item.point.y,
+                        `Point ${index + 1} ${stage.qualifiedLabel('y')}`,
+                        (value, context) => updateLayoutPoint(index, 'y', value, context)
+                      )}
+                    </div>
+
+                    <span aria-hidden="true"></span>
+
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      class="h-full rounded-none border-y-0 border-r-0 border-l border-control-line text-fg-muted focus-visible:ring-offset-0 focus-visible:ring-inset"
+                      disabled={disabled || !canUseCurrentPoint(index)}
+                      aria-label={`Use current stage position for point ${index + 1}`}
+                      title="Use current stage position"
+                      onclick={() => useCurrentPoint(index)}
+                    >
+                      <Crosshair class="size-3.5" />
+                    </Button>
+                    <Button
+                      variant="ghost"
+                      size="icon-sm"
+                      class="h-full rounded-none border-y-0 border-r-0 border-l border-control-line text-fg-muted hover:text-danger-fg focus-visible:ring-offset-0 focus-visible:ring-inset"
+                      disabled={disabled || layoutPoints.length <= (task.xy.mode === 'explicit_points' ? 1 : 3)}
+                      aria-label={`Delete point ${index + 1}`}
+                      title={`Delete point ${index + 1}`}
+                      onclick={() => removeLayoutPoint(index)}
+                    >
+                      <Trash class="size-3.5" />
+                    </Button>
+                  </Sortable.Item>
+                {/snippet}
+              </Sortable.Root>
+
+              <Button variant="dashed" disabled={disabled || !canAddPoint} onclick={addPoint}>
+                <Plus class="size-3.5" />
+                Add current point
+              </Button>
+            </div>
+          {/if}
+
+          {#if task.xy.mode !== 'explicit_points'}
+            <FieldRow label="Overlap" fieldsClass="*:basis-20">
+              {#snippet trailing()}
+                <button
+                  type="button"
+                  class={overlapLinked
+                    ? 'cursor-pointer text-fg transition-colors'
+                    : 'cursor-pointer text-fg-faint transition-colors hover:text-fg'}
+                  {disabled}
+                  aria-label={overlapLinked ? 'Unlink X and Y overlap' : 'Link X and Y overlap'}
+                  title={overlapLinked ? 'X and Y overlap are linked' : 'Link X and Y overlap'}
+                  onclick={toggleOverlapLink}
+                >
+                  {#if overlapLinked}<Link class="size-3" />{:else}<Unlink class="size-3" />{/if}
+                </button>
+              {/snippet}
+              <SpinBox
+                value={task.xy.overlap.x}
+                min={0}
+                max={0.99}
+                step={0.01}
+                bigStep={0.1}
+                displayScale={0.01}
+                decimals={0}
+                prefix="X"
+                suffix="%"
+                onEditStart={() => instrument.edits.hold()}
+                onChange={(value, edit) => updateOverlap('x', value, edit)}
+                {disabled}
+              />
+              <SpinBox
+                value={task.xy.overlap.y}
+                min={0}
+                max={0.99}
+                step={0.01}
+                bigStep={0.1}
+                displayScale={0.01}
+                decimals={0}
+                prefix="Y"
+                suffix="%"
+                onEditStart={() => instrument.edits.hold()}
+                onChange={(value, edit) => updateOverlap('y', value, edit)}
+                {disabled}
+              />
+            </FieldRow>
+          {/if}
+        </div>
+      </Section>
+
+      <Section heading="Z coverage" variant="bordered">
+        <FieldRow label="Range">
+          <StageNumericField
+            stage={instrument.stage}
+            axis="z"
+            value={task.z.start}
+            max={task.z.end}
+            prefix="Start"
+            {unit}
+            onEditStart={() => instrument.edits.hold()}
+            onChange={(value, edit) => updateZ('start', value, edit)}
+            {disabled}
+          />
+          <StageNumericField
+            stage={instrument.stage}
+            axis="z"
+            value={task.z.end}
+            min={task.z.start}
+            prefix="End"
+            {unit}
+            onEditStart={() => instrument.edits.hold()}
+            onChange={(value, edit) => updateZ('end', value, edit)}
+            {disabled}
+          />
+        </FieldRow>
+      </Section>
+    {/if}
 
     <Section heading="Profiles" variant="bordered">
       {#snippet trailing()}
@@ -539,30 +659,32 @@
       </Sortable.Root>
     </Section>
 
-    <Section heading="Ordering" variant="bordered">
-      <div class="flex flex-col gap-3">
-        <FieldRow label="Mode">
-          <Select
-            class="w-full"
-            value={task.iteration}
-            options={ITERATIONS}
-            formatLabel={(order) => ITERATION_LABELS[order]}
-            {disabled}
-            onChange={(iteration) => patchTask({ iteration })}
-          />
-        </FieldRow>
-        <FieldRow label="Path">
-          <Select
-            class="w-full"
-            value={task.traversal}
-            options={TRAVERSALS}
-            formatLabel={(order) => TRAVERSAL_LABELS[order]}
-            {disabled}
-            onChange={(traversal) => patchTask({ traversal })}
-          />
-        </FieldRow>
-      </div>
-    </Section>
+    {#if !task.scan}
+      <Section heading="Ordering" variant="bordered">
+        <div class="flex flex-col gap-3">
+          <FieldRow label="Mode">
+            <Select
+              class="w-full"
+              value={task.iteration}
+              options={ITERATIONS}
+              formatLabel={(order) => ITERATION_LABELS[order]}
+              {disabled}
+              onChange={(iteration) => patchTask({ iteration })}
+            />
+          </FieldRow>
+          <FieldRow label="Path">
+            <Select
+              class="w-full"
+              value={task.traversal}
+              options={TRAVERSALS}
+              formatLabel={(order) => TRAVERSAL_LABELS[order]}
+              {disabled}
+              onChange={(traversal) => patchTask({ traversal })}
+            />
+          </FieldRow>
+        </div>
+      </Section>
+    {/if}
 
     <section
       class="flex min-h-40 flex-1 flex-col overflow-hidden rounded-t-lg border-x border-t border-line-muted bg-tint"
@@ -592,12 +714,19 @@
               aria-label={`Volume ${index + 1}, ${profileLabel(volume.profile)}, ${stage.qualifiedLabel('x')} ${formatCoordinate(volume.x)} ${unit.label}, ${stage.qualifiedLabel('y')} ${formatCoordinate(volume.y)} ${unit.label}, ${stage.qualifiedLabel('z')} ${formatCoordinate(volume.z_start)} to ${formatCoordinate(volume.z_end)} ${unit.label}`}
             >
               <div class="flex shrink-0 items-center gap-1 text-sm tabular-nums">
-                {@render positionChip(stage.qualifiedLabel('x'), formatCoordinate(volume.x))}
-                {@render positionChip(stage.qualifiedLabel('y'), formatCoordinate(volume.y))}
-                {@render positionChip(
-                  stage.qualifiedLabel('z'),
-                  `${formatCoordinate(volume.z_start)} – ${formatCoordinate(volume.z_end)}`
-                )}
+                {#if volume.scan}
+                  {@render positionChip(
+                    `${volume.scan.axis.toUpperCase()} scan`,
+                    `${formatCoordinate(volume.scan.start)} – ${formatCoordinate(volume.scan.end)}`
+                  )}
+                {:else}
+                  {@render positionChip(stage.qualifiedLabel('x'), formatCoordinate(volume.x))}
+                  {@render positionChip(stage.qualifiedLabel('y'), formatCoordinate(volume.y))}
+                  {@render positionChip(
+                    stage.qualifiedLabel('z'),
+                    `${formatCoordinate(volume.z_start)} – ${formatCoordinate(volume.z_end)}`
+                  )}
+                {/if}
               </div>
               <span
                 class="min-w-20 truncate rounded-sm bg-tint px-1.5 py-0.5 whitespace-nowrap text-fg-muted"

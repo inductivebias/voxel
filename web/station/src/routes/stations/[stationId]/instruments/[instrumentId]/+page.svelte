@@ -10,6 +10,7 @@
     type AcquisitionTask,
     type Compression,
     createAreaTask,
+    createLineTask,
     createPositionTask,
     deviceReady,
     type DownscaleType,
@@ -201,7 +202,9 @@
   }
 
   function framesOf(item: PlannedVolume): number {
-    return Math.trunc((item.z_end - item.z_start) / item.z_step) + 1;
+    return item.scan
+      ? Math.round((item.scan.end - item.scan.start) / item.scan.spacing)
+      : Math.trunc((item.z_end - item.z_start) / item.z_step) + 1;
   }
 
   function finished(source: AcquisitionManifest): number {
@@ -316,6 +319,15 @@
     if (instrument === target) await goto(resolve(TASK_ROUTE, { ...routeParams, taskId: task.id }));
   }
 
+  async function addLine(): Promise<void> {
+    const target = instrument;
+    const z = target?.stage.z.position?.value;
+    if (!target || !currentPosition || z == null || !currentProfile || locked) return;
+    const task = createLineTask({ ...currentPosition, z }, currentProfile, target.hal.continuous_scan?.axis ?? 'x');
+    await target.addTask(task);
+    if (instrument === target) await goto(resolve(TASK_ROUTE, { ...routeParams, taskId: task.id }));
+  }
+
   async function addArea(): Promise<void> {
     const target = instrument;
     if (!target || !areaBounds || !currentZRange || !currentProfile || !currentFov || locked) return;
@@ -369,6 +381,14 @@
     <Button variant="outline" disabled={!canAddPosition} onclick={() => reportFailure(addAtCurrentPosition())}>
       <Plus class="size-3.5" />
       Position
+    </Button>
+    <Button
+      variant="outline"
+      disabled={!canAddPosition || instrument?.stage.z.position?.value == null || !instrument?.hal.continuous_scan}
+      onclick={() => reportFailure(addLine())}
+      title="Continuous encoder-paced sweep; the other axes remain stationary"
+    >
+      <Plus class="size-3.5" /> X-Scan
     </Button>
     <Button variant="outline" disabled={!canAddArea} onclick={() => reportFailure(addArea())}>
       <Plus class="size-3.5" />
@@ -426,7 +446,7 @@
               >
                 <span class="flex min-w-0 items-center gap-2">
                   <span class="min-w-0 flex-1 truncate text-base text-fg">Task {index + 1}</span>
-                  <Badge>{TASK_TYPES[task.xy.mode]}</Badge>
+                  <Badge>{task.scan ? 'X-Scan' : TASK_TYPES[task.xy.mode]}</Badge>
                   {#if instrument}
                     <span class="text-sm text-fg-muted tabular-nums">{plural(taskVolumes(task.id), 'volume')}</span>
                   {/if}
@@ -601,6 +621,13 @@
               {formatSpatialValue(volume.z_start, unit.value)} to {formatSpatialValue(volume.z_end, unit.value)}
               {unit.label}
             </dd>
+            {#if volume.scan}
+              <dt>{volume.scan.axis.toUpperCase()} scan</dt>
+              <dd>
+                {formatSpatialValue(volume.scan.start, unit.value)}–{formatSpatialValue(volume.scan.end, unit.value)}
+                {unit.label}, {volume.scan.spacing} µm sampling
+              </dd>
+            {/if}
             <dt>Writes to</dt>
             <dd class="font-mono wrap-anywhere">{storageLabel(manifest)}</dd>
           </dl>

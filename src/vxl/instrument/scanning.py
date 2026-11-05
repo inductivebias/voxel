@@ -48,6 +48,7 @@ def plan_continuous_pass(
     info: ContinuousScanInfo,
     pacing: EdgePacing,
     limits: tuple[float, float],
+    runway_s: float | None = None,
 ) -> tuple[ContinuousPass | None, list[str]]:
     """Plan the pass that images ``frames`` planes ``z_step`` apart from ``z_start``.
 
@@ -91,6 +92,17 @@ def plan_continuous_pass(
     end = (
         start + (initial_delay + (frames - 1) * divider + _TRAILING_EDGES) * edge + ramp + speed * (cycle + _LEAD_OUT_S)
     )
+    if runway_s is not None:
+        runway = speed * runway_s
+        edges = runway / edge
+        if not math.isclose(edges, round(edges), rel_tol=1e-9, abs_tol=1e-9):
+            violations.append("runway distance must be a whole number of encoder edges")
+        requested_start = z_start - runway
+        requested_end = z_start + frames * z_step + runway
+        if requested_start > start or requested_end < end:
+            violations.append("runway is too short for acceleration, final exposure, and deceleration")
+        initial_delay = max(1, round(edges) + 1)
+        start, end = requested_start, requested_end
     lower, upper = limits
     if start < lower or end > upper:
         violations.append(

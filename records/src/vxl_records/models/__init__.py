@@ -6,6 +6,7 @@ from .acquisition import (
     AcquisitionOrigin,
     AcquisitionStatus,
     AcquisitionVolume,
+    LineScan,
     PlannedVolume,
     VolumeStatus,
 )
@@ -25,6 +26,7 @@ __all__ = [
     "DatasetFormat",
     "DatasetLocation",
     "DatasetStatus",
+    "LineScan",
     "LocalLocation",
     "LocationRole",
     "LocationStatus",

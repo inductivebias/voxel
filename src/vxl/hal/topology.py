@@ -119,13 +119,14 @@ class OpticalRouting(RootModel[dict[Annotated[str, identifier("Routing dimension
 
 
 class ContinuousScan(FrozenModel):
-    """Acquire each volume in one constant-speed pass of the stage's z (scan) axis instead of stepping it.
+    """Encoder wiring for continuous line tasks and legacy Z-volume scans.
 
-    The axis exports its encoder, ``generator`` starts one waveform cycle per ``z_step`` of travel by
-    dividing the encoder edges, and ``recorder`` records the encoder position of every exposure. The
-    profile sets the speed: one ``z_step`` per ``duration + rest_time``.
+    ``axis`` identifies the physical stage axis exporting its encoder. The generator divides its edges
+    into camera cycles and the recorder latches exposure positions. Speed is task sampling (or legacy
+    ``z_step``) divided by the profile's ``duration + rest_time``. Default Z preserves legacy behavior.
     """
 
+    axis: Literal["x", "y", "z"] = "z"
     generator: str = Field(description="Signal generator that divides the scan axis's encoder edges")
     recorder: str = Field(description="Position recorder that latches the encoder position of each exposure")
     lead_in_edges: int = Field(
