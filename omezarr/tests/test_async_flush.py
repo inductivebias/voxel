@@ -23,12 +23,11 @@ def _read_l0(base: Path, z: int) -> np.ndarray:
 
 
 @pytest.mark.slow
-def test_OMEZarrWriter_async_flush_wrapping_ring_roundtrip(tmp_path: Path) -> None:  # noqa: N802
+@pytest.mark.parametrize("level", [ScaleLevel.L0, ScaleLevel.L6])
+def test_OMEZarrWriter_async_flush_wrapping_ring_roundtrip(tmp_path: Path, level: ScaleLevel) -> None:  # noqa: N802
     """OMEZarrWriter DatasetWriter (via the coordinator): same wrapping-ring invariant."""
     z, y, x = 256, 64, 64
-    cfg = WriterConfig(
-        volume_shape=UIVec3D(z=z, y=y, x=x), voxel_size=UVec3D(z=1.0, y=0.5, x=0.5), max_level=ScaleLevel.L6
-    )
+    cfg = WriterConfig(volume_shape=UIVec3D(z=z, y=y, x=x), voxel_size=UVec3D(z=1.0, y=0.5, x=0.5), max_level=level)
     assert cfg.batch_z == 64
     assert z // cfg.batch_z == 4
     writer = OMEZarrWriter(slots=2)  # BatchSlot (process) — worker does downsample + write off the main GIL
@@ -148,7 +147,7 @@ def test_flush_failure_poisoning_is_sticky(tmp_path: Path, monkeypatch: pytest.M
 @pytest.mark.slow
 def test_wait_ready_storage_failure_raises_before_arming_another_batch(tmp_path: Path) -> None:
     cfg = WriterConfig(
-        volume_shape=UIVec3D(z=2, y=64, x=64),
+        volume_shape=UIVec3D(z=128, y=64, x=64),
         voxel_size=UVec3D(z=1, y=1, x=1),
         max_level=ScaleLevel.L0,
     )
@@ -158,7 +157,7 @@ def test_wait_ready_storage_failure_raises_before_arming_another_batch(tmp_path:
     (tmp_path / "blocked.ome.zarr/0/c").write_text("blocks chunk writes")
     try:
         with suppress(RuntimeError, ValueError):
-            for _ in range(2):
+            for _ in range(cfg.batch_z * 2):
                 with writer.new_frame() as frame:
                     frame.fill(7)
         with pytest.raises(RuntimeError, match="pipeline failure"):

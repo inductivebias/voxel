@@ -61,12 +61,12 @@ def test_batchslot_roundtrip(tmp_path: Path) -> None:
     """End-to-end: a BatchSlot's worker downsamples and writes each batch to a local store; read L0 back
     and verify every frame's value survived. Exercises spawn + bind_output + flush + slot reuse across
     successive batches (the worker opens the writers once, the slot is reassigned after each flush)."""
-    z, y, x = 6, 64, 64
+    z, y, x = 192, 64, 64
     cfg = WriterConfig(
         volume_shape=UIVec3D(z=z, y=y, x=x), voxel_size=UVec3D(z=1.0, y=0.5, x=0.5), max_level=ScaleLevel.L1
     )
     batch_z = cfg.batch_z
-    assert batch_z == 2
+    assert batch_z == 64
     assert z % batch_z == 0  # three full batches
 
     root = Path(f"{tmp_path / 'ds'}.ome.zarr")
@@ -103,17 +103,16 @@ def test_batchslot_roundtrip(tmp_path: Path) -> None:
 
 
 @pytest.mark.slow
-def test_batchslot_concurrent_writers(tmp_path: Path) -> None:
+@pytest.mark.parametrize("level", [ScaleLevel.L0, ScaleLevel.L1, ScaleLevel.L6])
+def test_batchslot_concurrent_writers(tmp_path: Path, level: ScaleLevel) -> None:
     """Several BatchSlot workers write disjoint, shard-aligned z-ranges of the SAME arrays concurrently
     — exactly what the ring does. This is the assumption the whole worker-flush design rests on: with
-    batch_z == shard_z (L6 here), each batch owns whole shards, so concurrent writers from different
-    processes never touch the same shard. Distinct per-slice values mean any cross-writer clobber shows
-    up as a wrong value on read-back."""
+    batch_z == shard_z even below the minimum chunk edge, each batch owns whole shards, so concurrent
+    writers from different processes never touch the same shard. Distinct per-slice values expose
+    cross-writer clobbering as a wrong value on read-back."""
     n_slots, batch_z = 3, 64
     z, y, x = n_slots * batch_z, 64, 64  # 192 frames = 3 shard-aligned batches
-    cfg = WriterConfig(
-        volume_shape=UIVec3D(z=z, y=y, x=x), voxel_size=UVec3D(z=1.0, y=0.5, x=0.5), max_level=ScaleLevel.L6
-    )
+    cfg = WriterConfig(volume_shape=UIVec3D(z=z, y=y, x=x), voxel_size=UVec3D(z=1.0, y=0.5, x=0.5), max_level=level)
     assert cfg.batch_z == batch_z
     assert cfg.shard_shape.z == batch_z  # shard-aligned: one batch = whole shard(s)
 

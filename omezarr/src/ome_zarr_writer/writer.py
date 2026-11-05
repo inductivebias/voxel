@@ -98,7 +98,8 @@ class WriterSettings(BaseModel):
 
     @property
     def batch_z(self) -> int:
-        return self.batch_z_shards * self.shard_z_chunks * self.max_level.factor
+        # Each worker must own complete shards, including the minimum chunk-edge floor.
+        return self.batch_z_shards * self.shard_z_chunks * self.chunk_shape.z
 
 
 class WriterConfig(WriterSettings):
