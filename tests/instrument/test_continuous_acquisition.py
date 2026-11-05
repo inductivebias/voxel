@@ -362,3 +362,27 @@ async def test_automatic_rate_uses_slowest_camera_and_rejects_missing_timing(
         else:
             assert not errors
             assert rate == pytest.approx(min(limits[0], limits[1]) * 0.95 / 1.05)
+
+
+@pytest.mark.parametrize("scan_options", [{"missing_frames": {"camera_1": [1]}}], indirect=True)
+async def test_incomplete_camera_pass_preserves_recorder_evidence(
+    opened_instrument: Instrument, records: SQLiteRecords, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instrument = opened_instrument
+    await add_task(instrument)
+
+    async def incomplete(*_args: Any) -> None:
+        raise RuntimeError("scan stopped with missing camera frames")
+
+    monkeypatch.setattr(instrument, "_await_pass", incomplete)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.FAILED
+    report = json.loads((tmp_path / "data/run/volumes/000001/single_gfp/scan_failure.json").read_text())
+    assert report["error"] == "scan stopped with missing camera frames"
+    assert report["division"]["cycles"] == 2
+    assert "expected 2 exposures, recorded 1" in report["recorder_error"]
+    assert await instrument._hal.recorders["scan_recorder"].get_state() == "idle"
+    laser = instrument._hal.lasers["laser_488"]
+    assert not (await laser.props.get("is_output_enabled")).ok["is_output_enabled"].value

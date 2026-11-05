@@ -2071,7 +2071,36 @@ class Instrument:
         await recorder.mark_motion()
         progress.moving = True
         await axis.start_continuous_scan(planned.end)
-        await self._await_pass(channels, axis, planned)
+        try:
+            await self._await_pass(channels, axis, planned)
+        except Exception as capture_error:
+            # Preserve the recorder's count/spacing evidence before teardown discards it.
+            # Inhibit emission and halt motion first; normal teardown retries any failures.
+            report: dict[str, Any] = {
+                "error": str(capture_error),
+                "start": planned.start,
+                "end": planned.end,
+                "speed": planned.speed,
+                "division": planned.division.model_dump(),
+                "first_exposure": planned.first_exposure,
+                "pacing": pacing,
+                "prepared": prepared,
+            }
+            try:
+                await _disable_lasers_and_halt(self._all_lasers(), axis, halt=True)
+                await self._stop_signal_generators()
+                try:
+                    recorded = await recorder.finish(_RECORDER_FINISH_TIMEOUT_S)
+                    progress.recording = False
+                    report["recorded"] = recorded.model_dump(mode="json")
+                except Exception as recorder_error:
+                    report["recorder_error"] = str(recorder_error)
+                target = self._system.resolve_storage(manifest.storage, subpath).target / "scan_failure.json"
+                await asyncio.to_thread(_write_json, target, report)
+                logger.warning("Continuous scan diagnostics: %s", report.get("recorder_error", "recording saved"))
+            except Exception:
+                logger.exception("Could not save continuous scan failure diagnostics")
+            raise
 
         await generator.wait_until_done(planned.timeout_s)
         recorded = await recorder.finish(_RECORDER_FINISH_TIMEOUT_S)
