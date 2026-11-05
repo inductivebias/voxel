@@ -134,3 +134,21 @@ async def test_typed_handle_shares_property_cache_and_typed_views(handle: Device
 
     assert typed.value.value == 4.0
     assert observed == [4.0]
+
+
+async def test_single_property_read_does_not_copy_unrelated_cache(
+    handle: DeviceHandle, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A small geometry read must not copy a large writer-metrics property."""
+    value = handle.props.property("value", _as_float)
+    await value.get()
+
+    def reject_full_snapshot():
+        raise AssertionError("single property read copied the entire cache")
+
+    monkeypatch.setattr(handle.props, "_cache_snapshot", reject_full_snapshot)
+    assert value.value == 1.0
+    model = value.model
+    assert model is not None
+    model.value = 9.0
+    assert value.value == 1.0  # callers still receive an isolated observation

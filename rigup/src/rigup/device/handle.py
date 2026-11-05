@@ -102,13 +102,13 @@ class DeviceProperty[T](Subscribable[T]):
     @property
     def value(self) -> T | None:
         """Latest parsed value, or ``None`` until the property has been observed/read."""
-        model = self._owner.cache.get(self._name)
+        model = self._owner.cached_model(self._name)
         return None if model is None else self._parser(model.value)
 
     @property
     def model(self) -> PropertyModel | None:
         """Latest full property model, including metadata such as options/bounds when present."""
-        return self._owner.cache.get(self._name)
+        return self._owner.cached_model(self._name)
 
     async def get(self) -> T:
         """Read this property now, update the cache, and emit if the parsed value changed."""
@@ -155,6 +155,11 @@ class DeviceProperties(Subscribable[DeviceProps]):
     def cache(self) -> DeviceProps:
         """Complete latest-successful observations for this handle lifetime."""
         return self._cache_snapshot()
+
+    def cached_model(self, name: str) -> PropertyModel | None:
+        """Copy one cached observation without copying unrelated, potentially large properties."""
+        model = self._cache.get(name)
+        return None if model is None else model.model_copy(deep=True)
 
     def close(self) -> None:
         """Release the shared upstream subscription and discard cached observations."""
