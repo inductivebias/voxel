@@ -1,5 +1,7 @@
 import io
+import subprocess
 from collections.abc import Callable
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -11,8 +13,8 @@ def install_fake_pvcam(
 ) -> None:
     pvc = SimpleNamespace(get_pvcam_version=lambda: "3.10.3.6")
     monkeypatch.setattr(teledyne, "ensure_pvcam_environment", lambda: None)
-    monkeypatch.setattr(teledyne, "pvcam_runtime", lambda: pvc)
-    monkeypatch.setattr(teledyne, "list_pvcam_camera_names", lambda: names)
+    monkeypatch.setattr(teledyne, "pvcam_runtime", lambda **_kwargs: pvc)
+    monkeypatch.setattr(teledyne, "list_pvcam_camera_names", lambda **_kwargs: names)
     monkeypatch.setattr(teledyne, "open_pvcam_device", open_device)
     monkeypatch.setattr(pvcam_diagnose, "_device_nodes", list)
 
@@ -107,3 +109,163 @@ def test_run_serial_without_open_is_a_usage_error(monkeypatch: pytest.MonkeyPatc
         run("--serial", "KX00000001")
 
     assert exited.value.code == 2
+
+
+def test_recover_pvcam_pcie_rescans_kinetix_endpoints_and_reloads_module(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    udevadm = tmp_path / "udevadm"
+    udevadm.write_text("")
+    setpci = tmp_path / "setpci"
+    setpci.write_text("")
+    monkeypatch.setattr(pvcam_diagnose.sys, "platform", "linux")
+    monkeypatch.setattr(pvcam_diagnose.os, "geteuid", lambda: 1000)
+    monkeypatch.setattr(pvcam_diagnose, "_UDEVADM_PATHS", (udevadm,))
+    monkeypatch.setattr(pvcam_diagnose, "_SETPCI_PATHS", (setpci,))
+    monkeypatch.setattr(teledyne, "PVCAM_CLAIM_DIR", tmp_path / "locks")
+    monkeypatch.setattr(teledyne, "try_non_interactive_host_recovery", lambda **_kwargs: False)
+    (tmp_path / "locks").mkdir()
+
+    pci_dir = tmp_path / "pci"
+    bridge_dir = pci_dir / "0000:12:01.0"
+    kinetix_ep = bridge_dir / "0000:13:00.0"
+    kinetix_ep.mkdir(parents=True)
+    (pci_dir / "0000:13:00.0").symlink_to(kinetix_ep)
+    (bridge_dir / "vendor").write_text("0x10b5\n")
+    (bridge_dir / "class").write_text("0x060400\n")
+    (bridge_dir / "power").mkdir()
+    (bridge_dir / "power" / "control").write_text("auto\n")
+    (kinetix_ep / "vendor").write_text("0x1b6b\n")
+    (kinetix_ep / "device").write_text("0x0001\n")
+    (kinetix_ep / "remove").write_text("0\n")
+    (kinetix_ep / "power").mkdir()
+    (kinetix_ep / "power" / "control").write_text("auto\n")
+
+    other_ep = pci_dir / "0000:c1:00.0"
+    other_ep.mkdir(parents=True)
+    (other_ep / "vendor").write_text("0x1093\n")
+    (other_ep / "device").write_text("0xc4c4\n")
+    (other_ep / "remove").write_text("0\n")
+
+    rescan_path = tmp_path / "rescan"
+    rescan_path.write_text("0\n")
+    modules_dir = tmp_path / "modules"
+    (modules_dir / "pvcam_pcie").mkdir(parents=True)
+
+    commands: list[tuple[tuple[str, ...], str | None]] = []
+
+    def fake_run(args: list[str] | tuple[str, ...], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        timeout = kwargs["timeout"]
+        assert isinstance(timeout, int | float)
+        assert timeout > 0
+        input_text = kwargs.get("input")
+        commands.append((tuple(args), str(input_text) if input_text is not None else None))
+        return subprocess.CompletedProcess(args, 0, "", "")
+
+    monkeypatch.setattr(pvcam_diagnose.subprocess, "run", fake_run)
+
+    output = io.StringIO()
+    pvcam_diagnose.recover_pvcam_pcie(
+        output=output,
+        pci_devices_dir=pci_dir,
+        pci_rescan_path=rescan_path,
+        modules_dir=modules_dir,
+        settle_s=0.0,
+        retrain_bridges=True,
+    )
+
+    assert commands == [
+        (("sudo", "modprobe", "-r", "pvcam_pcie"), None),
+        (("sudo", "tee", str(bridge_dir / "power" / "control")), "on\n"),
+        (("sudo", "tee", str(pci_dir / "0000:13:00.0" / "remove")), "1\n"),
+        (("sudo", "setpci", "-s", "0000:12:01.0", "BRIDGE_CONTROL=0x40:0x40"), None),
+        (("sudo", "setpci", "-s", "0000:12:01.0", "BRIDGE_CONTROL=0x00:0x40"), None),
+        (("sudo", "tee", str(rescan_path)), "1\n"),
+        (("sudo", "tee", str(pci_dir / "0000:13:00.0" / "power" / "control")), "on\n"),
+        (("sudo", "modprobe", "pvcam_pcie"), None),
+        (("sudo", "udevadm", "settle", "--timeout=5"), None),
+    ]
+    log = output.getvalue()
+    assert "unloading pvcam_pcie" in log
+    assert "0000:13:00.0" in log
+    assert "0000:12:01.0" in log
+    assert "0000:c1:00.0" not in log
+
+
+def test_recover_pvcam_pcie_refuses_when_interface_is_claimed(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(pvcam_diagnose.sys, "platform", "linux")
+    monkeypatch.setattr(teledyne, "PVCAM_CLAIM_DIR", tmp_path)
+    monkeypatch.setattr(
+        pvcam_diagnose.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("must not run privileged commands while a head is claimed"),
+    )
+
+    claim = teledyne.PvcamClaim("pvcamPCIE_0")
+    try:
+        with pytest.raises(pvcam_diagnose.DiagnosisError, match="in use: pvcamPCIE_0"):
+            pvcam_diagnose.recover_pvcam_pcie(output=io.StringIO(), settle_s=0.0)
+    finally:
+        claim.release()
+
+
+def test_run_recover_invokes_recovery_and_reinitializes_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    recovered: list[bool] = []
+    reinit_flags: list[bool] = []
+    pvc = SimpleNamespace(get_pvcam_version=lambda: "3.10.3.6")
+    monkeypatch.setattr(teledyne, "ensure_pvcam_environment", lambda: None)
+    monkeypatch.setattr(teledyne, "pvcam_runtime", lambda *, reinit=False: (reinit_flags.append(reinit), pvc)[1])
+    monkeypatch.setattr(teledyne, "list_pvcam_camera_names", lambda **_kwargs: ["pvcamPCIE_0"])
+    monkeypatch.setattr(pvcam_diagnose, "_device_nodes", list)
+    monkeypatch.setattr(
+        pvcam_diagnose,
+        "recover_pvcam_pcie",
+        lambda *, output, retrain_bridges=False: (
+            recovered.append(retrain_bridges),
+            output.write("recovered\n"),
+        )[0],
+    )
+
+    status, output, errors = run("--recover")
+
+    assert status == 0, errors
+    assert recovered == [False]
+    assert reinit_flags == [True]
+    assert "recovered" in output
+
+
+def test_run_recover_open_polls_with_bridge_retrain_until_head_boots(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    retrain_calls: list[bool] = []
+    attempts = 0
+    pvc = SimpleNamespace(get_pvcam_version=lambda: "3.10.3.6")
+    monkeypatch.setattr(teledyne, "ensure_pvcam_environment", lambda: None)
+    monkeypatch.setattr(teledyne, "pvcam_runtime", lambda **_kwargs: pvc)
+    monkeypatch.setattr(teledyne, "list_pvcam_camera_names", lambda **_kwargs: ["pvcamPCIE_0"])
+    monkeypatch.setattr(pvcam_diagnose, "_device_nodes", list)
+    monkeypatch.setattr(pvcam_diagnose, "_RETRY_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(
+        pvcam_diagnose,
+        "recover_pvcam_pcie",
+        lambda *, output, retrain_bridges=False: (
+            retrain_calls.append(retrain_bridges),
+            output.write("recover\n"),
+        )[0],
+    )
+
+    def open_device(name: str) -> SimpleNamespace:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise RuntimeError(f"{name}: PL_ERR_DDI_DEVICE_WRITE_FAILED")
+        return SimpleNamespace(identity=identity("KX00000001"), close=lambda: None)
+
+    monkeypatch.setattr(teledyne, "open_pvcam_device", open_device)
+
+    status, output, errors = run("--recover", "--open", "--wait", "1")
+
+    assert status == 0, errors
+    assert retrain_calls == [False, True, True]
+    assert "retry:" in output
+    assert "head=pvcamPCIE_0 serial=KX00000001" in output

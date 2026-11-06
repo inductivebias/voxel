@@ -4,6 +4,7 @@ import fcntl
 import math
 import os
 import re
+import subprocess
 import tempfile
 import threading
 from collections.abc import Mapping
@@ -15,7 +16,6 @@ from types import ModuleType
 from typing import Any, cast
 
 import numpy as np
-from vxl_drivers.utils import thread_safe_singleton
 from vxlib.vector import IVec2D, Vec2D
 
 from rigup import describe, enumerated, numeric, numeric_int
@@ -34,6 +34,7 @@ from vxl.devices.camera.base import (
 )
 
 PVCAM_ROOT = Path("/opt/pvcam")
+PVCAM_RECOVERY_HELPER = Path("/usr/local/sbin/voxel-recover-pvcam")
 DEFAULT_EXPOSURE_US = 10_000
 # Twelve full 3200 x 3200 uint16 Kinetix frames fit in this budget. Larger buffers are
 # configurable, but should not make the first acquisition allocate multiple gigabytes.
@@ -209,25 +210,56 @@ def ensure_pvcam_environment(root: Path = PVCAM_ROOT) -> None:
             os.environ["PVCAM_VERSION"] = version
 
 
-@thread_safe_singleton
-def pvcam_runtime() -> ModuleType:
-    """Initialize PVCAM once per process; it stays initialized for the process lifetime."""
-    ensure_pvcam_environment()
-    try:
-        # The native extension is absent on macOS; importing the driver must remain hardware-free.
-        pvc = import_module("pyvcam.pvc")
-    except ImportError as error:
-        raise KinetixDiscoveryError(
-            "PyVCAM is not importable; it is installed only on Linux/Windows and needs the PVCAM runtime"
-        ) from error
-    pvc.init_pvcam()
-    return pvc
+@dataclass
+class _PvcamRuntimeState:
+    module: ModuleType | None = None
+    initialized: bool = False
+    local_claims: int = 0
 
 
-def list_pvcam_camera_names() -> list[str]:
+_PVCAM_RUNTIME_LOCK = threading.RLock()
+_PVCAM_STATE = _PvcamRuntimeState()
+
+
+def pvcam_runtime(*, reinit: bool = False) -> ModuleType:
+    """Initialize PVCAM once per process, or reinitialize when no local handle holds an interface.
+
+    libpvcam caches the attached interfaces at ``init_pvcam()`` time. If a camera head was powered
+    on or the ``pvcam_pcie`` kernel module was reloaded after this process first initialized PVCAM,
+    calling ``pvcam_runtime(reinit=True)`` while no local handle is open uninitializes and
+    reinitializes ``libpvcam`` so newly enumerated interfaces become visible without restarting.
+    """
+    with _PVCAM_RUNTIME_LOCK:
+        if _PVCAM_STATE.module is None:
+            ensure_pvcam_environment()
+            try:
+                # The native extension is absent on macOS; importing the driver must remain hardware-free.
+                _PVCAM_STATE.module = import_module("pyvcam.pvc")
+            except ImportError as error:
+                raise KinetixDiscoveryError(
+                    "PyVCAM is not importable; it is installed only on Linux/Windows and needs the PVCAM runtime"
+                ) from error
+        pvc = _PVCAM_STATE.module
+        if reinit and _PVCAM_STATE.initialized and _PVCAM_STATE.local_claims == 0:
+            with suppress(Exception):
+                pvc.uninit_pvcam()
+            _PVCAM_STATE.initialized = False
+        if not _PVCAM_STATE.initialized:
+            pvc.init_pvcam()
+            _PVCAM_STATE.initialized = True
+        return pvc
+
+
+def list_pvcam_camera_names(*, reinit_if_empty: bool = True) -> list[str]:
     """Names PVCAM assigns to attached interfaces, e.g. ``pvcamPCIE_0``."""
-    pvc = pvcam_runtime()
-    return [pvc.get_cam_name(index) for index in range(pvc.get_cam_total())]
+    with _PVCAM_RUNTIME_LOCK:
+        was_initialized = _PVCAM_STATE.initialized
+        pvc = pvcam_runtime()
+        total = int(pvc.get_cam_total())
+        if total == 0 and reinit_if_empty and was_initialized and _PVCAM_STATE.local_claims == 0:
+            pvc = pvcam_runtime(reinit=True)
+            total = int(pvc.get_cam_total())
+        return [str(pvc.get_cam_name(index)) for index in range(total)]
 
 
 def _open_claim_file(path: Path) -> int:
@@ -259,6 +291,8 @@ class PvcamClaim:
         except BaseException:
             os.close(fd)
             raise
+        with _PVCAM_RUNTIME_LOCK:
+            _PVCAM_STATE.local_claims += 1
         self._fd: int | None = fd
 
     def release(self) -> None:
@@ -266,6 +300,53 @@ class PvcamClaim:
         if self._fd is not None:
             os.close(self._fd)
             self._fd = None
+            with _PVCAM_RUNTIME_LOCK:
+                _PVCAM_STATE.local_claims = max(0, _PVCAM_STATE.local_claims - 1)
+
+
+def claimed_pvcam_interfaces(claim_dir: Path | None = None) -> list[str]:
+    """Return PVCAM interface names currently claimed via flock by any process on the host."""
+    root = claim_dir if claim_dir is not None else PVCAM_CLAIM_DIR
+    if not root.is_dir():
+        return []
+    claimed: list[str] = []
+    for lock_file in sorted(root.glob("voxel-pvcam-*.lock")):
+        match = re.fullmatch(r"voxel-pvcam-(.+)\.lock", lock_file.name)
+        name = match.group(1) if match else lock_file.stem
+        try:
+            claim = PvcamClaim(name)
+        except PvcamClaimedError:
+            claimed.append(name)
+        except KinetixDiscoveryError:
+            continue
+        else:
+            claim.release()
+    return claimed
+
+
+def try_non_interactive_host_recovery(helper: Path | None = None, *, retrain_bridges: bool = False) -> bool:
+    """Run the installed privileged PCIe/PVCAM recovery helper if present and no head is claimed."""
+    target = helper if helper is not None else PVCAM_RECOVERY_HELPER
+    if not target.is_file():
+        return False
+    with _PVCAM_RUNTIME_LOCK:
+        if _PVCAM_STATE.local_claims > 0:
+            return False
+    if claimed_pvcam_interfaces():
+        return False
+    args = [str(target), "--retrain"] if retrain_bridges else [str(target)]
+    cmd = args if os.geteuid() == 0 else ["sudo", "-n", *args]
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed root-owned recovery helper path, no shell.
+            cmd,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=30.0,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return result.returncode == 0
 
 
 def open_pvcam_device(name: str) -> "PyvcamDevice":
@@ -489,22 +570,10 @@ def describe_error(error: BaseException) -> str:
     return ": ".join(parts) or type(error).__name__
 
 
-def discover_camera(serial: str) -> PyvcamDevice:
-    """Open the PVCAM camera whose head serial number matches ``serial``, closing every other one.
-
-    Heads that another Kinetix or process holds are skipped without being opened.
-    """
-    wanted = serial.strip()
-    if not wanted:
-        raise ValueError("Kinetix serial must not be empty")
-
-    names = list_pvcam_camera_names()
-    if not names:
-        raise KinetixDiscoveryError(
-            "PVCAM enumerated no cameras; check that the pvcam_pcie module created /dev/pvcamPCIE_* "
-            "and that the process can read it"
-        )
-
+def _probe_enumerated_cameras(
+    wanted: str,
+    names: list[str],
+) -> tuple[PyvcamDevice | None, list[str], list[str], list[str]]:
     found: list[str] = []
     failures: list[str] = []
     in_use: list[str] = []
@@ -519,16 +588,59 @@ def discover_camera(serial: str) -> PyvcamDevice:
             continue
         found_serial = device.identity.serial
         if found_serial == wanted:
-            return device
+            return device, found, failures, in_use
         device.close()
         found.append(f"{name}: serial={found_serial!r}")
+    return None, found, failures, in_use
+
+
+def discover_camera(serial: str) -> PyvcamDevice:
+    """Open the PVCAM camera whose head serial number matches ``serial``, closing every other one.
+
+    Heads that another Kinetix or process holds are skipped without being opened. If the first pass
+    finds no matching head and this process holds no open PVCAM handle, ``libpvcam`` is reinitialized
+    (and the non-interactive PCIe recovery helper is invoked when installed and no interface is
+    claimed on the host) so cameras powered on after process startup can be discovered without
+    restarting.
+    """
+    wanted = serial.strip()
+    if not wanted:
+        raise ValueError("Kinetix serial must not be empty")
+
+    with _PVCAM_RUNTIME_LOCK:
+        was_initialized = _PVCAM_STATE.initialized
+    names = list_pvcam_camera_names()
+    if not names and try_non_interactive_host_recovery():
+        pvcam_runtime(reinit=True)
+        names = list_pvcam_camera_names(reinit_if_empty=False)
+    if not names:
+        raise KinetixDiscoveryError(
+            "PVCAM enumerated no cameras; check that the pvcam_pcie module created /dev/pvcamPCIE_* "
+            "and that the process can read it (or run `vxl-pvcam-diagnose --recover --open`)"
+        )
+
+    device, found, failures, in_use = _probe_enumerated_cameras(wanted, names)
+    if device is not None:
+        return device
+
+    with _PVCAM_RUNTIME_LOCK:
+        can_reinit = _PVCAM_STATE.local_claims == 0
+    if can_reinit and not in_use:
+        recovered = try_non_interactive_host_recovery()
+        if recovered or was_initialized:
+            pvcam_runtime(reinit=True)
+            retry_names = list_pvcam_camera_names(reinit_if_empty=False)
+            if retry_names:
+                device, found, failures, in_use = _probe_enumerated_cameras(wanted, retry_names)
+                if device is not None:
+                    return device
 
     busy = f"; in use by another Kinetix or process: {', '.join(in_use)}" if in_use else ""
     if failures and not found:
         raise KinetixDiscoveryError(
             f"PVCAM could not open any camera for serial {wanted!r} ({'; '.join(failures)}{busy}). "
             "A device write timeout means the interface card sees no responding camera head: "
-            "check camera power and the SFF-8644 cable."
+            "check camera power and the SFF-8644 cable, or run `vxl-pvcam-diagnose --recover --open`."
         )
     enumerated = "; ".join(found + failures) or "none opened"
     raise KinetixDiscoveryError(f"no PVCAM camera has serial {wanted!r}; enumerated: {enumerated}{busy}")

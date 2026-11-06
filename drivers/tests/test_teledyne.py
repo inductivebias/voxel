@@ -451,6 +451,111 @@ def test_discover_camera_without_cameras_mentions_device_node(
         teledyne.discover_camera(SERIAL)
 
 
+def test_list_pvcam_camera_names_reinitializes_when_cached_table_is_empty(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(teledyne, "PVCAM_CLAIM_DIR", tmp_path)
+    monkeypatch.setattr(teledyne._PVCAM_STATE, "module", None)
+    monkeypatch.setattr(teledyne._PVCAM_STATE, "initialized", False)
+    monkeypatch.setattr(teledyne._PVCAM_STATE, "local_claims", 0)
+    calls: list[str] = []
+    cam_names: list[str] = []
+
+    pvc_module = ModuleType("pyvcam.pvc")
+    vars(pvc_module).update(
+        init_pvcam=lambda: calls.append("init"),
+        uninit_pvcam=lambda: calls.append("uninit"),
+        get_cam_total=lambda: len(cam_names),
+        get_cam_name=lambda index: cam_names[index],
+        get_pvcam_version=lambda: "3.10.3",
+    )
+    monkeypatch.setitem(sys.modules, "pyvcam.pvc", pvc_module)
+
+    assert teledyne.list_pvcam_camera_names() == []
+    assert calls == ["init"], "first initialization does not immediately uninit when empty"
+
+    def uninit_and_populate() -> None:
+        calls.append("uninit")
+        cam_names[:] = ["pvcamPCIE_0"]
+
+    vars(pvc_module)["uninit_pvcam"] = uninit_and_populate
+    assert teledyne.list_pvcam_camera_names() == ["pvcamPCIE_0"]
+    assert calls == ["init", "uninit", "init"]
+
+
+def test_discover_camera_reinitializes_pvcam_when_powered_on_late_and_no_local_claim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    device = FakeDevice(serial=SERIAL, name="pvcamPCIE_0")
+    monkeypatch.setattr(teledyne, "PVCAM_CLAIM_DIR", tmp_path)
+    monkeypatch.setattr(teledyne._PVCAM_STATE, "initialized", True)
+    monkeypatch.setattr(teledyne._PVCAM_STATE, "local_claims", 0)
+    reinit_calls: list[bool] = []
+    ready = False
+
+    def fake_runtime(*, reinit: bool = False) -> SimpleNamespace:
+        nonlocal ready
+        reinit_calls.append(reinit)
+        if reinit:
+            ready = True
+        return SimpleNamespace(get_pvcam_version=lambda: "3.10.3")
+
+    def open_device(name: str) -> FakeDevice:
+        if not ready:
+            raise RuntimeError(f"{name}: PL_ERR_DDI_DEVICE_WRITE_FAILED")
+        return device
+
+    monkeypatch.setattr(teledyne, "pvcam_runtime", fake_runtime)
+    monkeypatch.setattr(teledyne, "list_pvcam_camera_names", lambda **_kwargs: ["pvcamPCIE_0"])
+    monkeypatch.setattr(teledyne, "open_pvcam_device", open_device)
+    monkeypatch.setattr(teledyne, "try_non_interactive_host_recovery", lambda: False)
+
+    assert teledyne.discover_camera(SERIAL) is device
+    assert reinit_calls == [True]
+
+    # When this process already holds a local claim, discover_camera must never uninit_pvcam.
+    ready = False
+    reinit_calls.clear()
+    claim = teledyne.PvcamClaim("pvcamPCIE_1")
+    try:
+        with pytest.raises(teledyne.KinetixDiscoveryError, match="PL_ERR_DDI_DEVICE_WRITE_FAILED"):
+            teledyne.discover_camera(SERIAL)
+    finally:
+        claim.release()
+    assert reinit_calls == []
+
+
+def test_discover_camera_runs_non_interactive_host_recovery_when_no_cameras_enumerated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    device = FakeDevice(serial=SERIAL, name="pvcamPCIE_0")
+    helper = tmp_path / "voxel-recover-pvcam"
+    helper.write_text("#!/bin/sh\n")
+    monkeypatch.setattr(teledyne, "PVCAM_CLAIM_DIR", tmp_path)
+    monkeypatch.setattr(teledyne, "PVCAM_RECOVERY_HELPER", helper)
+    monkeypatch.setattr(teledyne._PVCAM_STATE, "initialized", False)
+    monkeypatch.setattr(teledyne._PVCAM_STATE, "local_claims", 0)
+    monkeypatch.setattr(teledyne.os, "geteuid", lambda: 1000)
+
+    names: list[str] = []
+    helper_calls: list[tuple[str, ...]] = []
+
+    def fake_run(args: list[str] | tuple[str, ...], **_kwargs: object) -> SimpleNamespace:
+        helper_calls.append(tuple(args))
+        names[:] = ["pvcamPCIE_0"]
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(teledyne.subprocess, "run", fake_run)
+    monkeypatch.setattr(
+        teledyne, "pvcam_runtime", lambda **_kwargs: SimpleNamespace(get_pvcam_version=lambda: "3.10.3")
+    )
+    monkeypatch.setattr(teledyne, "list_pvcam_camera_names", lambda **_kwargs: list(names))
+    monkeypatch.setattr(teledyne, "open_pvcam_device", lambda _name: device)
+
+    assert teledyne.discover_camera(SERIAL) is device
+    assert helper_calls == [("sudo", "-n", str(helper))]
+
+
 def test_constructor_reads_identity_geometry_and_applies_defaults(
     camera: tuple[teledyne.Kinetix, FakeDevice],
 ) -> None:
