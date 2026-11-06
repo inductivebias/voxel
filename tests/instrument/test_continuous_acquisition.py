@@ -3,6 +3,7 @@ import json
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from vxl_records import (
@@ -386,3 +387,101 @@ async def test_incomplete_camera_pass_preserves_recorder_evidence(
     assert await instrument._hal.recorders["scan_recorder"].get_state() == "idle"
     laser = instrument._hal.lasers["laser_488"]
     assert not (await laser.props.get("is_output_enabled")).ok["is_output_enabled"].value
+
+
+async def test_window_is_armed_before_cameras_and_motion(
+    opened_instrument: Instrument,
+    writer: _Writer,
+    records: SQLiteRecords,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    axis = instrument._hal.stage.scanning_axis
+    generator = instrument._hal.signal_generators["daq"]
+    info = await axis.get_continuous_scan_info()
+    pacing = await generator.get_edge_pacing()
+    assert info is not None
+    assert pacing is not None
+    events = []
+
+    async def window_info():
+        return info.model_copy(update={"window_available": True})
+
+    async def window_pacing():
+        return pacing.model_copy(update={"window_source": "pfi6"})
+
+    async def arm(start, end):
+        events.append(("window", start, end))
+
+    original_start = axis.start_continuous_scan
+    original_batch = writer.begin_batch
+
+    async def start(target):
+        events.append(("motion", target))
+        await original_start(target)
+
+    async def batch(frames):
+        events.append(("camera", frames))
+        await original_batch(frames)
+
+    monkeypatch.setattr(axis, "get_continuous_scan_info", window_info)
+    monkeypatch.setattr(generator, "get_edge_pacing", window_pacing)
+    monkeypatch.setattr(axis, "arm_scan_window", arm)
+    monkeypatch.setattr(axis, "start_continuous_scan", start)
+    monkeypatch.setattr(instrument._hal.cameras["camera_1"], "begin_batch", batch)
+    await add_task(instrument)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.COMPLETED
+    assert events[:2] == [("window", 1000, 1160), ("camera", 2)]
+    assert events[2][0] == "motion"
+    scan = json.loads((tmp_path / "data/run/volumes/000001/single_gfp/scan.json").read_text())
+    assert scan["plan"]["window"] == [1000, 1160]
+    assert scan["plan"]["division"]["initial_delay"] == 2
+
+
+@pytest.mark.parametrize("fail", [False, True])
+async def test_continuous_progress_uses_first_camera_before_completion(fail: bool) -> None:
+    """Progress must advance during a pass, including one that subsequently loses a camera."""
+    count = 0
+
+    async def count_a() -> int:
+        nonlocal count
+        count += 5
+        return count
+
+    count_b = AsyncMock(side_effect=AssertionError("second camera must not be queried for progress"))
+
+    async def state() -> CaptureState:
+        if count >= 15:
+            if fail:
+                raise RuntimeError("camera failed")
+            return CaptureState.DONE
+        return CaptureState.COLLECTING
+
+    async def moving() -> bool:
+        return count < 15
+
+    update = AsyncMock()
+    instrument = SimpleNamespace(_update_acquisition=update)
+    channels = {
+        "a": SimpleNamespace(
+            camera=SimpleNamespace(captured_frames=count_a, capture_state=AsyncMock(return_value=CaptureState.DONE))
+        ),
+        "b": SimpleNamespace(camera=SimpleNamespace(captured_frames=count_b, capture_state=state)),
+    }
+    planned = SimpleNamespace(timeout_s=2, division=SimpleNamespace(cycles=20))
+    manifest = object()
+    run = Instrument._await_pass(
+        instrument, channels, SimpleNamespace(continuous_scan_moving=moving), planned, manifest
+    )
+    if fail:
+        with pytest.raises(RuntimeError, match="camera failed"):
+            await run
+    else:
+        await run
+    assert [call.kwargs["frames_captured"] for call in update.call_args_list] == [5, 10, 15]
+    assert all(call.args == (manifest,) for call in update.call_args_list)
+    count_b.assert_not_awaited()

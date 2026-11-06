@@ -271,8 +271,12 @@ class Ring:
 
     def bind_output(self, setup: OutputSetup) -> None:
         """Point every slot's worker at the dataset described by `setup` (open its per-level writers)."""
-        for slot in self.slots:
-            slot.bind_output(setup)
+        if len(self.slots) <= 1:
+            for slot in self.slots:
+                slot.bind_output(setup)
+            return
+        with ThreadPoolExecutor(max_workers=len(self.slots)) as pool:
+            list(pool.map(lambda s: s.bind_output(setup), self.slots))
 
     def close(self) -> None:
         """Tear every slot down (shut its worker, unmap its shared memory), concurrently so the OS page

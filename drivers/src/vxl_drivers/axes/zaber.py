@@ -59,6 +59,7 @@ _SCAN_OUTPUT_SETTLE_S = 0.2
 # scan, so one lost reply on a lossy controller link must not abort it.
 _SCAN_POLL_RETRIES = 3
 _SCAN_STOP_TIMEOUT_S = 5.0
+_ORIGINALS_STORAGE_KEY = "voxel.scan.originals"
 # How far the planned and measured positions may be from a scan's start or target: 1 µm in each unit.
 _SCAN_POSITION_TOLERANCE = {"nm": 1000.0, "um": 1.0, "mm": 0.001}
 
@@ -305,6 +306,8 @@ class ZaberContinuousScanner(ContinuousScanner):
         scale_period: float,
         acceleration: float,
         invalidate_settings: Callable[[], None],
+        window_output: int | None = None,
+        window_triggers: tuple[int, int, int] | None = None,
     ) -> None:
         if encoder < 1:
             raise ValueError(f"scan_encoder must be positive, got {encoder}")
@@ -324,6 +327,20 @@ class ZaberContinuousScanner(ContinuousScanner):
         self._units = units
         self._position_unit, self._velocity_unit, self._acceleration_unit = _UNITS[units]
         self._tolerance = _SCAN_POSITION_TOLERANCE[units]
+        if (window_output is None) != (window_triggers is None):
+            raise ValueError("Configure window output and three trigger IDs together")
+        if window_triggers is not None and (
+            len(window_triggers) != 3 or min(window_triggers) < 1 or len(set(window_triggers)) != 3
+        ):
+            raise ValueError("Window trigger IDs must be distinct positive numbers")
+        self._window_output = window_output
+        self._window_triggers = window_triggers
+        self._window_armed = False
+        if window_output is not None and window_triggers is not None:
+            _check_channel("Window output", window_output, self._device.io.get_channels_info().number_digital_outputs)
+            for number in window_triggers:
+                _check_channel("Window trigger", number, self._device.triggers.get_number_of_triggers())
+            self._disarm_window()
         self._encoder = encoder
         self._enable = f"encoder.{encoder}.out.enable"
         self._interpolation = interpolation
@@ -332,6 +349,7 @@ class ZaberContinuousScanner(ContinuousScanner):
         self._invalidate_settings = invalidate_settings
         rate_limit = scale_period / (interpolation * output_width_ns * 1e-9)
         self._info = ContinuousScanInfo(
+            window_available=window_output is not None,
             edge_spacing=4 * scale_period / interpolation,
             acceleration=acceleration,
             max_speed=_SCAN_SPEED_MARGIN * rate_limit,
@@ -345,15 +363,73 @@ class ZaberContinuousScanner(ContinuousScanner):
             SettingConstants.MOTION_ACCELONLY,
             SettingConstants.MOTION_DECELONLY,
         )
-        self._originals: dict[str, float] | None = None  # Native values, held from prepare until restored.
+        self._originals: dict[str, float] | None = self._load_persisted_originals()
         self._started = False
         self._status_timeouts = 0
-        # Never inherit an output that an earlier session left enabled.
+        # Never inherit an output or scan speed that an earlier session left active.
         self.reset()
 
     @property
     def info(self) -> ContinuousScanInfo:
         return self._info
+
+    @property
+    def is_prepared(self) -> bool:
+        return self._originals is not None
+
+    def _load_persisted_originals(self) -> dict[str, float] | None:
+        storage = getattr(self._axis, "storage", None)
+        if storage is None:
+            return None
+        with self._lock:
+            if not storage.key_exists(_ORIGINALS_STORAGE_KEY):
+                return None
+            raw = storage.get_string(_ORIGINALS_STORAGE_KEY)
+        try:
+            values = [float(part) for part in raw.split(",")]
+        except ValueError:
+            return None
+        if len(values) != len(self._changed) or not all(math.isfinite(value) for value in values):
+            return None
+        return dict(zip(self._changed, values, strict=True))
+
+    def _persist_originals(self) -> None:
+        storage = getattr(self._axis, "storage", None)
+        if storage is None or self._originals is None:
+            return
+        payload = ",".join(f"{self._originals[name]:g}" for name in self._changed)
+        with self._lock:
+            storage.set_string(_ORIGINALS_STORAGE_KEY, payload)
+
+    def _clear_persisted_originals(self) -> None:
+        storage = getattr(self._axis, "storage", None)
+        if storage is None:
+            return
+        with self._lock:
+            storage.erase_key(_ORIGINALS_STORAGE_KEY)
+
+    def update_motion_speed(self, speed: float) -> None:
+        """Update the motion speed that will be restored when the current scan ends."""
+        with self._lock:
+            if self._originals is None:
+                return
+            native = self._axis.settings.convert_to_native_units(
+                SettingConstants.MAXSPEED, speed, self._velocity_unit, round=True
+            )
+            self._originals[SettingConstants.MAXSPEED] = native
+            self._persist_originals()
+
+    def update_motion_acceleration(self, acceleration: float) -> None:
+        """Update the motion acceleration that will be restored when the current scan ends."""
+        with self._lock:
+            if self._originals is None:
+                return
+            native = self._axis.settings.convert_to_native_units(
+                SettingConstants.ACCEL, acceleration, self._acceleration_unit, round=True
+            )
+            self._originals[SettingConstants.MOTION_ACCELONLY] = native
+            self._originals[SettingConstants.MOTION_DECELONLY] = native
+            self._persist_originals()
 
     def _verify_native(self, name: str, expected: float) -> float:
         with self._lock:
@@ -456,6 +532,7 @@ class ZaberContinuousScanner(ContinuousScanner):
             self._originals = {name: self._axis.settings.get(name) for name in self._changed}
             self._status_timeouts = 0
             try:
+                self._persist_originals()
                 self._set_verified(f"encoder.{self._encoder}.out.interpolation", self._interpolation)
                 self._set_verified(f"encoder.{self._encoder}.out.width", self._output_width_ns)
                 self._set_verified(SettingConstants.MAXSPEED, speed, self._velocity_unit)
@@ -483,7 +560,62 @@ class ZaberContinuousScanner(ContinuousScanner):
         # A DAQ counting the exported quadrature counts from the exported encoder's own position.
         return {**state, "origin": state["exported_encoder_position"]}
 
+    def _disarm_window(self) -> None:
+        if self._window_output is None or self._window_triggers is None:
+            return
+        failures = []
+        for number in self._window_triggers:
+            try:
+                self._device.triggers.get_trigger(number).disable()
+            except Exception as error:
+                failures.append(error)
+        try:
+            self._device.io.set_digital_output(self._window_output, DigitalOutputAction.OFF)
+        except Exception as error:
+            failures.append(error)
+        if failures:
+            raise ExceptionGroup("Could not disable scan window", failures)
+        self._window_armed = False
+
+    def arm_window(self, start: float, end: float) -> None:
+        with self._lock:
+            if self._originals is None or self._started:
+                raise RuntimeError("Prepare the scan before arming its window")
+            if self._window_output is None or self._window_triggers is None:
+                raise RuntimeError("No Zaber window output configured")
+            if not all(math.isfinite(v) for v in (start, end)) or start >= end:
+                raise ValueError("Window must have finite increasing bounds")
+            if self._state()["encoder_position"] >= start:
+                raise RuntimeError("Stage must be below the window before arming")
+            self._check_within_limits("window start", start)
+            self._check_within_limits("window end", end)
+            self._disarm_window()
+            try:
+                conditions = (
+                    (start, TriggerCondition.GE, 1),
+                    (end, TriggerCondition.GE, 0),
+                    (start, TriggerCondition.LT, 0),
+                )
+                for number, (position, condition, value) in zip(self._window_triggers, conditions, strict=True):
+                    trigger = self._device.triggers.get_trigger(number)
+                    trigger.fire_when_setting(
+                        self._axis.axis_number, "encoder.pos", condition, position, self._position_unit
+                    )
+                    trigger.on_fire(TriggerAction.A, 0, f"io set do {self._window_output} {value}")
+                    trigger.clear_action(TriggerAction.B)
+                # Lower exit closes the gate on reversal; entry opens only once, so a return
+                # cannot reopen it. Arm both exit guards before permitting entry.
+                self._device.triggers.get_trigger(self._window_triggers[2]).enable()
+                self._device.triggers.get_trigger(self._window_triggers[1]).enable(count=1)
+                self._device.triggers.get_trigger(self._window_triggers[0]).enable(count=1)
+                self._window_armed = True
+            except BaseException:
+                self._disarm_window()
+                raise
+
     def start(self, target: float) -> None:
+        if self._window_output is not None and not self._window_armed:
+            raise RuntimeError("Arm the scan window before motion")
         if not math.isfinite(target):
             raise ValueError(f"scan target must be finite, got {target}")
         with self._lock:
@@ -519,6 +651,10 @@ class ZaberContinuousScanner(ContinuousScanner):
         if self._originals is None:
             return
         failures: list[tuple[str, Exception]] = []
+        try:
+            self._disarm_window()
+        except Exception as error:
+            failures.append(("window off", error))
         for name, value in self._originals.items():
             try:
                 self._set_verified(name, value)
@@ -527,6 +663,7 @@ class ZaberContinuousScanner(ContinuousScanner):
         if failures:
             details = "; ".join(f"{name}: {error}" for name, error in failures)
             raise RuntimeError(f"could not restore Zaber scan settings ({details})") from failures[0][1]
+        self._clear_persisted_originals()
         self._originals = None
         self._started = False
 
@@ -556,6 +693,10 @@ class ZaberContinuousScanner(ContinuousScanner):
 
     def reset(self) -> None:
         failures: list[tuple[str, Exception]] = []
+        try:
+            self._disarm_window()
+        except Exception as error:
+            failures.append(("window off", error))
         if self._originals is not None:
             try:
                 # Restoring speed and acceleration mid-move would change that move.
@@ -695,6 +836,8 @@ class ZaberLinearAxis(ContinuousAxis):
         device_serial: int,
         axis_number: int = 1,
         units: str = "um",
+        speed: float | None = None,
+        acceleration: float | None = None,
         ttl_input: int | None = None,
         ttl_trigger: int | None = None,
         ttl_status_output: int | None = None,
@@ -704,11 +847,24 @@ class ZaberLinearAxis(ContinuousAxis):
         scan_output_width_ns: int | None = None,
         scan_scale_period: float | None = None,
         scan_acceleration: float | None = None,
+        scan_window_output: int | None = None,
+        scan_window_triggers: tuple[int, int, int] | None = None,
     ) -> None:
+        for name, value in (("speed", speed), ("acceleration", acceleration)):
+            if value is not None and (not math.isfinite(value) or value <= 0):
+                raise ValueError(f"{name} must be finite and positive, got {value}")
         _validate_ttl_config(ttl_input, ttl_trigger, ttl_status_output, ttl_status_trigger)
         _validate_scan_config(
             scan_encoder, scan_interpolation, scan_output_width_ns, scan_scale_period, scan_acceleration
         )
+        if (scan_window_output is not None or scan_window_triggers is not None) and scan_encoder is None:
+            raise ValueError("A scan window requires continuous encoder scanning")
+        if scan_window_triggers is not None and set(scan_window_triggers).intersection(
+            number for number in (ttl_trigger, ttl_status_trigger) if number is not None
+        ):
+            raise ValueError("Window and TTL stepping must use distinct trigger IDs")
+        if scan_window_output is not None and scan_window_output == ttl_status_output:
+            raise ValueError("Window and TTL status must use distinct outputs")
         super().__init__(uid=uid, units=units)
         self.hub = hub
         self.device_serial = device_serial
@@ -756,7 +912,13 @@ class ZaberLinearAxis(ContinuousAxis):
                     scale_period=scan_scale_period,
                     acceleration=scan_acceleration,
                     invalidate_settings=self._settings.clear,
+                    window_output=scan_window_output,
+                    window_triggers=scan_window_triggers,
                 )
+            if speed is not None:
+                self.speed = speed
+            if acceleration is not None:
+                self.acceleration = acceleration
         except Exception:
             hub.release_axis(device_serial, axis_number)
             raise
@@ -904,7 +1066,13 @@ class ZaberLinearAxis(ContinuousAxis):
 
     @speed.setter
     def speed(self, value: float) -> None:
-        self._set_setting(SettingConstants.MAXSPEED, value, self._velocity_unit, positive=True)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{SettingConstants.MAXSPEED} must be finite and positive, got {value}")
+        with self.hub.lock:
+            if self._continuous_scanner is not None and self._continuous_scanner.is_prepared:
+                self._continuous_scanner.update_motion_speed(value)
+                return
+            self._set_setting(SettingConstants.MAXSPEED, value, self._velocity_unit, positive=True)
 
     @property
     def acceleration(self) -> float:
@@ -912,7 +1080,13 @@ class ZaberLinearAxis(ContinuousAxis):
 
     @acceleration.setter
     def acceleration(self, value: float) -> None:
-        self._set_setting(SettingConstants.ACCEL, value, self._acceleration_unit, positive=True)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError(f"{SettingConstants.ACCEL} must be finite and positive, got {value}")
+        with self.hub.lock:
+            if self._continuous_scanner is not None and self._continuous_scanner.is_prepared:
+                self._continuous_scanner.update_motion_acceleration(value)
+                return
+            self._set_setting(SettingConstants.ACCEL, value, self._acceleration_unit, positive=True)
 
     @property
     def backlash(self) -> None:

@@ -192,6 +192,12 @@ class FakeDevice:
         self.close_calls += 1
 
 
+@pytest.fixture(autouse=True)
+def isolate_host_recovery(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Mock camera discovery must never invoke the workstation's privileged helper."""
+    monkeypatch.setattr(teledyne, "PVCAM_RECOVERY_HELPER", tmp_path / "not-installed")
+
+
 def install_devices(
     monkeypatch: pytest.MonkeyPatch,
     *devices: FakeDevice,

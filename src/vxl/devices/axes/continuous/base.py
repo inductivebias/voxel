@@ -84,6 +84,7 @@ class ContinuousScanInfo(BaseModel, frozen=True):
         max_speed: Fastest speed the exported encoder signal supports, in axis units per second.
     """
 
+    window_available: bool = False
     edge_spacing: float
     acceleration: float
     max_speed: float
@@ -108,6 +109,10 @@ class ContinuousScanner(ABC):
             The axis state read. Its ``origin`` is the position the exported encoder reports at `start`,
             which a DAQ counting that encoder counts from.
         """
+
+    def arm_window(self, start: float, end: float) -> None:
+        """Arm a one-pass position gate; reset/finish must disable it."""
+        raise NotImplementedError("This axis has no position window output")
 
     @abstractmethod
     def start(self, target: float) -> None:
@@ -145,6 +150,20 @@ class ContinuousAxisController(DeviceController["ContinuousAxis"]):
         self._scan_mode = ScanMode.IDLE
         self._ttl_stepper = device.get_ttl_stepper()
         self._continuous_scanner = device.get_continuous_scanner()
+        unit = "µm" if device.units == "um" else device.units
+        units_by_prop = {
+            "position": unit,
+            "device_position": unit,
+            "lower_limit": unit,
+            "upper_limit": unit,
+            "speed": f"{unit}/s",
+            "acceleration": f"{unit}/s²",
+            "backlash": unit,
+            "home": unit,
+        }
+        for name, prop_units in units_by_prop.items():
+            if (prop := self._interface.properties.get(name)) is not None and not prop.units:
+                prop.units = prop_units
 
     @property
     @describe(label="Scan Mode", stream=True)
@@ -224,6 +243,10 @@ class ContinuousAxisController(DeviceController["ContinuousAxis"]):
         except BaseException:
             self._scan_mode = ScanMode.IDLE
             raise
+
+    @describe(label="Arm Scan Window")
+    async def arm_scan_window(self, start: float, end: float) -> None:
+        await self._run_sync(self._prepared_scanner().arm_window, start, end)
 
     @describe(label="Start Continuous Scan")
     async def start_continuous_scan(self, target: float) -> None:

@@ -244,3 +244,49 @@ class TestDependencyFailures:
         assert not built
         assert errors["root"].error_type == "internal"
         assert errors["dependent"].error_type == "dependency"
+
+
+class TestFallback:
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    async def test_failed_primary_builds_fallback(self, asynchronous: bool) -> None:
+        configs = {
+            "dev": BuildConfig(
+                target="nonexistent.Module",
+                init={},
+                fallback=BuildConfig(target=f"{__name__}._GoodDevice", init={"value": 99}),
+            ),
+        }
+        built, errors = await build_objects_async(configs) if asynchronous else build_objects(configs)
+        assert not errors
+        assert isinstance(built["dev"], _GoodDevice)
+        assert built["dev"].value == 99
+
+    @pytest.mark.parametrize("asynchronous", [False, True])
+    async def test_dependency_fallback_triggers_dependent_fallback_and_passes_to_wrapper(
+        self,
+        asynchronous: bool,
+    ) -> None:
+        configs = {
+            "hub": BuildConfig(
+                target="nonexistent.Hub",
+                init={},
+                fallback=BuildConfig(target=f"{__name__}._GoodDevice", init={"value": 7}),
+            ),
+            "dependent_with_fallback": BuildConfig(
+                target=f"{__name__}._DependentDevice",
+                init={"dependency": "hub"},
+                fallback=BuildConfig(target=f"{__name__}._GoodDevice", init={"value": 11}),
+            ),
+            "wrapper_without_fallback": BuildConfig(
+                target=f"{__name__}._DependentDevice",
+                init={"dependency": "hub"},
+            ),
+        }
+        built, errors = await build_objects_async(configs) if asynchronous else build_objects(configs)
+        assert not errors
+        assert isinstance(built["hub"], _GoodDevice)
+        assert isinstance(built["dependent_with_fallback"], _GoodDevice)
+        assert built["dependent_with_fallback"].value == 11
+        assert isinstance(built["wrapper_without_fallback"], _DependentDevice)
+        assert built["wrapper_without_fallback"].dependency is built["hub"]
+

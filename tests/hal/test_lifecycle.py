@@ -235,3 +235,62 @@ async def test_camera_geometry_reports_failed_and_missing_properties(monkeypatch
         ("hal", "devices", "camera", "pixel_size_um"),
         ("hal", "devices", "camera", "sensor_size_px"),
     }
+
+
+async def test_offline_hardware_devices_fall_back_to_simulated_counterparts() -> None:
+    config = HardwareTopology(
+        devices={
+            "zaber_controller": DeviceConfig(
+                target="vxl_drivers.axes.zaber.ZaberHub",
+                init={"port": "/dev/nonexistent_zaber_port"},
+            ),
+            "x": DeviceConfig(
+                target="vxl_drivers.axes.zaber.ZaberLinearAxis",
+                init={"hub": "zaber_controller", "device_address": 1},
+            ),
+            "y": DeviceConfig(
+                target="vxl_drivers.axes.zaber.ZaberLinearAxis",
+                init={"hub": "zaber_controller", "device_address": 2},
+            ),
+            "z": DeviceConfig(
+                target="vxl_drivers.axes.zaber.ZaberLinearAxis",
+                init={"hub": "zaber_controller", "device_address": 3},
+            ),
+            "filter": DeviceConfig(
+                target="vxl_drivers.axes.fw212c.FW212C",
+                init={"port": "/dev/nonexistent_fw_port", "slots": {0: "BP525", 1: "BP600"}},
+            ),
+            "laser_source": DeviceConfig(
+                target="vxl_drivers.lasers.luxx.LuxxSource",
+                init={"port": "/dev/nonexistent_luxx_port", "wavelength": 488},
+            ),
+            "laser": DeviceConfig(
+                target="vxl.devices.laser.source_only.SourceOnlyLaser",
+                init={"source": "laser_source"},
+            ),
+            "camera": DeviceConfig(
+                target="vxl_drivers.cameras.pvcam.kinetix.Kinetix",
+                init={"serial": "NONEXISTENT_CAMERA", "pixel_size_um": [6.5, 6.5]},
+            ),
+        },
+        stage=StageAxes(x="x", y="y", z="z"),
+        detection={
+            "camera": DetectionAssembly(
+                filter_wheels=["filter"],
+                magnification=1,
+                rotation_deg=0,
+            )
+        },
+        illumination={"laser": IlluminationAssembly()},
+    )
+
+    hal = HAL(config)
+    await hal.open()
+    try:
+        assert "camera" in hal.cameras
+        assert "laser" in hal.lasers
+        assert set(hal.continuous_axes.keys()) == {"x", "y", "z"}
+        assert "filter" in hal.discrete_axes
+    finally:
+        await hal.close()
+

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 
 from pydantic import TypeAdapter
 
-from rigup import DeviceHandle, DeviceInterface, Rig
+from rigup import BuildConfig, DeviceConfig, DeviceHandle, DeviceInterface, NodeConfig, Rig, RigConfig
 from vxl.devices.axes import ContinuousAxisHandle
 from vxl.devices.axes.discrete.base import DiscreteAxisState
 from vxl.devices.axes.discrete.handle import DiscreteAxisHandle
@@ -97,12 +97,125 @@ class RouteDimension:
         return labels.get(state.position) if not state.is_moving and state.position is not None else None
 
 
+def _default_device_fallback(cfg: DeviceConfig) -> BuildConfig | None:
+    """Synthesize a simulated fallback ``BuildConfig`` for known hardware drivers when offline."""
+    if cfg.fallback is not None:
+        return cfg.fallback
+    init = cfg.init
+    match cfg.target:
+        case "vxl_drivers.axes.zaber.ZaberHub":
+            return BuildConfig(target="rigup.Device", init={})
+        case "vxl_drivers.axes.zaber.ZaberLinearAxis":
+            units = str(init.get("units", "um"))
+            speed = float(init.get("speed") or 5000.0)
+            acceleration = float(init.get("acceleration") or 100000.0)
+            scan_edge_spacing = (
+                float(init["scan_scale_period"]) / int(init["scan_interpolation"])
+                if "scan_scale_period" in init and "scan_interpolation" in init
+                else None
+            )
+            scan_acceleration = float(init.get("scan_acceleration") or 20000.0)
+            return BuildConfig(
+                target="vxl.devices.axes.simulated.SimulatedContinuousAxis",
+                init={
+                    "units": units,
+                    "lower_limit": -100_000.0,
+                    "upper_limit": 200_000.0,
+                    "speed": speed,
+                    "acceleration": acceleration,
+                    "scan_edge_spacing": scan_edge_spacing,
+                    "scan_acceleration": scan_acceleration,
+                    "scan_max_speed": max(speed, 5000.0),
+                },
+            )
+        case "vxl_drivers.axes.fw212c.FW212C" if "slots" in init:
+            return BuildConfig(
+                target="vxl.devices.axes.simulated.SimulatedDiscreteAxis",
+                init={"slots": init["slots"]},
+            )
+        case (
+            "vxl_drivers.lasers.luxx.LuxxSource"
+            | "vxl_drivers.lasers.obis.ObisSource"
+            | "vxl_drivers.lasers.obis.source.ObisSource"
+        ):
+            wavelength = float(init.get("wavelength_nm") or init.get("wavelength") or 488.0)
+            return BuildConfig(
+                target="vxl.devices.laser.simulated.SimulatedLaserSource",
+                init={
+                    "wavelength": wavelength,
+                    "max_power_mw": 200.0,
+                    "power_setpoint_mw": 20.0,
+                    "modulation_modes": ["software", "digital"],
+                },
+            )
+        case "vxl.devices.daq.hub_ni.NiDaqmx":
+            return BuildConfig(
+                target="vxl.devices.daq.SimulatedDaqmx",
+                init={"device_name": str(init.get("device_name", "SimDev"))},
+            )
+        case "vxl.devices.daq.clocked.ni.NiSignalGenerator" if "hub" in init and "ports" in init:
+            trigger = init.get("trigger")
+            edge_source = trigger.get("edge_source") if isinstance(trigger, Mapping) else None
+            edge_filter_us = float(trigger.get("edge_filter_us", 0.0)) if isinstance(trigger, Mapping) else 0.0
+            return BuildConfig(
+                target="vxl.devices.daq.SimulatedSignalGenerator",
+                init={
+                    "hub": init["hub"],
+                    "ports": init["ports"],
+                    "edge_source": edge_source,
+                    "edge_filter_us": edge_filter_us,
+                },
+            )
+        case "vxl.devices.daq.recording.ni.NiPositionRecorder" if "markers" in init:
+            return BuildConfig(
+                target="vxl.devices.daq.recording.simulated.SimulatedPositionRecorder",
+                init={
+                    "markers": init["markers"],
+                    "encoder_a": init.get("encoder_a", "pfi1"),
+                    "filter_us": float(init.get("filter_us", 0.0)),
+                },
+            )
+        case target if target.startswith("vxl_drivers.cameras."):
+            return BuildConfig(
+                target="vxl.devices.camera.simulated.SimulatedCamera",
+                init={
+                    "start_delay_s": 0.0,
+                    "stop_delay_s": 0.0,
+                    "frame_source": {
+                        "pattern": "gradient_x",
+                        "sensor_size_px": {"x": 3200, "y": 3200},
+                        "pixel_size_um": {"x": 6.5, "y": 6.5},
+                    },
+                },
+            )
+        case _:
+            return None
+
+
+def _with_simulated_fallbacks(topology: HardwareTopology) -> RigConfig:
+    """Attach default simulated fallbacks to hardware device configs so offline components degrade gracefully."""
+
+    def _enrich(devices: Mapping[str, DeviceConfig]) -> dict[str, DeviceConfig]:
+        return {
+            uid: cfg.model_copy(update={"fallback": fb}) if (fb := _default_device_fallback(cfg)) is not None else cfg
+            for uid, cfg in devices.items()
+        }
+
+    return RigConfig(
+        devices=_enrich(topology.devices),
+        nodes={
+            node_id: NodeConfig(kind=node.kind, address=node.address, devices=_enrich(node.devices))
+            for node_id, node in topology.nodes.items()
+        },
+    )
+
+
 class HAL:
     """Runtime hardware abstraction: opens the rig and exposes typed device handles."""
 
     def __init__(self, topology: HardwareTopology, name: str = "VoxelHAL") -> None:
         self._topology = topology
-        self._rig = Rig(topology, name)
+        self._rig = Rig(_with_simulated_fallbacks(topology), name)
 
         self.cameras: dict[str, CameraHandle] = {}
         self.lasers: dict[str, DeviceHandle] = {}

@@ -98,6 +98,9 @@ class ContinuousAxisHandle(DeviceHandle[ContinuousAxis]):
     async def prepare_continuous_scan(self, start: float, speed: float) -> dict[str, Any]:
         return await self.call("prepare_continuous_scan", start, speed)
 
+    async def arm_scan_window(self, start: float, end: float) -> None:
+        await self.call("arm_scan_window", start, end)
+
     async def start_continuous_scan(self, target: float) -> None:
         await self.call("start_continuous_scan", target)
 

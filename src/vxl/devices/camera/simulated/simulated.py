@@ -86,6 +86,7 @@ class SimulatedCamera(Camera):
         self._roi_width_offset_px = 0
         self._roi_height_offset_px = 0
         self._pixel_format: PixelFormat = "MONO16"
+        self._sensor_mode: str = "Dynamic Range"
         self._binning: int = 1
         self._exposure_time_ms: float = 10.0
         self._frame_rate_hz: float = 1000.0 / (self._exposure_time_ms + self.readout_time_ms)
@@ -119,6 +120,14 @@ class SimulatedCamera(Camera):
     @pixel_format.setter
     def pixel_format(self, pixel_format: str) -> None:
         self._pixel_format = cast("PixelFormat", pixel_format)
+
+    @enumerated(options=["Sensitivity", "Speed", "Dynamic Range", "Sub-Electron"])
+    def sensor_mode(self) -> str:
+        return self._sensor_mode
+
+    @sensor_mode.setter
+    def sensor_mode(self, value: str) -> None:
+        self._sensor_mode = value
 
     @numeric_int(options=BINNING_OPTIONS)
     def binning(self) -> int:

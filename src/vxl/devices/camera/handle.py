@@ -137,6 +137,10 @@ class CameraHandle(DeviceHandle[Camera]):
         """Arm and start grabbing num_frames frames in the background. Poll capture_state for completion."""
         await self.call("begin_batch", num_frames)
 
+    async def captured_frames(self) -> int:
+        """Number of frames collected in the current stack."""
+        return int(await self.call("captured_frames"))
+
     async def capture_state(self) -> CaptureState:
         """Lifecycle of the most recent begin_batch/close_stack. Raises if the task failed."""
         result = await self.call("capture_state")

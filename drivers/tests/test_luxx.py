@@ -344,6 +344,27 @@ def test_source_enable_reads_back_and_disables_when_emission_stays_off(
     assert transport.serial.writes[-1] == b"?LOf\r"
 
 
+def test_source_enable_when_keyswitch_is_off_warns_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport(luxx_488_replies())
+    source = open_fake_luxx(monkeypatch, transport)
+    laser = SourceOnlyLaser("laser_488", source)
+    assert source.keyswitch_on is True
+
+    # Simulate LightHUB keyswitch OFF: bit 6 (0x0040) cleared in GAS, LOn acknowledged without emitting.
+    transport.serial.replies[b"?GAS\r"] = b"!GAS0288\r"
+    transport.serial.replies[b"?LOn\r"] = b"!LOn>\r"
+    assert source.keyswitch_on is False
+
+    laser.source_enable(wait=True)
+    laser.output_enable(wait=True)
+
+    assert laser.is_output_enabled is True
+    assert source.is_source_enabled is False
+    assert source.keyswitch_on is False
+
+
 def test_source_setpoint_keeps_the_request_and_checks_the_12_bit_readback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

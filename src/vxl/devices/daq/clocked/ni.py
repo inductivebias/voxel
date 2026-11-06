@@ -16,7 +16,7 @@ from typing import Annotated, Literal
 
 import numpy as np
 from nidaqmx.constants import AcquisitionType as NiAcqType
-from nidaqmx.constants import Edge, Level, RegenerationMode, TaskMode
+from nidaqmx.constants import Edge, Level, RegenerationMode, TaskMode, TriggerType
 from nidaqmx.task import Task as NiTask
 from nidaqmx.task.channels import COChannel
 from pydantic import BaseModel, ConfigDict, Discriminator, Field, TypeAdapter
@@ -46,6 +46,7 @@ class CounterTrigger(BaseModel):
     output: str | None = None
     edge_source: str | None = None
     edge_filter_us: float = Field(default=0.0, ge=0)
+    window_source: str | None = None
 
 
 class InputTrigger(BaseModel):
@@ -126,7 +127,9 @@ class NiSignalGenerator(SignalGenerator):
         trigger = self._trigger
         if not isinstance(trigger, CounterTrigger) or trigger.edge_source is None:
             return None
-        return EdgePacing(source=trigger.edge_source, filter_s=trigger.edge_filter_us * 1e-6)
+        return EdgePacing(
+            source=trigger.edge_source, filter_s=trigger.edge_filter_us * 1e-6, window_source=trigger.window_source
+        )
 
     # ---- hardware primitives ----
 
@@ -150,7 +153,7 @@ class NiSignalGenerator(SignalGenerator):
         if isinstance(trigger, InputTrigger):
             physical_input_pins = (trigger.source,)
         elif trigger.edge_source is not None:
-            physical_input_pins = (trigger.edge_source,)
+            physical_input_pins = (trigger.edge_source,) + ((trigger.window_source,) if trigger.window_source else ())
         else:
             physical_input_pins = ()
 
@@ -354,7 +357,12 @@ class NiSignalGenerator(SignalGenerator):
         if self._co_task is None or self._ao_task is None:
             # Defensive: should not reach here — InputTrigger + repeat raises in start().
             raise RuntimeError(f"{self.uid}: no CO task to wait on (input-trigger path)")
-        self._co_task.wait_until_done(timeout=timeout_s)
+        if self._edge_paced and self.edge_pacing is not None and self.edge_pacing.window_source:
+            # Called after motion ends: the position gate has closed. A pause-gated counter
+            # must be continuous on NI 6738; exact AO/exposure counts are checked separately.
+            self._co_task.stop()
+        else:
+            self._co_task.wait_until_done(timeout=timeout_s)
         # The counter's last pulse has started the last AO cycle, which may still be playing.
         expected = self._finite_repeat * self._cycle_samples
         generated = self._wait_for_generated(self._ao_task, lambda count: count >= expected)
@@ -450,6 +458,11 @@ class NiSignalGenerator(SignalGenerator):
             divider, channel = self._create_edge_divider(source_path, pacing.filter_s, division)
             readback = self._read_edge_divider(channel, source_path, pacing.filter_s, division)
             readback["ao_trigger_source"] = ao_task.triggers.start_trigger.dig_edge_src
+            if pacing.window_source is not None:
+                pause = divider.triggers.pause_trigger
+                if pause.trig_type != TriggerType.DIGITAL_LEVEL or pause.dig_lvl_when != Level.LOW:
+                    raise RuntimeError("DAQ window gate did not commit as active-high")  # noqa: TRY301
+                readback["window_source"] = pause.dig_lvl_src
             # AO arms first (waits for a trigger), then the divider starts counting edges.
             ao_task.start()
             divider.start()
@@ -490,7 +503,18 @@ class NiSignalGenerator(SignalGenerator):
         # (-200770); an enabled filter qualifies edges on its own clock, so only an
         # unfiltered source is synchronized.
         channel.co_ctr_timebase_dig_sync_enable = filter_s == 0
-        divider.timing.cfg_implicit_timing(sample_mode=NiAcqType.FINITE, samps_per_chan=division.cycles)
+        windowed = self.edge_pacing is not None and self.edge_pacing.window_source is not None
+        if windowed:
+            if self._lease is None or len(self._lease.input_pfi_paths) != 2:
+                raise RuntimeError("Window input was not reserved")
+            pause = divider.triggers.pause_trigger
+            pause.trig_type = TriggerType.DIGITAL_LEVEL
+            pause.dig_lvl_src = self._lease.input_pfi_paths[1]
+            pause.dig_lvl_when = Level.LOW
+        divider.timing.cfg_implicit_timing(
+            sample_mode=NiAcqType.CONTINUOUS if windowed else NiAcqType.FINITE,
+            samps_per_chan=division.cycles,
+        )
         divider.control(TaskMode.TASK_COMMIT)
         return divider, channel
 

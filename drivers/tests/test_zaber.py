@@ -87,14 +87,17 @@ class FakeTrigger:
         self.enabled = False
 
     def enable(self, count: int = 0) -> None:
-        assert count == 0, "steps must repeat until disarmed"
+        self.count = count
         self.enabled = True
 
     def fire_when_io(self, port_type: object, channel: int, condition: object, value: float) -> None:
         self.condition = ("io", port_type, channel, condition, value)
 
-    def fire_when_setting(self, axis: int, setting: str, condition: object, value: float) -> None:
+    def fire_when_setting(
+        self, axis: int, setting: str, condition: object, value: float, unit: object = NATIVE
+    ) -> None:
         self.condition = ("setting", axis, setting, condition, value)
+        self.unit = unit
 
     def on_fire(self, action: object, axis: int, command: str) -> None:
         self.actions[action] = (axis, command)
@@ -136,12 +139,30 @@ class FakeIO:
         self.digital_outputs[channel] = value
 
 
+class FakeStorage:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    def key_exists(self, key: str) -> bool:
+        return key in self.values
+
+    def get_string(self, key: str) -> str:
+        return self.values[key]
+
+    def set_string(self, key: str, value: str) -> None:
+        self.values[key] = value
+
+    def erase_key(self, key: str) -> bool:
+        return self.values.pop(key, None) is not None
+
+
 class FakeAxis:
     def __init__(self, axis_number: int, position: float = 25_000.0) -> None:
         self.axis_number = axis_number
         self.axis_type = zaber.AxisType.LINEAR
         self.device: FakeDevice | None = None
         self.identity = SimpleNamespace(peripheral_name="X-LSM100A", peripheral_serial_number=axis_number + 1000)
+        self.storage = FakeStorage()
         self.settings = FakeSettings(
             {
                 zaber.SettingConstants.LIMIT_MIN: 0.0,
@@ -1085,4 +1106,91 @@ def test_zaber_linear_axis_invalid_scan_config_rejected_without_leaking_the_axis
 
     assert hub.reserve_axis(12345, 1) is x_sdk, "a rejected configuration must release its axis"
     hub.release_axis(12345, 1)
+    hub.close()
+
+
+@pytest.mark.parametrize("cleanup", ["reset", "finish"])
+def test_position_window_arms_once_and_disarms_on_cleanup(controller, monkeypatch, cleanup):
+    hub, _, sdk, _ = controller
+    axis, scanner = scan_axis(hub, monkeypatch, scan_window_output=2, scan_window_triggers=(3, 4, 5))
+    device = sdk.device
+    assert scanner.info.window_available
+    assert device.io.digital_outputs[2] is zaber.DigitalOutputAction.OFF
+    scanner.prepare(start=SCAN_START, speed=2000)
+    with pytest.raises(RuntimeError, match="Arm the scan window"):
+        scanner.start(SCAN_TARGET)
+    scanner.arm_window(26000, 29000)
+    for number, position, value in [(3, 26000, 1), (4, 29000, 0)]:
+        trigger = device.triggers.by_number[number]
+        assert trigger.condition == ("setting", 1, "encoder.pos", zaber.TriggerCondition.GE, position)
+        assert trigger.actions[zaber.TriggerAction.A] == (0, f"io set do 2 {value}")
+        assert trigger.enabled
+        assert trigger.count == 1
+    lower_exit = device.triggers.by_number[5]
+    assert lower_exit.condition == ("setting", 1, "encoder.pos", zaber.TriggerCondition.LT, 26000)
+    assert lower_exit.count == 0
+    assert lower_exit.actions[zaber.TriggerAction.A] == (0, "io set do 2 0")
+    scanner.start(SCAN_TARGET)
+    if cleanup == "finish":
+        sdk.busy = False
+        sdk.settings.values[S.POS] = SCAN_TARGET
+        scanner.finish(SCAN_TARGET)
+    else:
+        scanner.reset()
+    assert not device.triggers.by_number[3].enabled
+    assert not device.triggers.by_number[4].enabled
+    assert device.io.digital_outputs[2] is zaber.DigitalOutputAction.OFF
+    axis.close()
+
+
+def test_window_arming_failure_disables_both_triggers(controller, monkeypatch):
+    hub, _, sdk, _ = controller
+    axis, scanner = scan_axis(hub, monkeypatch, scan_window_output=2, scan_window_triggers=(3, 4, 5))
+    scanner.prepare(start=SCAN_START, speed=2000)
+
+    def fail(*_args, **_kwargs):
+        raise RuntimeError("enable failed")
+
+    monkeypatch.setattr(sdk.device.triggers.by_number[3], "enable", fail)
+    with pytest.raises(RuntimeError, match="enable failed"):
+        scanner.arm_window(26000, 29000)
+    assert not sdk.device.triggers.by_number[4].enabled
+    assert not sdk.device.triggers.by_number[5].enabled
+    assert sdk.device.io.digital_outputs[2] is zaber.DigitalOutputAction.OFF
+    axis.close()
+
+
+def test_continuous_scan_crash_recovery_restores_motion_speed_from_axis_storage(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub, _connection, sdk, _y_sdk = controller
+    axis, scanner = scan_axis(hub, monkeypatch, speed=5000.0, acceleration=25000.0)
+    assert axis.speed == 5000.0
+    assert axis.acceleration == 25000.0
+
+    scanner.prepare(start=SCAN_START, speed=32.5)
+    scanner.start(SCAN_TARGET)
+    assert sdk.settings.values[S.MAXSPEED] == 32.5
+    assert sdk.settings.values["encoder.2.out.enable"] == 1
+    assert sdk.storage.key_exists("voxel.scan.originals")
+
+    # Updating motion speed/acceleration while a scan is prepared updates the stored motion settings
+    # without clobbering the active scan speed mid-scan.
+    axis.speed = 6000.0
+    axis.acceleration = 30000.0
+    assert sdk.settings.values[S.MAXSPEED] == 32.5
+
+    # Simulate an abrupt process crash during the scan (release reservation without calling axis.close()).
+    hub.release_axis(12345, 1)
+
+    # Opening a new ZaberLinearAxis on the same hardware halts the axis, recovers the motion settings
+    # from Zaber axis storage, turns encoder output off, and erases the storage key.
+    recovered, _recovered_scanner = scan_axis(hub, monkeypatch)
+    assert not sdk.busy
+    assert sdk.settings.values["encoder.2.out.enable"] == 0
+    assert recovered.speed == 6000.0
+    assert recovered.acceleration == 30000.0
+    assert not sdk.storage.key_exists("voxel.scan.originals")
+    recovered.close()
     hub.close()

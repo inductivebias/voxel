@@ -358,3 +358,27 @@ class TestNiSignalGeneratorEdgePacing:
         fake.latest("ao_test_ao").out_stream.total_samp_per_chan_generated = 300
         with pytest.raises(RuntimeError, match="expected 400"):
             generator.wait_until_done(timeout_s=2.0)
+
+
+@pytest.mark.parametrize("generated", [300, 400])
+def test_window_gate_uses_continuous_counter_and_checks_exact_cycles(monkeypatch, generated):
+    trigger = CounterTrigger(edge_source="pfi1", window_source="pfi6")
+    generator, fake = _set_up_ni_generator(monkeypatch, trigger)
+    readback = generator.start_paced(_DIVISION)
+    divider = fake.latest("ao_test_divider")
+    pause = divider.triggers.pause_trigger
+    assert pause.trig_type == ni.TriggerType.DIGITAL_LEVEL
+    assert pause.dig_lvl_src == "/Dev1/PFI6"
+    assert pause.dig_lvl_when == Level.LOW
+    assert readback["window_source"] == "/Dev1/PFI6"
+    divider.timing.cfg_implicit_timing.assert_called_once_with(sample_mode=AcquisitionType.CONTINUOUS, samps_per_chan=3)
+    fake.latest("ao_test_ao").out_stream = _FakeOutStream([generated])
+    generator._cycle_samples = 100
+    if generated == 300:
+        generator.wait_until_done(1)
+    else:
+        with pytest.raises(RuntimeError, match="expected 300"):
+            generator.wait_until_done(1)
+    divider.wait_until_done.assert_not_called()
+    assert ("stop", "ao_test_divider") in fake.events
+    generator.teardown()

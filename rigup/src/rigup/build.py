@@ -21,6 +21,7 @@ class BuildConfig(BaseModel):
     # setters (so validation/clamping applies there), but a setattr that raises aborts the
     # device's build with BuildError(error_type="defaults") rather than silently warning.
     defaults: dict[str, Any] | None = None
+    fallback: "BuildConfig | None" = None
 
     def get_obj_class(self) -> type:
         """Dynamically import and return the obj class."""
@@ -48,6 +49,82 @@ type BuildGroupSpec = Mapping[str, BuildConfig]
 type BuildObjectsResult[T] = tuple[Mapping[str, T], Mapping[str, BuildError]]
 
 
+def _check_dependency_status(
+    uid: str,
+    cfg: BuildConfig,
+    cfgs: BuildGroupSpec,
+    deps: set[str],
+    errors: Mapping[str, BuildError],
+    fell_back: set[str],
+    *,
+    single_failed_message: str | None = None,
+) -> tuple[bool, BuildError | None]:
+    """Return ``(force_fallback, error)`` given resolved dependency statuses for ``uid``."""
+    failed_deps = deps & errors.keys()
+    if cfg.fallback is not None and (failed_deps or (deps & fell_back)):
+        fallback_deps = _extract_deps_from_init(cfgs, uid, cfg.fallback.init)
+        if failed_fallback := sorted(fallback_deps & errors.keys()):
+            return False, BuildError(
+                uid=uid,
+                error_type="dependency",
+                message=f"Dependency failed: {', '.join(failed_fallback)}",
+            )
+        return True, None
+    if failed_deps:
+        msg = single_failed_message or f"Dependency failed: {', '.join(sorted(failed_deps))}"
+        return False, BuildError(uid=uid, error_type="dependency", message=msg)
+    return False, None
+
+
+def _record_build_result[T](
+    uid: str,
+    obj: T | None,
+    error: BuildError | None,
+    used_fallback: bool,
+    built: dict[str, T],
+    errors: dict[str, BuildError],
+    fell_back: set[str],
+) -> T | BuildError:
+    if used_fallback:
+        fell_back.add(uid)
+    if obj is not None:
+        built[uid] = obj
+    if error is not None:
+        errors[uid] = error
+        return error
+    return built[uid]
+
+
+def _filter_layer_groups(
+    layer: list[list[str]],
+    cfgs: BuildGroupSpec,
+    errors: dict[str, BuildError],
+    fell_back: set[str],
+) -> tuple[list[list[str]], set[str]]:
+    valid_groups: list[list[str]] = []
+    force_fallback_uids: set[str] = set()
+    for group in layer:
+        valid_uids: list[str] = []
+        for uid in group:
+            force_fallback, dep_error = _check_dependency_status(
+                uid,
+                cfgs[uid],
+                cfgs,
+                _extract_deps(cfgs, uid),
+                errors,
+                fell_back,
+            )
+            if dep_error is not None:
+                errors[uid] = dep_error
+                continue
+            if force_fallback:
+                force_fallback_uids.add(uid)
+            valid_uids.append(uid)
+        if valid_uids:
+            valid_groups.append(valid_uids)
+    return valid_groups, force_fallback_uids
+
+
 def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildObjectsResult[T]:
     """Build objects from configuration with error accumulation and dependency resolution.
 
@@ -60,6 +137,7 @@ def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildO
         retained in both mappings so the owner can retry cleanup; it cannot be used as a dependency.
     """
     built: dict[str, T] = {}
+    fell_back: set[str] = set()
     errors = {
         uid: BuildError(
             uid=uid,
@@ -70,60 +148,56 @@ def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildO
     }
     building: set[str] = set()
 
+    def _resolve_deps(obj_cfg: BuildConfig, deps: set[str]) -> str | None:
+        for dep_uid in deps:
+            if dep_uid in errors:
+                if obj_cfg.fallback is None:
+                    return f"Dependency '{dep_uid}' failed to build"
+                continue
+            dep_result = _build_one(dep_uid)
+            if isinstance(dep_result, BuildError) and obj_cfg.fallback is None:
+                return f"Dependency '{dep_uid}' failed: {dep_result.message}"
+        return None
+
     def _build_one(uid: str) -> T | BuildError:
         """Build a single obj, resolving dependencies first."""
         if uid in errors:
             return errors[uid]
         if uid in built:
             return built[uid]
-
         if uid in building:
-            error = BuildError(
+            errors[uid] = BuildError(
                 uid=uid,
                 error_type="circular",
                 message=f"Circular dependency detected for obj '{uid}'",
             )
-            errors[uid] = error
-            return error
+            return errors[uid]
 
         building.add(uid)
         try:
             obj_cfg = cfgs[uid]
-
-            # Build dependencies first
             deps = _extract_deps(cfgs, uid)
-            for dep_uid in deps:
-                if dep_uid in errors:
-                    error = BuildError(
-                        uid=uid,
-                        error_type="dependency",
-                        message=f"Dependency '{dep_uid}' failed to build",
-                    )
-                    errors[uid] = error
-                    return error
+            first_failure = _resolve_deps(obj_cfg, deps)
+            force_fallback, dep_error = _check_dependency_status(
+                uid,
+                obj_cfg,
+                cfgs,
+                deps,
+                errors,
+                fell_back,
+                single_failed_message=first_failure,
+            )
+            if dep_error is not None:
+                errors[uid] = dep_error
+                return dep_error
 
-                dep_result = _build_one(dep_uid)
-                if isinstance(dep_result, BuildError):
-                    error = BuildError(
-                        uid=uid,
-                        error_type="dependency",
-                        message=f"Dependency '{dep_uid}' failed: {dep_result.message}",
-                    )
-                    errors[uid] = error
-                    return error
-
-            obj, error = _construct(uid, obj_cfg, built, base_cls)
-            if obj is not None:
-                built[uid] = obj
-            if error is not None:
-                errors[uid] = error
-                return error
-            return built[uid]
-
+            obj, error, used_fallback = _construct_with_fallback(
+                uid, obj_cfg, built, base_cls, force_fallback=force_fallback
+            )
+            return _record_build_result(uid, obj, error, used_fallback, built, errors, fell_back)
         finally:
             building.discard(uid)
 
-    # Build all objects
     for uid in cfgs:
         if uid not in built and uid not in errors:
             _build_one(uid)
@@ -131,8 +205,8 @@ def build_objects[T](cfgs: BuildGroupSpec, base_cls: type[T] = object) -> BuildO
     return built, errors
 
 
-def _extract_deps(cfgs: BuildGroupSpec, uid: str) -> set[str]:
-    """Extract device UIDs referenced in a device's init kwargs."""
+def _extract_deps_from_init(cfgs: BuildGroupSpec, uid: str, init: Mapping[str, Any]) -> set[str]:
+    """Extract device UIDs referenced in an init kwargs mapping."""
     deps: set[str] = set()
 
     def scan(value: Any) -> None:
@@ -145,9 +219,14 @@ def _extract_deps(cfgs: BuildGroupSpec, uid: str) -> set[str]:
             for v in value.values():
                 scan(v)
 
-    for v in cfgs[uid].init.values():
+    for v in init.values():
         scan(v)
     return deps
+
+
+def _extract_deps(cfgs: BuildGroupSpec, uid: str) -> set[str]:
+    """Extract device UIDs referenced in a device's init kwargs."""
+    return _extract_deps_from_init(cfgs, uid, cfgs[uid].init)
 
 
 def _find_cyclic_uids(cfgs: BuildGroupSpec) -> set[str]:
@@ -268,11 +347,52 @@ def _construct[T](
         return obj, BuildError(uid=uid, error_type=phase, message=message, traceback=trace)
 
 
+def _construct_with_fallback[T](
+    uid: str,
+    cfg: BuildConfig,
+    built: Mapping[str, T],
+    base_cls: type[T],
+    *,
+    force_fallback: bool = False,
+) -> tuple[T | None, BuildError | None, bool]:
+    """Construct ``cfg`` or its ``fallback``, returning ``(obj, error, used_fallback)``."""
+    if force_fallback and cfg.fallback is not None:
+        logger.warning(
+            "Device '%s' (%s) using fallback %s because its hardware dependency is offline",
+            uid,
+            cfg.target,
+            cfg.fallback.target,
+        )
+        obj, error = _construct(uid, cfg.fallback, built, base_cls)
+        return obj, error, error is None
+
+    obj, error = _construct(uid, cfg, built, base_cls)
+    if error is None or cfg.fallback is None or obj is not None:
+        return obj, error, False
+
+    logger.warning(
+        "Device '%s' (%s) unavailable (%s); falling back to %s",
+        uid,
+        cfg.target,
+        error.message,
+        cfg.fallback.target,
+    )
+    fallback_obj, fallback_error = _construct(uid, cfg.fallback, built, base_cls)
+    return fallback_obj, fallback_error, fallback_error is None
+
+
 def _build_group_sync[T](
-    group: list[str], cfgs: BuildGroupSpec, built: dict[str, T], base_cls: type[T]
-) -> list[tuple[str, T | None, BuildError | None]]:
+    group: list[str],
+    cfgs: BuildGroupSpec,
+    built: dict[str, T],
+    base_cls: type[T],
+    force_fallback_uids: set[str] | None = None,
+) -> list[tuple[str, T | None, BuildError | None, bool]]:
     # Driver groups are serialized; prior-layer objects are read-only in worker threads.
-    return [(uid, *_construct(uid, cfgs[uid], built, base_cls)) for uid in group]
+    forced = force_fallback_uids or set()
+    return [
+        (uid, *_construct_with_fallback(uid, cfgs[uid], built, base_cls, force_fallback=uid in forced)) for uid in group
+    ]
 
 
 def _prewarm_parent_modules(cfgs: BuildGroupSpec) -> None:
@@ -287,6 +407,9 @@ def _prewarm_parent_modules(cfgs: BuildGroupSpec) -> None:
     before any worker touches it.
     """
     parents = {cfg.target.rsplit(".", 1)[0] for cfg in cfgs.values()}
+    for cfg in cfgs.values():
+        if cfg.fallback is not None:
+            parents.add(cfg.fallback.target.rsplit(".", 1)[0])
     for mod_name in sorted(parents):
         with suppress(Exception):
             importlib.import_module(mod_name)
@@ -314,26 +437,10 @@ async def build_objects_async[T](cfgs: BuildGroupSpec, base_cls: type[T] = objec
     buildable = {uid: cfg for uid, cfg in cfgs.items() if uid not in cyclic}
     layers = _topological_layers(buildable)
     built: dict[str, T] = {}
+    fell_back: set[str] = set()
 
     for layer in layers:
-        # Skip devices whose dependencies failed
-        valid_groups: list[list[str]] = []
-        for group in layer:
-            valid_uids: list[str] = []
-            for uid in group:
-                deps = _extract_deps(cfgs, uid)
-                failed_deps = deps & errors.keys()
-                if failed_deps:
-                    errors[uid] = BuildError(
-                        uid=uid,
-                        error_type="dependency",
-                        message=f"Dependency failed: {', '.join(sorted(failed_deps))}",
-                    )
-                else:
-                    valid_uids.append(uid)
-            if valid_uids:
-                valid_groups.append(valid_uids)
-
+        valid_groups, force_fallback_uids = _filter_layer_groups(layer, cfgs, errors, fell_back)
         if not valid_groups:
             continue
 
@@ -342,7 +449,10 @@ async def build_objects_async[T](cfgs: BuildGroupSpec, base_cls: type[T] = objec
 
         # Build groups concurrently, each group sequential in its own thread
         group_results = await asyncio.gather(
-            *(asyncio.to_thread(_build_group_sync, group, cfgs, built, base_cls) for group in valid_groups),
+            *(
+                asyncio.to_thread(_build_group_sync, group, cfgs, built, base_cls, force_fallback_uids)
+                for group in valid_groups
+            ),
             return_exceptions=True,
         )
 
@@ -360,11 +470,10 @@ async def build_objects_async[T](cfgs: BuildGroupSpec, base_cls: type[T] = objec
                         traceback=formatted_traceback,
                     )
                 continue
-            for uid, obj, error in group_result:
-                if obj is not None:
-                    built[uid] = obj
-                if error is not None:
-                    errors[uid] = error
+            for item in group_result:
+                uid, obj, error = item[0], item[1], item[2]
+                used_fallback = item[3] if len(item) > 3 else False
+                _record_build_result(uid, obj, error, used_fallback, built, errors, fell_back)
 
     return built, errors
 

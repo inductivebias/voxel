@@ -7,7 +7,109 @@ from time import monotonic, sleep
 from rigup import numeric
 
 from .base import Laser
-from .source import ModulationMode
+from .source import LaserSource, ModulationMode
+
+
+class SimulatedLaserSource(LaserSource):
+    """Simulated ``LaserSource`` for standalone or ``SourceOnlyLaser``-wrapped use."""
+
+    def __init__(
+        self,
+        uid: str,
+        *,
+        wavelength: float,
+        max_power_mw: float = 200.0,
+        power_setpoint_mw: float = 20.0,
+        modulation_modes: tuple[ModulationMode | str, ...] = (ModulationMode.SOFTWARE, ModulationMode.DIGITAL),
+        source_enable_delay_s: float = 0.0,
+        power_noise_percent: float = 0.5,
+    ) -> None:
+        if isinstance(wavelength, bool) or not isfinite(wavelength) or wavelength <= 0:
+            raise ValueError("wavelength must be finite and positive in nm")
+        if not isfinite(max_power_mw) or max_power_mw <= 0:
+            raise ValueError("max_power_mw must be finite and positive")
+        if not isfinite(power_setpoint_mw) or not 0 <= power_setpoint_mw <= max_power_mw:
+            raise ValueError("power_setpoint_mw must be within 0..max_power_mw")
+        if not isfinite(source_enable_delay_s) or source_enable_delay_s < 0:
+            raise ValueError("source_enable_delay_s must be finite and non-negative")
+        if not isfinite(power_noise_percent) or power_noise_percent < 0:
+            raise ValueError("power_noise_percent must be finite and non-negative")
+        if not modulation_modes or any(mode not in tuple(ModulationMode) for mode in modulation_modes):
+            raise ValueError("modulation_modes must contain software, digital, or analog choices")
+        super().__init__(uid=uid)
+        self._wavelength = float(wavelength)
+        self._max_power_mw = float(max_power_mw)
+        self._modulation_modes = tuple(ModulationMode(mode) for mode in modulation_modes)
+        self._modulation_mode = self._modulation_modes[0]
+        self._source_enabled = False
+        self._source_enable_delay_s = float(source_enable_delay_s)
+        self._power_noise_percent = float(power_noise_percent)
+        self._source_ready_at = 0.0
+        self._power_setpoint_mw = float(power_setpoint_mw)
+        self._closed = False
+
+    @property
+    def wavelength(self) -> float:
+        return self._wavelength
+
+    def source_enable(self, *, wait: bool = False) -> None:
+        self._ensure_open()
+        if not self._source_enabled:
+            self._source_ready_at = monotonic() + self._source_enable_delay_s
+            self._source_enabled = True
+        if wait:
+            self._wait_for_source()
+
+    def source_disable(self) -> None:
+        self._source_enabled = False
+
+    @property
+    def is_source_enabled(self) -> bool:
+        return self._source_enabled
+
+    @numeric(minimum=0.0, maximum=lambda self: self._max_power_mw)
+    def source_power_setpoint_mw(self) -> float:
+        return self._power_setpoint_mw
+
+    @source_power_setpoint_mw.setter
+    def source_power_setpoint_mw(self, value: float) -> None:
+        self._ensure_open()
+        self._power_setpoint_mw = float(value)
+
+    @property
+    def source_power_mw(self) -> float:
+        if not self._source_enabled or monotonic() < self._source_ready_at:
+            return 0.0
+        if self._power_noise_percent == 0 or self._power_setpoint_mw == 0:
+            return self._power_setpoint_mw
+        deviation = self._power_setpoint_mw * self._power_noise_percent / 100.0
+        return max(0.0, gauss(self._power_setpoint_mw, deviation))
+
+    @property
+    def temperature_c(self) -> float:
+        return 25.0
+
+    def _get_modulation_modes(self) -> tuple[ModulationMode, ...]:
+        return self._modulation_modes
+
+    def _read_modulation_mode(self) -> ModulationMode:
+        return self._modulation_mode
+
+    def _configure_modulation_mode(self, mode: ModulationMode) -> None:
+        self._ensure_open()
+        self._modulation_mode = mode
+
+    def close(self) -> None:
+        self.source_disable()
+        self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise RuntimeError("laser is closed")
+
+    def _wait_for_source(self) -> None:
+        if remaining := max(0.0, self._source_ready_at - monotonic()):
+            sleep(remaining)
 
 
 class SimulatedLaser(Laser):

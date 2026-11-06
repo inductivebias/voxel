@@ -29,6 +29,7 @@ class FakeTransport:
             "SOUR:POW:LEV?": b"0.0095\r\n",
             "SOUR:TEMP:BAS?": b"25.0C\r\n",
             "SYST:FAUL?": b"0\r\n",
+            "SYST:LOCK?": b"ON\r\n",
             "SYST:STAT?": READY,
         }
         # Status polls that still report warm-up; a warming module ignores SOUR:AM:STAT ON.
@@ -328,6 +329,27 @@ def test_obis_source_enable_with_wait_lets_warm_up_finish_first(
     assert source.is_source_enabled
     assert transport.writes.count("SYST:STAT?") == 4
     assert transport.writes.count("SOUR:AM:STAT ON") == 1
+
+
+def test_obis_source_enable_when_keyswitch_interlock_is_off_warns_without_raising(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    transport = FakeTransport()
+    source = open_source(monkeypatch, transport)
+    assert source.interlock_closed is True
+
+    # Simulate LightHUB keyswitch OFF: SYST:LOCK? is OFF and SOUR:AM:STAT ON is ignored.
+    transport.replies["SYST:LOCK?"] = b"OFF\r\n"
+    transport.replies["SOUR:AM:STAT ON"] = b"OK\r\n"
+    assert source.interlock_closed is False
+
+    laser = SourceOnlyLaser("laser_561", source)
+    laser.source_enable(wait=True)
+    laser.output_enable(wait=True)
+
+    assert laser.is_output_enabled is True
+    assert source.is_source_enabled is False
+    assert source.interlock_closed is False
 
 
 def test_obis_source_enable_with_wait_gives_up_after_the_startup_timeout(

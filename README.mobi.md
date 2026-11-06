@@ -125,3 +125,25 @@ or independent fix, then remove the equivalent fork change when upstream provide
 branches temporary and fold validated code into `mobi`; record physical commissioning status
 separately from branch membership. Avoid a parallel patch-overlay build or a second implementation
 of acquisition when the normal Voxel path can serve the same workflow.
+
+
+## Optional position window for encoder-paced scans
+
+A Zaber scanner can reserve a controller digital output with `scan_window_output` and three
+`scan_window_triggers` (entry, upper exit, lower exit). The NI counter trigger must also name
+its corresponding TTL-level PFI input as `window_source`. Both sides must be configured together;
+the existing encoder A/B signals remain continuous for position recording. Dedicated trigger IDs
+and the output must not be shared with another axis's stepping/status configuration.
+
+The gate opens once when measured position reaches the scan start, closes at the exclusive scan
+end, and closes if position reverses below the start. It cannot reopen during that pass. Initialization,
+normal finish, cancellation, failure cleanup, and device close disable the gate. This is controller
+trigger logic, not a process-independent safety interlock or a direction-aware position comparator.
+Reversals within the window can still affect encoder-A edge division and are checked by the recorder.
+
+NI 6738 pause gating requires a continuous counter task. Windowed acquisitions therefore validate
+exact AO cycle and exposure counts after the pass rather than relying on a finite counter pulse limit.
+The divider starts two encoder edges after window entry (the supported minimum), introducing an
+encoder-phase offset relative to the boundary; recorded exposure positions remain authoritative.
+The window and committed gate input are retained in scan metadata. A physical gate/polarity and
+position-timing test is required before enabling this optional mode on an instrument.

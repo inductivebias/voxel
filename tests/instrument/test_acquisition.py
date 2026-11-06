@@ -117,7 +117,7 @@ async def test_acquisition_manifest_tracks_completed_dataset(
     assert persisted.state_snapshot == instrument.state.value.model_dump(mode="json")
     assert (tmp_path / "data/run/manifest.json").is_file()
     assert not (tmp_path / "data/run/record.json").exists()
-    assert writer.released
+    assert not writer.released
     assert isinstance(instrument.activity.value, IdleActivity)
 
 
@@ -139,7 +139,7 @@ async def test_writer_close_failure_marks_dataset_and_acquisition_failed(
     assert persisted.volumes[0].status is VolumeStatus.FAILED
     assert dataset.status is DatasetStatus.PARTIAL
     assert dataset.locations[0].status is LocationStatus.FAILED
-    assert writer.released
+    assert not writer.released
     assert isinstance(instrument.activity.value, CaptureActivity)
     with pytest.raises(InstrumentBusyError, match="already in progress"):
         await instrument.start_acquisition(AcquisitionRequest(storage=storage))
@@ -168,7 +168,7 @@ async def test_profile_preparation_failure_still_stops_daq_and_finalizes_volume(
     assert manifest.status is AcquisitionStatus.FAILED
     assert manifest.volumes[0].status is VolumeStatus.FAILED
     assert stopped
-    assert writer.released
+    assert not writer.released
     laser = instrument._hal.lasers["laser_488"]
     assert not (await laser.props.get("is_output_enabled")).ok["is_output_enabled"].value
 
@@ -202,6 +202,35 @@ async def test_capture_uses_profile_lasers_independently_of_camera(
     await asyncio.wait_for(instrument.wait_acquisition(), timeout=5)
     assert (await records.acquisitions.get(manifest.id)).status is AcquisitionStatus.COMPLETED
     assert observed == [set(selected)]
-    assert writer.released
+    assert not writer.released
     for laser in instrument._hal.lasers.values():
         assert not await laser.props.get_value("is_output_enabled")
+
+
+async def test_acquisition_skips_unchanged_camera_reconfiguration(
+    opened_instrument: Instrument,
+    writer: _Writer,
+    records: SQLiteRecords,
+) -> None:
+    instrument = opened_instrument
+    camera = instrument.active_channels["gfp"].camera
+    await instrument.set_device_properties("camera_1", {"exposure_time_ms": 15.0})
+    await camera.props.refresh()
+    await camera.roi.get()
+    await camera.sensor_size_px.get()
+
+    set_calls: list[dict[str, object]] = []
+    orig_set = camera.props.set
+
+    async def record_set(**props: object):
+        set_calls.append(props)
+        return await orig_set(**props)
+
+    camera.props.set = record_set  # type: ignore[method-assign]
+    manifest = await instrument.start_acquisition(
+        AcquisitionRequest(storage=StorageSpec(path=PurePosixPath("no-camera-reconfig")))
+    )
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=5)
+    assert (await records.acquisitions.get(manifest.id)).status is AcquisitionStatus.COMPLETED
+    assert not writer.released
+    assert set_calls == []

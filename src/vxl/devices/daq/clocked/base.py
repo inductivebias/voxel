@@ -29,6 +29,7 @@ class EdgeDivision(BaseModel, frozen=True):
 class EdgePacing(BaseModel, frozen=True):
     """A generator's ability to pace cycles by external edges."""
 
+    window_source: str | None = None
     source: str  # terminal that supplies the edges, as configured (e.g. "pfi1")
     filter_s: float  # requested minimum pulse width of the source's digital filter; 0 = unfiltered
 

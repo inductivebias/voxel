@@ -1357,18 +1357,43 @@ class Instrument:
         if invalid := set(profile.props) - self._settable_devices():
             msg = f"devices not settable for profile '{self._active_profile_id.value}': {sorted(invalid)}"
             raise OperationRejectedError(msg)
-        for device_id in sorted(profile.props):
-            props = profile.props[device_id]
-            if props:
-                result = await self._hal.devices[device_id].props.set(**props)
-                if not result.is_ok:
-                    failed = sorted(name for name, prop_result in result.results.items() if not prop_result.is_ok)
-                    raise OperationRejectedError(f"Unable to apply properties {failed} to device '{device_id}'")
+        capturing = isinstance(self._activity.value, CaptureActivity)
+
+        async def _apply_device_props(device_id: str, props: Mapping[str, Any]) -> None:
+            handle = self._hal.devices[device_id]
+            if capturing and device_id in self._hal.cameras:
+                props = {
+                    name: value
+                    for name, value in props.items()
+                    if (cached := handle.props.cached_model(name)) is None or cached.value != value
+                }
+            if not props:
+                return
+            result = await handle.props.set(**props)
+            if not result.is_ok:
+                failed = sorted(name for name, prop_result in result.results.items() if not prop_result.is_ok)
+                raise OperationRejectedError(f"Unable to apply properties {failed} to device '{device_id}'")
+
+        await asyncio.gather(
+            *(_apply_device_props(device_id, profile.props[device_id]) for device_id in sorted(profile.props))
+        )
         coros = []
         for ch_id, ch in self.active_channels.items():
             roi = profile.rois.get(self._channel_config(ch_id).detection)
-            coros.append(ch.camera.update_roi(roi) if roi is not None else ch.camera.reset_roi())
-        await asyncio.gather(*coros)
+            if not capturing:
+                coros.append(ch.camera.update_roi(roi) if roi is not None else ch.camera.reset_roi())
+                continue
+            current_roi = ch.camera.roi.value
+            if roi is not None:
+                if current_roi != roi:
+                    coros.append(ch.camera.update_roi(roi))
+            else:
+                sensor_size = ch.camera.sensor_size_px.value
+                full_roi = SensorROI(w=sensor_size.x, h=sensor_size.y) if sensor_size is not None else None
+                if full_roi is None or current_roi != full_roi:
+                    coros.append(ch.camera.reset_roi())
+        if coros:
+            await asyncio.gather(*coros)
         await self.fov.get()
 
     async def _apply_filters(self) -> None:
@@ -1693,16 +1718,8 @@ class Instrument:
                 logger.exception("Failed to persist failure for acquisition %s", manifest.id)
             logger.exception("Acquisition aborted")
         finally:
-            # Free each camera's writer ring (workers + ~hundreds of GB shared memory) now the run is
-            # over — it's kept resident across volumes for reuse, but not indefinitely afterward. The
-            # next acquisition re-allocates it cold. Runs on completion, failure, or cancellation.
-            released = await asyncio.gather(
-                *(cam.release_writer() for cam in self._hal.cameras.values()), return_exceptions=True
-            )
-            for cam_id, result in zip(self._hal.cameras, released, strict=True):
-                if isinstance(result, BaseException):
-                    logger.warning("release_writer failed for %s: %r", cam_id, result)
-                    self._cleanup_errors.append(result if isinstance(result, Exception) else RuntimeError(str(result)))
+            # Keep each camera's writer ring resident across acquisitions so subsequent runs reuse
+            # its workers and shared memory unless the batch geometry changes (or the instrument closes).
             if not self._cleanup_errors:
                 await self._activity.set(IdleActivity())
             else:
@@ -1954,15 +1971,18 @@ class Instrument:
     ) -> tuple[float | None, list[str]]:
         rates: list[float] = []
         errors: list[str] = []
-        for camera_id in {self._channel_config(uid).detection for uid in profile.channels}:
-            try:
-                limit = await self._hal.cameras[camera_id].props.get_value("acquisition_rate_limit_hz")
-                if limit is None or not math.isfinite(float(limit)) or float(limit) <= 0:
-                    errors.append(f"camera '{camera_id}' has no valid acquisition timing")
-                else:
-                    rates.append(float(limit))
-            except Exception as error:
-                errors.append(f"camera '{camera_id}' timing query failed: {error}")
+        camera_ids = sorted({self._channel_config(uid).detection for uid in profile.channels})
+        results = await asyncio.gather(
+            *(self._hal.cameras[cid].props.get_value("acquisition_rate_limit_hz") for cid in camera_ids),
+            return_exceptions=True,
+        )
+        for camera_id, limit in zip(camera_ids, results, strict=True):
+            if isinstance(limit, BaseException):
+                errors.append(f"camera '{camera_id}' timing query failed: {limit}")
+            elif limit is None or not math.isfinite(float(limit)) or float(limit) <= 0:
+                errors.append(f"camera '{camera_id}' has no valid acquisition timing")
+            else:
+                rates.append(float(limit))
         if errors or not rates:
             return None, errors or ["scan profile has no camera timing"]
         return min(rates) * fraction / (1 + speed_tolerance), []
@@ -2049,6 +2069,8 @@ class Instrument:
 
         progress.prepared = True
         prepared = await axis.prepare_continuous_scan(planned.start, planned.speed)
+        if planned.window is not None:
+            await axis.arm_scan_window(*planned.window)
         progress.recording = True
         await recorder.arm(
             RecorderArm(
@@ -2072,11 +2094,13 @@ class Instrument:
         progress.moving = True
         await axis.start_continuous_scan(planned.end)
         try:
-            await self._await_pass(channels, axis, planned)
+            await self._await_pass(channels, axis, planned, manifest)
+            await generator.wait_until_done(planned.timeout_s)
         except Exception as capture_error:
             # Preserve the recorder's count/spacing evidence before teardown discards it.
             # Inhibit emission and halt motion first; normal teardown retries any failures.
             report: dict[str, Any] = {
+                "window": planned.window,
                 "error": str(capture_error),
                 "start": planned.start,
                 "end": planned.end,
@@ -2102,7 +2126,6 @@ class Instrument:
                 logger.exception("Could not save continuous scan failure diagnostics")
             raise
 
-        await generator.wait_until_done(planned.timeout_s)
         recorded = await recorder.finish(_RECORDER_FINISH_TIMEOUT_S)
         progress.recording = False
         final = await axis.finish_continuous_scan(planned.end)
@@ -2113,6 +2136,7 @@ class Instrument:
             "axis": getattr(self._hal.topology.stage, volume.scan.axis if volume.scan else "z"),
             "line_scan": volume.scan.model_dump() if volume.scan else None,
             "plan": {
+                "window": planned.window,
                 "z_start": volume.z_start,
                 "z_step": volume.z_step,
                 "start": planned.start,
@@ -2131,13 +2155,26 @@ class Instrument:
         await asyncio.to_thread(_write_json, target, record)
 
     async def _await_pass(
-        self, channels: Mapping[str, Channel], axis: ContinuousAxisHandle, planned: ContinuousPass
+        self,
+        channels: Mapping[str, Channel],
+        axis: ContinuousAxisHandle,
+        planned: ContinuousPass,
+        manifest: AcquisitionManifest,
     ) -> None:
         """Wait until the axis has stopped and every camera has all its frames, within the pass timeout."""
         loop = asyncio.get_running_loop()
         deadline = loop.time() + planned.timeout_s
         stopped_at: float | None = None
+        progress_camera = next(iter(channels.values())).camera
+        next_progress = 0.0
+        last_count = -1
         while True:
+            if loop.time() >= next_progress:
+                count = min(planned.division.cycles, await progress_camera.captured_frames())
+                if count != last_count:
+                    await self._update_acquisition(manifest, frames_captured=count)
+                    last_count = count
+                next_progress = loop.time() + 0.2
             states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
             moving = await axis.continuous_scan_moving()
             if not moving and all(state is CaptureState.DONE for state in states):

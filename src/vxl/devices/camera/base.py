@@ -558,6 +558,11 @@ class CameraController(DeviceController["Camera"]):
                 frame.close()
             raise
 
+    @describe(label="Captured Frames")
+    async def captured_frames(self) -> int:
+        """Frames collected in the current stack; reads memory without querying camera hardware."""
+        return self._frame_idx
+
     @describe(label="Capture State")
     async def capture_state(self) -> CaptureState:
         """Lifecycle of the most recent :meth:`begin_batch`/:meth:`close_stack` task. Non-mutating: the

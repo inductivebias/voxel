@@ -127,3 +127,21 @@ async def test_controller_continuous_scan_without_scanner_names_the_axis() -> No
             await command(*args)
     await controller.reset_continuous_scan()
     assert controller.scan_mode == ScanMode.IDLE
+
+
+def test_controller_populates_axis_property_units() -> None:
+    controller = ContinuousAxisController(SimulatedContinuousAxis("x_axis", units="um"))
+    props = controller.interface.properties
+    assert props["position"].units == "µm"
+    assert props["lower_limit"].units == "µm"
+    assert props["upper_limit"].units == "µm"
+    assert props["speed"].units == "µm/s"
+    assert props["acceleration"].units == "µm/s²"
+    assert props["backlash"].units == "µm"
+    assert props["home"].units == "µm"
+
+    mm_controller = ContinuousAxisController(SimulatedContinuousAxis("y_axis", units="mm"))
+    mm_props = mm_controller.interface.properties
+    assert mm_props["position"].units == "mm"
+    assert mm_props["speed"].units == "mm/s"
+    assert mm_props["acceleration"].units == "mm/s²"

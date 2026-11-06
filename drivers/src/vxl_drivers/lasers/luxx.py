@@ -38,8 +38,23 @@ MAX_PENDING_STATUS_REPLIES = 8
 # line, which gates emission only in ACC or analogue mode (LightHUB Ultra manual, Table 3), so
 # DAQ gating needs ACC. Commissioned lasers reported F918: APC.
 APC_MODE_BIT = 1 << 8
+LASER_ON_BIT = 1 << 1
+KEYSWITCH_ERROR_BIT = 1 << 3
+INTERLOCK_ERROR_BIT = 1 << 4
+DISABLE_INPUT_BIT = 1 << 5
+KEYSWITCH_ON_BIT = 1 << 6
+SYSTEM_POWER_BIT = 1 << 7
 MODULATION_TO_CONTROL_MODE = {ModulationMode.SOFTWARE: "APC", ModulationMode.DIGITAL: "ACC"}
 CONTROL_TO_MODULATION_MODE = {mode: key for key, mode in MODULATION_TO_CONTROL_MODE.items()}
+
+
+def _emission_permitted(status: int) -> bool:
+    """Whether the LuxX ``GAS`` status word reports keyswitch and safety interlock closed."""
+    return (
+        bool(status & KEYSWITCH_ON_BIT)
+        and bool(status & SYSTEM_POWER_BIT)
+        and not bool(status & (KEYSWITCH_ERROR_BIT | INTERLOCK_ERROR_BIT | DISABLE_INPUT_BIT))
+    )
 
 
 class LuxxDiscoveryError(ConnectionError):
@@ -165,8 +180,16 @@ class LuxxProtocol:
         return self._query_float("GWH")
 
     @property
+    def status(self) -> int:
+        return self._query_hex("GAS")
+
+    @property
     def enabled(self) -> bool:
-        return bool(self._query_hex("GAS") & (1 << 1))
+        return bool(self.status & LASER_ON_BIT)
+
+    @property
+    def keyswitch_on(self) -> bool:
+        return _emission_permitted(self.status)
 
     @property
     def operating_mode(self) -> int:
@@ -218,10 +241,15 @@ class LuxxProtocol:
         level = round(power_mw * LEVEL_MAX / maximum_mw)
         self.query(f"SLP{level:03X}")
 
-    def enable(self) -> None:
+    def enable(self) -> bool:
+        """Send ``LOn`` and verify ``GAS``. Return ``False`` when inhibited by keyswitch or interlock."""
         self.query("LOn")
-        if not self.enabled:
-            raise LuxxProtocolError(f"LuxX on {self.port!r} remained off after LOn")
+        status = self.status
+        if status & LASER_ON_BIT:
+            return True
+        if not _emission_permitted(status):
+            return False
+        raise LuxxProtocolError(f"LuxX on {self.port!r} remained off after LOn")
 
     def disable(self) -> None:
         self.query("LOf")
@@ -317,13 +345,19 @@ class LuxxSource(LaserSource):
         if self._protocol.enabled:
             return
         try:
-            self._protocol.enable()
+            emitted = self._protocol.enable()
         except Exception as error:
             try:
                 self._protocol.disable()
             except Exception as cleanup_error:
                 raise ExceptionGroup("LuxX enable and inhibition both failed", [error, cleanup_error]) from None
             raise
+        if not emitted:
+            self.log.warning(
+                "LuxX %s (%s nm) did not emit after LOn because the keyswitch or interlock is off",
+                self._serial_number,
+                self._wavelength,
+            )
 
     @override
     def source_disable(self) -> None:
@@ -421,6 +455,16 @@ class LuxxSource(LaserSource):
     @describe(label="Working Hours", units="h")
     def working_hours(self) -> float:
         return self._protocol.working_hours
+
+    @property
+    @describe(
+        label="Keyswitch On",
+        desc="Whether the LightHUB keyswitch and safety interlock permit emission.",
+        stream=True,
+    )
+    def keyswitch_on(self) -> bool:
+        self._ensure_open()
+        return self._protocol.keyswitch_on
 
     @property
     @describe(label="Fault Code")

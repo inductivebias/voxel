@@ -176,3 +176,27 @@ def test_auto_rate_respects_daq_rearm_budget() -> None:
     assert violations == []
     assert planned is not None
     assert planned.speed / 80 < 1 / (0.065 + SCAN.rearm_margin_s)
+
+
+def test_window_uses_window_entry_instead_of_runway_for_first_exposure():
+    planned, errors = plan(
+        info=INFO.model_copy(update={"window_available": True}),
+        pacing=PACING.model_copy(update={"window_source": "pfi6"}),
+    )
+    assert not errors
+    assert planned is not None
+    assert planned.window is not None
+    assert planned.window == (26060, 30060)
+    assert planned.division.initial_delay == 2
+    assert planned.first_exposure[0] == 26080
+    assert planned.start < planned.window[0] < planned.window[1] < planned.end
+
+
+@pytest.mark.parametrize(("stage", "daq"), [(True, False), (False, True)])
+def test_window_requires_both_sides(stage, daq):
+    planned, errors = plan(
+        info=INFO.model_copy(update={"window_available": stage}),
+        pacing=PACING.model_copy(update={"window_source": "pfi6" if daq else None}),
+    )
+    assert planned is None
+    assert any("configured together" in error for error in errors)

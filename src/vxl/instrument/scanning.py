@@ -36,6 +36,7 @@ class ContinuousPass:
     first_exposure: tuple[float, float]
     """Bounds of the first exposure's position: after ``initial_delay`` edges from an unknown phase."""
     timeout_s: float
+    window: tuple[float, float] | None = None
 
 
 def plan_continuous_pass(
@@ -114,6 +115,10 @@ def plan_continuous_pass(
             violations.append("runway is too short for acceleration, final exposure, and deceleration")
         initial_delay = max(1, round(edges) + 1)
         start, end = requested_start, requested_end
+    window, window_errors = _window_plan(pacing, info, z_start, frames * z_step)
+    violations.extend(window_errors)
+    # The gate excludes runway edges; two is the minimum supported NI delay.
+    initial_delay = 2 if window is not None else initial_delay
     lower, upper = limits
     if start < lower or end > upper:
         violations.append(
@@ -134,7 +139,11 @@ def plan_continuous_pass(
             end=end,
             speed=speed,
             division=division,
-            first_exposure=(start + (initial_delay - 1) * edge, start + initial_delay * edge + speed * cycle),
+            window=window,
+            first_exposure=(
+                (z_start if window else start) + (initial_delay - 1) * edge,
+                (z_start if window else start) + initial_delay * edge + speed * cycle,
+            ),
             timeout_s=_MIN_TIMEOUT_S + 2 * (end - start) / speed,
         ),
         [],
@@ -142,3 +151,12 @@ def plan_continuous_pass(
 
 
 __all__ = ["ContinuousPass", "plan_continuous_pass"]
+
+
+def _window_plan(
+    pacing: EdgePacing, info: ContinuousScanInfo, start: float, length: float
+) -> tuple[tuple[float, float] | None, list[str]]:
+    enabled = pacing.window_source is not None
+    if enabled != info.window_available:
+        return None, ["Stage window output and DAQ window input must be configured together"]
+    return ((start, start + length) if enabled else None), []

@@ -174,17 +174,28 @@ class ObisProtocol:
     def warming_up(self) -> bool:
         return bool(self.status & WARM_UP_STATUS_BIT)
 
+    @property
+    def interlock_closed(self) -> bool:
+        state = self.query("SYST:LOCK?").upper()
+        if state not in {"ON", "OFF"}:
+            raise ObisProtocolError(f"OBIS reports invalid interlock state {state!r}")
+        return state == "ON"
+
     def set_power_setpoint(self, power_mw: float, maximum_mw: float) -> None:
         if not math.isfinite(power_mw) or not 0 <= power_mw <= maximum_mw:
             raise ValueError(f"OBIS power must be within 0..{maximum_mw:g} mW, got {power_mw}")
         self.command(f"SOUR:POW:LEV:IMM:AMPL {power_mw / 1000:.6f}")
 
-    def enable(self) -> None:
-        """Turn emission on and verify it; a warming-up module ignores the command."""
+    def enable(self) -> bool:
+        """Turn emission on and verify it; return ``False`` when inhibited by keyswitch or interlock."""
         self.command("SOUR:AM:STAT ON")
-        if not self.enabled:
-            detail = " while warming up" if self.warming_up else ""
-            raise ObisProtocolError(f"OBIS on {self.port!r} ignored SOUR:AM:STAT ON{detail}")
+        if self.enabled:
+            return True
+        if self.warming_up:
+            raise ObisProtocolError(f"OBIS on {self.port!r} ignored SOUR:AM:STAT ON while warming up")
+        if not self.interlock_closed:
+            return False
+        raise ObisProtocolError(f"OBIS on {self.port!r} ignored SOUR:AM:STAT ON")
 
     def disable(self) -> None:
         self.command("SOUR:AM:STAT OFF")
@@ -324,20 +335,36 @@ class ObisSource(LaserSource):
             return
         if wait:
             deadline = time.monotonic() + self._startup_timeout_s
+            checked_interlock = False
             while self._protocol.warming_up:
+                if not checked_interlock:
+                    checked_interlock = True
+                    if not self._protocol.interlock_closed:
+                        self.log.warning(
+                            "OBIS %s (%s nm) cannot emit while the keyswitch or interlock is off",
+                            self._serial_number,
+                            self._wavelength,
+                        )
+                        return
                 if time.monotonic() >= deadline:
                     raise ObisProtocolError(
                         f"OBIS {self._serial_number} was still warming up after {self._startup_timeout_s:g} s"
                     )
                 time.sleep(STARTUP_POLL_S)
         try:
-            self._protocol.enable()
+            emitted = self._protocol.enable()
         except Exception as error:
             try:
                 self._protocol.disable()
             except Exception as cleanup_error:
                 raise ExceptionGroup("OBIS enable and inhibition both failed", [error, cleanup_error]) from None
             raise
+        if not emitted:
+            self.log.warning(
+                "OBIS %s (%s nm) did not emit after SOUR:AM:STAT ON because the keyswitch or interlock is off",
+                self._serial_number,
+                self._wavelength,
+            )
 
     @override
     def source_disable(self) -> None:
@@ -425,6 +452,16 @@ class ObisSource(LaserSource):
     @describe(label="Warming Up", desc="The module ignores enable until warm-up finishes.")
     def warming_up(self) -> bool:
         return self._protocol.warming_up
+
+    @property
+    @describe(
+        label="Interlock Closed",
+        desc="Whether the LightHUB keyswitch and safety interlock permit emission.",
+        stream=True,
+    )
+    def interlock_closed(self) -> bool:
+        self._ensure_open()
+        return self._protocol.interlock_closed
 
     @property
     @describe(label="Fault")
