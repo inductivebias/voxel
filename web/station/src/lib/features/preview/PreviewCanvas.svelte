@@ -11,7 +11,7 @@
 
   import PreviewChannels from './PreviewChannels.svelte';
   import PreviewNavigationControls from './PreviewNavigationControls.svelte';
-  import { type PreviewChannel, type PreviewSession, wheelZoomFactor } from './session.svelte';
+  import { channelCameraKey, type PreviewChannel, type PreviewSession, wheelZoomFactor } from './session.svelte';
 
   interface Props {
     previewer: PreviewSession;
@@ -30,9 +30,7 @@
   let activeCrosshairCamera = $state<string | 'all'>('all');
 
   const visibleChannels = $derived(previewer.channels.filter((channel) => channel.name && channel.visible));
-  function cameraKey(channel: PreviewChannel): string {
-    return channel.config?.detection ?? channel.name ?? String(channel.idx);
-  }
+  const cameraKey = channelCameraKey;
   const cameraOptions = $derived.by(() => {
     const options: { id: string; label: string }[] = [];
     for (const channel of visibleChannels) {

@@ -5,10 +5,16 @@
   import { prefs } from '$lib/core/prefs';
   import { clampTopLeft } from '$lib/core/utils/vec';
   import { NumberBox } from '@voxel/kit';
-  import { ChevronDown, Crosshair } from '@voxel/kit/icons';
+  import { ChevronDown, Crosshair, RotateCw } from '@voxel/kit/icons';
 
   import { isFullViewport } from './render';
-  import { DEFAULT_VIEWPORT, type PreviewSession, wheelZoomFactor } from './session.svelte';
+  import {
+    DEFAULT_VIEWPORT,
+    MAX_CAMERA_SCALE,
+    MIN_CAMERA_SCALE,
+    type PreviewSession,
+    wheelZoomFactor
+  } from './session.svelte';
 
   interface CrosshairCameraOption {
     id: string;
@@ -45,6 +51,7 @@
     return Number.isFinite(aspect) && aspect > 0 ? aspect : 1;
   });
   const viewportZoomed = $derived(!isFullViewport(previewer.viewport));
+  const primaryRotationDeg = $derived(previewer.getCameraRotationDeg(cameras[0]?.id));
 
   async function drawMinimap() {
     if (!navigatorVisible.get() || !canvasEl) return;
@@ -141,6 +148,15 @@
     <NumberBox model={previewer.zoomModel} prefix="K" class="min-w-0 bg-transparent pr-0.5 pl-0" />
     <button
       type="button"
+      onclick={() => previewer.rotateClockwise()}
+      class="flex h-6 w-5 shrink-0 cursor-pointer items-center justify-center rounded text-fg-muted transition-colors hover:bg-element-hover hover:text-fg"
+      aria-label="Rotate preview 90° clockwise"
+      title="Rotate preview 90° clockwise ({primaryRotationDeg}°)"
+    >
+      <RotateCw width="14" height="14" />
+    </button>
+    <button
+      type="button"
       onclick={() => crosshairVisible.set(!crosshairVisible.get())}
       class="flex h-6 w-5 shrink-0 cursor-pointer items-center justify-center rounded transition-colors hover:bg-element-hover hover:text-fg {crosshairVisible.get()
         ? 'bg-element-selected text-fg'
@@ -166,6 +182,40 @@
       />
     </button>
   </div>
+
+  {#if cameras.length > 1 || (cameras.length === 1 && navigatorVisible.get())}
+    <div class="flex flex-col gap-1 border-t border-line-muted p-1.5 text-xs">
+      {#each cameras as cam (cam.id)}
+        {@const rot = previewer.getCameraRotationDeg(cam.id)}
+        <div class="flex items-center gap-1.5">
+          <span class="min-w-0 flex-1 truncate text-fg-muted" title={cam.label}>{cam.label}</span>
+          <button
+            type="button"
+            onclick={() => previewer.rotateClockwise(cam.id)}
+            class="flex h-6 shrink-0 cursor-pointer items-center gap-0.5 rounded px-1 font-mono text-fg-muted transition-colors hover:bg-element-hover hover:text-fg"
+            aria-label="Rotate {cam.label} 90° clockwise"
+            title="Rotate {cam.label} 90° clockwise"
+          >
+            <RotateCw width="12" height="12" />
+            <span>{rot}°</span>
+          </button>
+          <NumberBox
+            value={previewer.getCameraScale(cam.id)}
+            onChange={(value) => previewer.setCameraScale(cam.id, value)}
+            min={MIN_CAMERA_SCALE}
+            max={MAX_CAMERA_SCALE}
+            step={0.01}
+            bigStep={0.1}
+            home={1}
+            prefix="S"
+            suffix="×"
+            aria-label="{cam.label} scale"
+            class="w-24 shrink-0"
+          />
+        </div>
+      {/each}
+    </div>
+  {/if}
 
   {#if crosshairVisible.get()}
     <div class="flex flex-col gap-1 border-t border-line-muted p-1.5 text-xs">

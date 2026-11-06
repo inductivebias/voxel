@@ -39,7 +39,30 @@ export interface PreviewChannelPreferences {
   levels: PreviewLevelsPreference;
 }
 
+export interface PreviewCameraPreferences {
+  rotationOffsetDeg: number;
+  scale: number;
+}
+
 type StoredPreviewPreferences = Record<string, Record<string, Record<string, PreviewChannelPreferences>>>;
+type StoredCameraPreferences = Record<string, Record<string, PreviewCameraPreferences>>;
+
+export const MIN_CAMERA_SCALE = 0.05;
+export const MAX_CAMERA_SCALE = 10;
+
+export function normalizeRotationDeg(degrees: number): number {
+  if (!Number.isFinite(degrees)) return 0;
+  return (((Math.round(degrees / 90) * 90) % 360) + 360) % 360;
+}
+
+export function normalizeCameraScale(scale: number): number {
+  if (!Number.isFinite(scale)) return 1;
+  return Number(clamp(scale, MIN_CAMERA_SCALE, MAX_CAMERA_SCALE).toFixed(4));
+}
+
+export function channelCameraKey(channel: Pick<PreviewChannel, 'config' | 'name' | 'idx'>): string {
+  return channel.config?.detection ?? channel.name ?? String(channel.idx);
+}
 
 const DEFAULT_AUTO_LEVELS: AutoLevelsPreference = {
   lowPercentile: 1,
@@ -161,7 +184,10 @@ export class PreviewChannel {
   preferences = $state<PreviewChannelPreferences>(defaultChannelPreferences());
   resolvedColormap: string | null = $state<string | null>(null);
   levelsAppliedDeliveryStreamId: string | null = null;
-  rotationDeg = $state(0);
+  baseRotationDeg = $state(0);
+  rotationOffsetDeg = $state(0);
+  rotationDeg: number = $derived(normalizeRotationDeg(this.baseRotationDeg + this.rotationOffsetDeg));
+  scale = $state(1);
   sensorWidth = $state(0);
   sensorHeight = $state(0);
   /** Current overview metadata. Pixel planes live only in the shared GPU store. */
@@ -215,6 +241,7 @@ export class PreviewSession {
   readonly #renderer: PreviewGpuRenderer;
   readonly #stream: PreviewStream;
   readonly #preferenceStore = pref<StoredPreviewPreferences>('preview:channels', {});
+  readonly #cameraPreferenceStore = pref<StoredCameraPreferences>('preview:cameras', {});
   #displayAspect = 1;
   #fov = $state.raw<[number, number] | null>(null);
   #unsubscribers: Array<() => void> = [];
@@ -225,6 +252,7 @@ export class PreviewSession {
   #disposed = false;
   #lastDeliverySequences = new SvelteMap<string, number>();
   #pendingPreferenceStore: StoredPreviewPreferences | null = null;
+  #pendingCameraPreferenceStore: StoredCameraPreferences | null = null;
   #preferenceSaveTimer: number | null = null;
   #viewportUpdateTimer: number | null = null;
   #viewportLastSent = 0;
@@ -400,6 +428,59 @@ export class PreviewSession {
     if (redraw) this.redrawGeneration++;
   }
 
+  getCameraRotationDeg(cameraId?: string): number {
+    const channel = this.channels.find(
+      (candidate) => candidate.name && (!cameraId || channelCameraKey(candidate) === cameraId)
+    );
+    return channel?.rotationDeg ?? 0;
+  }
+
+  getCameraScale(cameraId: string): number {
+    const channel = this.channels.find((candidate) => candidate.name && channelCameraKey(candidate) === cameraId);
+    return channel?.scale ?? 1;
+  }
+
+  rotateClockwise(cameraId?: string | 'all'): void {
+    const targets = this.channels.filter(
+      (channel) => channel.name && (!cameraId || cameraId === 'all' || channelCameraKey(channel) === cameraId)
+    );
+    if (targets.length === 0) return;
+    const updatedCameras = new Map<string, PreviewCameraPreferences>();
+    for (const channel of targets) {
+      const key = channelCameraKey(channel);
+      let nextPrefs = updatedCameras.get(key);
+      if (!nextPrefs) {
+        nextPrefs = {
+          rotationOffsetDeg: normalizeRotationDeg(channel.rotationOffsetDeg + 90),
+          scale: channel.scale
+        };
+        updatedCameras.set(key, nextPrefs);
+        this.#saveCameraPreferences(key, nextPrefs);
+      }
+      channel.rotationOffsetDeg = nextPrefs.rotationOffsetDeg;
+    }
+    this.zoomModel.value = 1 / this.#zoomExtent(this.viewport);
+    this.redrawGeneration++;
+  }
+
+  setCameraScale(cameraId: string, scale: number): void {
+    const normalized = normalizeCameraScale(scale);
+    const targets = this.channels.filter((channel) => channel.name && channelCameraKey(channel) === cameraId);
+    if (targets.length === 0) return;
+    let changed = false;
+    for (const channel of targets) {
+      if (channel.scale !== normalized) {
+        channel.scale = normalized;
+        changed = true;
+      }
+    }
+    this.#saveCameraPreferences(cameraId, {
+      rotationOffsetDeg: targets[0].rotationOffsetDeg,
+      scale: normalized
+    });
+    if (changed) this.redrawGeneration++;
+  }
+
   setViewport(value: PreviewViewport): void {
     if (isViewportEqual(this.viewport, value)) return;
     this.#applyViewport(value);
@@ -537,8 +618,38 @@ export class PreviewSession {
 
   #flushPreferences(): void {
     if (this.#pendingPreferenceStore) this.#preferenceStore.set(this.#pendingPreferenceStore);
+    if (this.#pendingCameraPreferenceStore) this.#cameraPreferenceStore.set(this.#pendingCameraPreferenceStore);
     this.#pendingPreferenceStore = null;
+    this.#pendingCameraPreferenceStore = null;
     this.#preferenceSaveTimer = null;
+  }
+
+  #saveCameraPreferences(cameraId: string, preferences: PreviewCameraPreferences): void {
+    const stored = this.#pendingCameraPreferenceStore ?? this.#cameraPreferenceStore.get() ?? {};
+    const instrument = stored[this.#instrumentId] ?? {};
+    this.#pendingCameraPreferenceStore = {
+      ...stored,
+      [this.#instrumentId]: {
+        ...instrument,
+        [cameraId]: {
+          rotationOffsetDeg: normalizeRotationDeg(preferences.rotationOffsetDeg),
+          scale: normalizeCameraScale(preferences.scale)
+        }
+      }
+    };
+    if (this.#preferenceSaveTimer !== null) clearTimeout(this.#preferenceSaveTimer);
+    this.#preferenceSaveTimer = window.setTimeout(() => this.#flushPreferences(), PREFERENCE_SAVE_DELAY_MS);
+  }
+
+  #loadCameraPreferences(cameraId: string): PreviewCameraPreferences {
+    const stored = (this.#pendingCameraPreferenceStore ?? this.#cameraPreferenceStore.get())?.[this.#instrumentId]?.[
+      cameraId
+    ];
+    if (!stored) return { rotationOffsetDeg: 0, scale: 1 };
+    return {
+      rotationOffsetDeg: normalizeRotationDeg(stored.rotationOffsetDeg),
+      scale: normalizeCameraScale(stored.scale)
+    };
   }
 
   #loadChannelPreferences(name: string): PreviewChannelPreferences {
@@ -615,9 +726,14 @@ export class PreviewSession {
         channel.arrivals.viewport.length = 0;
       }
       channel.config = channel.name ? imaging.channels[channel.name] : undefined;
-      channel.rotationDeg = this.#detection[channel.config?.detection ?? '']?.rotation_deg ?? 0;
+      channel.baseRotationDeg = this.#detection[channel.config?.detection ?? '']?.rotation_deg ?? 0;
       if (profileChanged || nameChanged) {
         channel.preferences = channel.name ? this.#loadChannelPreferences(channel.name) : defaultChannelPreferences();
+        const cameraPrefs = channel.name
+          ? this.#loadCameraPreferences(channelCameraKey(channel))
+          : { rotationOffsetDeg: 0, scale: 1 };
+        channel.rotationOffsetDeg = cameraPrefs.rotationOffsetDeg;
+        channel.scale = cameraPrefs.scale;
       }
       channel.resolvedColormap = resolveColormap(channel.preferences.colormap, channel.config);
       if (!channel.name) continue;

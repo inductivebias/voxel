@@ -52,6 +52,7 @@ export { default as Power } from '~icons/lucide/power';
 export { default as Redo } from '~icons/lucide/redo-2';
 export { default as RefreshCw } from '~icons/lucide/refresh-cw';
 export { default as RotateCcw } from '~icons/lucide/rotate-ccw';
+export { default as RotateCw } from '~icons/lucide/rotate-cw';
 export { default as Route } from '~icons/lucide/route';
 export { default as Settings } from '~icons/lucide/settings-2';
 export { default as Split } from '~icons/lucide/split';

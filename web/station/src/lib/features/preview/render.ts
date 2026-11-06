@@ -95,14 +95,30 @@ export function toDisplayViewport(sensorRect: PreviewViewport, rotationDeg: numb
   return toSensorViewport(sensorRect, -rotationDeg);
 }
 
+function scaleChannelViewport(viewport: PreviewViewport, scaleX = 1, scaleY = 1): PreviewViewport | null {
+  if (scaleX <= 0 || scaleY <= 0) return null;
+  const offsetX = (1 - scaleX) / 2;
+  const offsetY = (1 - scaleY) / 2;
+  const left = Math.max(0, (viewport.x - offsetX) / scaleX);
+  const top = Math.max(0, (viewport.y - offsetY) / scaleY);
+  const right = Math.min(1, (viewport.x + viewport.w - offsetX) / scaleX);
+  const bottom = Math.min(1, (viewport.y + viewport.h - offsetY) / scaleY);
+  if (right <= left || bottom <= top) return null;
+  return { x: left, y: top, w: right - left, h: bottom - top };
+}
+
 /** Whether a cached viewport frame can completely cover the currently requested normalized viewport. */
 export function viewportFrameCovers(
   header: PreviewSourceHeader | null | undefined,
   viewport: PreviewViewport,
-  rotationDeg = 0
+  rotationDeg = 0,
+  scaleX = 1,
+  scaleY = 1
 ): boolean {
   if (!header || header.layer !== 'viewport' || isFullViewport(viewport)) return false;
-  const sensorViewport = toSensorViewport(viewport, rotationDeg);
+  const scaledViewport = scaleChannelViewport(viewport, scaleX, scaleY);
+  if (!scaledViewport || isFullViewport(scaledViewport)) return false;
+  const sensorViewport = toSensorViewport(scaledViewport, rotationDeg);
   const rect = header.source_rect_px;
   const left = rect.x / header.sensor_width;
   const top = rect.y / header.sensor_height;
@@ -151,11 +167,16 @@ export interface PreviewRenderChannel {
   label?: string | null;
   visible: boolean;
   rotationDeg: number;
+  scale?: number;
   sensorWidth: number;
   sensorHeight: number;
   levelsMin: number;
   levelsMax: number;
   resolvedColormap: string | null;
+}
+
+export function normalizeChannelScale(scale: number | undefined): number {
+  return typeof scale === 'number' && Number.isFinite(scale) && scale > 0 ? scale : 1;
 }
 
 export interface PreviewPixelSample {
@@ -320,14 +341,15 @@ export class PreviewGpuRenderer {
       if (!stored) continue;
       const rotation = normalizedQuarterTurns(channel.rotationDeg);
       const swapped = rotation % 2 !== 0;
-      const scaleX = (swapped ? channel.sensorHeight : channel.sensorWidth) / maxW;
-      const scaleY = (swapped ? channel.sensorWidth : channel.sensorHeight) / maxH;
+      const scale = normalizeChannelScale(channel.scale);
+      const scaleX = ((swapped ? channel.sensorHeight : channel.sensorWidth) / maxW) * scale;
+      const scaleY = ((swapped ? channel.sensorWidth : channel.sensorHeight) / maxH) * scale;
       const channelX = (boundingX - (1 - scaleX) / 2) / scaleX;
       const channelY = (boundingY - (1 - scaleY) / 2) / scaleY;
       if (channelX < 0 || channelX >= 1 || channelY < 0 || channelY >= 1) continue;
 
       const [sensorX, sensorY] = toSensorPoint(channelX, channelY, rotation);
-      const detail = viewportFrameCovers(stored.viewport?.header, viewport, channel.rotationDeg)
+      const detail = viewportFrameCovers(stored.viewport?.header, viewport, channel.rotationDeg, scaleX, scaleY)
         ? stored.viewport
         : undefined;
       const overview = stored.overview;
@@ -388,10 +410,11 @@ export class PreviewGpuRenderer {
         const bindGroup = this.#bindGroup(resources, stored);
         const rotation = normalizedQuarterTurns(channel.rotationDeg);
         const swapped = rotation % 2 !== 0;
-        const scaleX = (swapped ? channel.sensorHeight : channel.sensorWidth) / maxW;
-        const scaleY = (swapped ? channel.sensorWidth : channel.sensorHeight) / maxH;
+        const scale = normalizeChannelScale(channel.scale);
+        const scaleX = ((swapped ? channel.sensorHeight : channel.sensorWidth) / maxW) * scale;
+        const scaleY = ((swapped ? channel.sensorWidth : channel.sensorHeight) / maxH) * scale;
         const overview = stored.overview;
-        const detail = viewportFrameCovers(stored.viewport?.header, viewport, channel.rotationDeg)
+        const detail = viewportFrameCovers(stored.viewport?.header, viewport, channel.rotationDeg, scaleX, scaleY)
           ? stored.viewport
           : undefined;
         const validBits = overview?.header.valid_bits ?? detail?.header.valid_bits ?? 16;
