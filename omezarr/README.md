@@ -3,7 +3,7 @@
 **Stream microscopy frames into sharded, multiscale OME-Zarr datasets while acquisition continues.**
 
 ome-zarr-writer accepts one two-dimensional frame at a time, assembles bounded batches in shared memory, and builds
-an OME-NGFF v0.5 pyramid in worker processes. It writes Zarr v3 datasets to a local filesystem or S3 without placing
+an OME-NGFF v0.6 pyramid in worker processes. It writes Zarr v3 datasets to a local filesystem or S3 without placing
 downsampling and compression work on the capture process.
 
 > [!WARNING]

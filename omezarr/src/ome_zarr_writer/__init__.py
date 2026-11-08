@@ -38,29 +38,63 @@ The array backend (`ArrayWriter.Backend.TS` / `.ZARRS`) is an `OMEZarrWriter` co
 option; each batch is downsampled and flushed in a worker process (see `buffer.BatchSlot`).
 """
 
-from vxlib.vector import UIVec2D, UIVec3D, UVec3D
+from vxlib.vector import UIVec2D, UIVec3D, UVec3D, Vec3D
 
-from .dataset import Compression, DownscaleType, Dtype, ScaleLevel
+from .dataset import (
+    AffineTransform,
+    Compression,
+    CoordinateSystem,
+    DownscaleType,
+    Dtype,
+    Omero,
+    OmeroChannel,
+    OmeroWindow,
+    OmeZarrDataset,
+    ScaleLevel,
+    SequenceTransform,
+)
+from .deskew import (
+    deskew_dataset,
+    deskew_slice,
+    deskew_volume,
+    deskewed_width,
+    shear_factor_from_angle,
+    shear_xz_from_angle,
+)
 from .storage import DirectS3, Local, S3Store, StagedS3, StagingConfig, Storage
 from .writer import BatchMetrics, FrameLease, OMEZarrWriter, WriterConfig, WriterSettings
 
 __all__ = [
+    "AffineTransform",
     "BatchMetrics",
     "Compression",
+    "CoordinateSystem",
     "DirectS3",
     "DownscaleType",
     "Dtype",
     "FrameLease",
     "Local",
     "OMEZarrWriter",
+    "OmeZarrDataset",
+    "Omero",
+    "OmeroChannel",
+    "OmeroWindow",
     "S3Store",
     "ScaleLevel",
+    "SequenceTransform",
     "StagedS3",
     "StagingConfig",
     "Storage",
     "UIVec2D",
     "UIVec3D",
     "UVec3D",
+    "Vec3D",
     "WriterConfig",
     "WriterSettings",
+    "deskew_dataset",
+    "deskew_slice",
+    "deskew_volume",
+    "deskewed_width",
+    "shear_factor_from_angle",
+    "shear_xz_from_angle",
 ]

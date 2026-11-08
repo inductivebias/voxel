@@ -38,7 +38,7 @@ from typing import Any, Self, cast
 import numpy as np
 from cloudpathlib import S3Path
 from pydantic import BaseModel, ConfigDict, Field
-from vxlib.vector import UIVec3D, UVec3D
+from vxlib.vector import UIVec3D, UVec3D, Vec3D
 
 from ome_zarr_writer.array import ArrayWriter
 from ome_zarr_writer.dataset import (
@@ -115,6 +115,11 @@ class WriterConfig(WriterSettings):
     voxel_unit: SpaceUnit = SpaceUnit.MICROMETER
     dtype: Dtype = Dtype.UINT16
     channel_index: int = 0
+    origin: Vec3D | None = None
+    shear_xz: float = 0.0
+    shear_yz: float = 0.0
+    channel_label: str = "channel 0"
+    channel_color: str = "FFFFFF"
 
     @cached_property
     def shard_shape(self) -> UIVec3D:
@@ -168,6 +173,12 @@ class WriterConfig(WriterSettings):
             voxel_unit=self.voxel_unit,
             max_level=self.max_level,
             downscale_type=self.downscale_type,
+            dtype=self.dtype,
+            origin=self.origin,
+            shear_xz=self.shear_xz,
+            shear_yz=self.shear_yz,
+            channel_label=self.channel_label,
+            channel_color=self.channel_color,
         )
 
         return OmeZarrDataset(group=group, arrays=arrays)
