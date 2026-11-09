@@ -1,17 +1,18 @@
-"""Dataset description: Zarr v3 metadata + OME-NGFF v0.5 spec + `OmeZarrDataset`.
+"""Dataset description: Zarr v3 metadata + OME-NGFF v0.6 spec + `OmeZarrDataset`.
 
 Contains:
 - Zarr v3 array metadata: codecs, chunk grid, `Zarr3ArrayMeta` — spec-faithful
   Pydantic models for `{root}/{level}/zarr.json`.
-- OME-NGFF v0.5 spec types: axes, transforms, multiscales, `OmeMeta`.
+- OME-NGFF v0.6 spec types: coordinate systems, axes, transforms, multiscales, `Omero`, `OmeMeta`.
 - `Zarr3GroupMeta`: Zarr v3 group metadata carrying OME-NGFF attributes
   (mirrors `{root}/zarr.json`).
 - `OmeZarrDataset`: the top-level model mirroring the full on-disk shape of
-  an OME-Zarr v0.5 dataset. Carries derived properties for the layout fields
+  an OME-Zarr v0.6 dataset. Carries derived properties for the layout fields
   the writer cares about (`volume_shape`, `shard_shape`, `dtype`, `max_level`)
   and a single iterator for shard enumeration.
 """
 
+import json
 import math
 from collections.abc import Iterator
 from enum import IntEnum, StrEnum
@@ -19,6 +20,7 @@ from functools import cached_property
 from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, NamedTuple
 
+import numpy as np
 from cloudpathlib import S3Path
 from pydantic import (
     AfterValidator,
@@ -29,7 +31,7 @@ from pydantic import (
 )
 from vxlib.dtype import Dtype
 from vxlib.schema import SparseModel
-from vxlib.vector import UIVec3D, UVec3D
+from vxlib.vector import UIVec3D, UVec3D, Vec3D
 
 
 class ScaleLevel(IntEnum):
@@ -297,6 +299,8 @@ class TransformType(StrEnum):
     IDENTITY = "identity"
     TRANSLATION = "translation"
     SCALE = "scale"
+    AFFINE = "affine"
+    SEQUENCE = "sequence"
 
 
 class DownscaleType(StrEnum):
@@ -377,6 +381,27 @@ MultiscaleAxes = Annotated[
 ]
 
 
+class CoordinateSystem(SparseModel):
+    """OME-NGFF v0.6 named coordinate system."""
+
+    name: str = "physical"
+    axes: MultiscaleAxes
+
+
+class TransformEndpoint(SparseModel):
+    """OME-NGFF v0.6 transformation input or output reference (`{"path": ...}` or `{"name": ...}`)."""
+
+    path: str | None = None
+    name: str | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_str(cls, value: Any) -> Any:
+        if isinstance(value, str):
+            return {"name": value}
+        return value
+
+
 class IdentityTransform(SparseModel):
     type: Literal[TransformType.IDENTITY] = TransformType.IDENTITY
 
@@ -393,65 +418,212 @@ class ScaleTransform(SparseModel):
     path: str | None = None
 
 
-def _normalize_coord_transforms(value: list | tuple) -> tuple:
-    """Accept [scale] or [scale, translation]; return (scale, translation|None)."""
+class AffineTransform(SparseModel):
+    """OME-NGFF v0.6 affine coordinate transformation (`N x (N + 1)` homogeneous matrix)."""
+
+    type: Literal[TransformType.AFFINE] = TransformType.AFFINE
+    affine: list[list[float]]
+
+    @model_validator(mode="after")
+    def _validate_matrix(self) -> "AffineTransform":
+        n = len(self.affine)
+        if not (2 <= n <= 5):
+            raise ValueError(f"Affine matrix must have 2-5 rows, got {n}")
+        for row in self.affine:
+            if len(row) != n + 1 or not all(math.isfinite(v) for v in row):
+                raise ValueError(f"Each affine row must have {n + 1} finite values")
+        return self
+
+    @classmethod
+    def from_shear(
+        cls,
+        *,
+        shear_xz: float = 0.0,
+        shear_yz: float = 0.0,
+        ndim: int = 4,
+    ) -> "AffineTransform":
+        """Build an `N x (N + 1)` affine matrix for oblique stage-scan shear (`z` shearing `y`/`x`).
+
+        For `CZYX` (`ndim=4`) or `ZYX` (`ndim=3`), the spatial axes `(z, y, x)` occupy the trailing
+        three indices `(ndim - 3, ndim - 2, ndim - 1)`:
+            y_out = y_in + shear_yz * z_in
+            x_out = x_in + shear_xz * z_in
+        """
+        if not (3 <= ndim <= 5):
+            raise ValueError(f"ndim must be 3-5, got {ndim}")
+        matrix = [[1.0 if i == j else 0.0 for j in range(ndim + 1)] for i in range(ndim)]
+        z_idx = ndim - 3
+        matrix[ndim - 2][z_idx] = float(shear_yz)
+        matrix[ndim - 1][z_idx] = float(shear_xz)
+        return cls(affine=matrix)
+
+
+def _normalize_sequence_steps(value: list | tuple) -> tuple:
+    """Accept `[scale]`, `[scale, translation]`, `[scale, affine]`, or `[scale, translation, affine]`."""
     if not isinstance(value, (tuple, list)):
         raise ValueError(f"Expected list or tuple, got {type(value)}")
-    if isinstance(value, list):
-        value = tuple(value)
-    if len(value) == 1:
-        return (value[0], None)
-    if len(value) == 2:
-        return tuple(value)
-    raise ValueError(f"Must have 1-2 transforms, got {len(value)}")
+    if not (1 <= len(value) <= 3):
+        raise ValueError(f"Must have 1-3 transforms, got {len(value)}")
+    return tuple(value)
 
 
-def _serialize_coord_transforms(value: tuple) -> list:
-    """Drop trailing None translation when serializing."""
-    scale, translation = value
-    if translation is None:
-        return [scale]
-    return [scale, translation]
+SequenceSteps = Annotated[
+    tuple[ScaleTransform]
+    | tuple[ScaleTransform, TranslationTransform]
+    | tuple[ScaleTransform, AffineTransform]
+    | tuple[ScaleTransform, TranslationTransform, AffineTransform],
+    BeforeValidator(_normalize_sequence_steps),
+    PlainSerializer(list, return_type=list),
+]
+
+
+class SequenceTransform(SparseModel):
+    """OME-NGFF v0.6 sequence transformation mapping a dataset path to a named coordinate system."""
+
+    type: Literal[TransformType.SEQUENCE] = TransformType.SEQUENCE
+    input: TransformEndpoint | None = None
+    output: TransformEndpoint | None = None
+    name: str | None = "transformSequence"
+    transformations: SequenceSteps
+
+    @property
+    def scale(self) -> ScaleTransform:
+        return self.transformations[0]
+
+    @property
+    def translation(self) -> TranslationTransform | None:
+        return next((t for t in self.transformations if isinstance(t, TranslationTransform)), None)
+
+    @property
+    def affine(self) -> AffineTransform | None:
+        return next((t for t in self.transformations if isinstance(t, AffineTransform)), None)
+
+
+def _normalize_coord_transforms(value: list | tuple) -> tuple[SequenceTransform]:
+    """Normalize either `[SequenceTransform]` or flat `[ScaleTransform, ...]` into `(SequenceTransform,)`."""
+    if not isinstance(value, (tuple, list)):
+        raise ValueError(f"Expected list or tuple, got {type(value)}")
+    if not value:
+        raise ValueError("Must have at least 1 transform")
+    first = value[0]
+    is_seq = isinstance(first, SequenceTransform) or (
+        isinstance(first, dict) and first.get("type") == TransformType.SEQUENCE
+    )
+    if is_seq:
+        if len(value) != 1:
+            raise ValueError(f"Must have 1 sequence transform, got {len(value)}")
+        return (first,)  # type: ignore[return-value]
+    return (SequenceTransform(transformations=value),)  # type: ignore[arg-type]
 
 
 CoordinateTransformations = Annotated[
-    tuple[ScaleTransform, TranslationTransform | None] | tuple[ScaleTransform, ...],
+    tuple[SequenceTransform],
     BeforeValidator(_normalize_coord_transforms),
-    PlainSerializer(_serialize_coord_transforms, return_type=list),
+    PlainSerializer(list, return_type=list),
 ]
 
 
 class Dataset(SparseModel):
     """One resolution level inside a Multiscale.
 
-    Per OME-NGFF v0.5: exactly one scale transform, optionally followed by one
-    translation transform. Datasets compare by resolution — lower scale values
-    are higher resolution.
+    Per OME-NGFF v0.6: a `sequence` transformation mapping `{"path": path}` to
+    `{"name": "physical"}` containing a `scale` transform and optional
+    `translation` and `affine` transforms. Datasets compare by resolution —
+    lower scale values are higher resolution.
     """
 
     path: str
     coordinateTransformations: CoordinateTransformations  # noqa: N815 - OME-NGFF schema field
 
+    @model_validator(mode="after")
+    def _bind_default_endpoints(self) -> "Dataset":
+        seq = self.coordinateTransformations[0]
+        if seq.input is None or seq.output is None:
+            bound = SequenceTransform(
+                input=seq.input or TransformEndpoint(path=self.path),
+                output=seq.output or TransformEndpoint(name="physical"),
+                name=seq.name,
+                transformations=seq.transformations,
+            )
+            object.__setattr__(self, "coordinateTransformations", (bound,))
+        return self
+
+    @property
+    def sequence(self) -> SequenceTransform:
+        return self.coordinateTransformations[0]
+
+    @property
+    def scale(self) -> ScaleTransform:
+        return self.sequence.scale
+
+    @property
+    def translation(self) -> TranslationTransform | None:
+        return self.sequence.translation
+
+    @property
+    def affine(self) -> AffineTransform | None:
+        return self.sequence.affine
+
     @property
     def resolution(self) -> tuple[float, ...]:
-        scale = self.coordinateTransformations[0].scale
+        scale = self.scale.scale
         if not scale:
             raise ValueError(f"Dataset {self.path} has no scale values")
         return tuple(scale)
 
 
 class Multiscale(SparseModel):
-    """OME-NGFF multiscale: ordered datasets sharing a coordinate system.
+    """OME-NGFF v0.6 multiscale: ordered datasets sharing a coordinate system.
 
     Datasets must be ordered highest-to-lowest resolution.
     """
 
-    axes: MultiscaleAxes
+    coordinateSystems: list[CoordinateSystem] = Field(..., min_length=1)  # noqa: N815 - OME-NGFF schema field
     datasets: list[Dataset] = Field(..., min_length=1)
     name: str | None = None
     type: DownscaleType | None = None
     metadata: dict | None = None
     coordinateTransformations: CoordinateTransformations | None = None  # noqa: N815 - OME-NGFF schema field
+
+    def __init__(
+        self,
+        *,
+        datasets: list[Any],
+        coordinateSystems: list[Any] | None = None,  # noqa: N803
+        axes: list[Any] | None = None,
+        name: str | None = None,
+        type: DownscaleType | None = None,  # noqa: A002 - OME-NGFF schema field
+        metadata: dict | None = None,
+        coordinateTransformations: Any = None,  # noqa: N803
+        **extra: Any,
+    ) -> None:
+        kwargs: dict[str, Any] = {
+            "datasets": datasets,
+            "name": name,
+            "type": type,
+            "metadata": metadata,
+            "coordinateTransformations": coordinateTransformations,
+            **extra,
+        }
+        if coordinateSystems is not None:
+            kwargs["coordinateSystems"] = coordinateSystems
+        if axes is not None:
+            kwargs["axes"] = axes
+        super().__init__(**kwargs)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _coerce_axes_to_coordinate_systems(cls, data: Any) -> Any:
+        if isinstance(data, dict) and "axes" in data and "coordinateSystems" not in data:
+            copied = dict(data)
+            axes = copied.pop("axes")
+            copied["coordinateSystems"] = [{"name": "physical", "axes": axes}]
+            return copied
+        return data
+
+    @property
+    def axes(self) -> list[Axis]:
+        return self.coordinateSystems[0].axes
 
     @model_validator(mode="after")
     def _validate_dataset_ordering(self) -> "Multiscale":
@@ -468,11 +640,50 @@ class Multiscale(SparseModel):
         return self
 
 
-class OmeMeta(SparseModel):
-    """Top-level OME-Zarr v0.5 group attributes."""
+class OmeroWindow(SparseModel):
+    min: float = 0.0
+    max: float = 65535.0
+    start: float = 0.0
+    end: float = 65535.0
 
-    version: Literal["0.5"] = "0.5"
+
+class OmeroChannel(SparseModel):
+    label: str = "channel 0"
+    color: str = "FFFFFF"
+    active: bool = True
+    window: OmeroWindow = Field(default_factory=OmeroWindow)
+
+
+class Omero(SparseModel):
+    channels: list[OmeroChannel] = Field(..., min_length=1)
+
+    @classmethod
+    def default(
+        cls,
+        dtype: Dtype = Dtype.UINT16,
+        *,
+        label: str = "channel 0",
+        color: str = "FFFFFF",
+    ) -> "Omero":
+        top = float(np.iinfo(dtype.dtype).max) if np.issubdtype(dtype.dtype, np.integer) else 1.0
+        return cls(
+            channels=[
+                OmeroChannel(
+                    label=label,
+                    color=color,
+                    active=True,
+                    window=OmeroWindow(min=0.0, max=top, start=0.0, end=top),
+                )
+            ]
+        )
+
+
+class OmeMeta(SparseModel):
+    """Top-level OME-Zarr v0.6 group attributes."""
+
+    version: Literal["0.6"] = "0.6"
     multiscales: list[Multiscale] | None = None
+    omero: Omero | None = None
 
 
 class ZarrGroupAttributes(SparseModel):
@@ -494,41 +705,84 @@ class Zarr3GroupMeta(SparseModel):
         voxel_unit: SpaceUnit,
         max_level: ScaleLevel,
         downscale_type: DownscaleType,
+        dtype: Dtype = Dtype.UINT16,
+        origin: Vec3D | None = None,
+        shear_xz: float = 0.0,
+        shear_yz: float = 0.0,
+        channel_label: str = "channel 0",
+        channel_color: str = "FFFFFF",
     ) -> "Zarr3GroupMeta":
-        """A Zarr v3 group with OME-NGFF v0.5 multiscale attributes for a CZYX
-        dataset. Builds the channel + space axes and a per-level scale dataset."""
+        """A Zarr v3 group with OME-NGFF v0.6 multiscale attributes for a CZYX
+        dataset. Builds the `physical` coordinate system, per-level sequence
+        transforms (scale, half-voxel center translation, and optional oblique
+        shear affine), and default `omero` channel display metadata."""
+        oz, oy, ox = (origin.z, origin.y, origin.x) if origin is not None else (0.0, 0.0, 0.0)
+        has_origin = oz != 0.0 or oy != 0.0 or ox != 0.0
+        has_shear = shear_xz != 0.0 or shear_yz != 0.0
+        affine = AffineTransform.from_shear(shear_xz=shear_xz, shear_yz=shear_yz, ndim=4) if has_shear else None
+
+        datasets: list[Dataset] = []
+        for level in max_level.levels:
+            f = level.factor
+            steps: list[ScaleTransform | TranslationTransform | AffineTransform] = [
+                ScaleTransform(
+                    scale=[
+                        1.0,
+                        voxel_size.z * f,
+                        voxel_size.y * f,
+                        voxel_size.x * f,
+                    ]
+                )
+            ]
+            if f > 1 or has_origin:
+                steps.append(
+                    TranslationTransform(
+                        translation=[
+                            0.0,
+                            oz + voxel_size.z * (f - 1) / 2.0,
+                            oy + voxel_size.y * (f - 1) / 2.0,
+                            ox + voxel_size.x * (f - 1) / 2.0,
+                        ]
+                    )
+                )
+            if affine is not None:
+                steps.append(affine)
+            datasets.append(
+                Dataset(
+                    path=str(level.value),
+                    coordinateTransformations=(
+                        SequenceTransform(
+                            input=TransformEndpoint(path=str(level.value)),
+                            output=TransformEndpoint(name="physical"),
+                            transformations=tuple(steps),  # type: ignore[arg-type]
+                        ),
+                    ),
+                )
+            )
+
         return cls(
             attributes=ZarrGroupAttributes(
                 ome=OmeMeta(
                     multiscales=[
                         Multiscale(
-                            axes=[ChannelAxis(), *SpaceAxis.axes(unit=voxel_unit)],
-                            datasets=[
-                                Dataset(
-                                    path=str(level.value),
-                                    coordinateTransformations=(
-                                        ScaleTransform(
-                                            scale=[
-                                                1.0,
-                                                voxel_size.z * level.factor,
-                                                voxel_size.y * level.factor,
-                                                voxel_size.x * level.factor,
-                                            ]
-                                        ),
-                                    ),
+                            coordinateSystems=[
+                                CoordinateSystem(
+                                    name="physical",
+                                    axes=[ChannelAxis(), *SpaceAxis.axes(unit=voxel_unit)],
                                 )
-                                for level in max_level.levels
                             ],
+                            datasets=datasets,
                             type=downscale_type,
                         )
-                    ]
+                    ],
+                    omero=Omero.default(dtype=dtype, label=channel_label, color=channel_color),
                 )
             )
         )
 
 
 class OmeZarrDataset(SparseModel):
-    """Full on-disk shape of an OME-Zarr v0.5 / Zarr v3 dataset.
+    """Full on-disk shape of an OME-Zarr v0.6 / Zarr v3 dataset.
 
     Bundles the OME-NGFF group metadata (`group`) with the per-array metadata
     (`arrays`). Reading and writing are symmetric: an `OmeZarrDataset` parses
@@ -559,6 +813,36 @@ class OmeZarrDataset(SparseModel):
     @property
     def dtype(self) -> Dtype:
         return self.arrays[ScaleLevel.L0].data_type
+
+    @property
+    def voxel_size(self) -> UVec3D:
+        multiscales = self.group.attributes.ome.multiscales
+        if not multiscales:
+            raise ValueError("Dataset group has no multiscales metadata")
+        scale = multiscales[0].datasets[0].resolution
+        z, y, x = scale[-3:]
+        return UVec3D(z=z, y=y, x=x)
+
+    @property
+    def voxel_unit(self) -> SpaceUnit:
+        multiscales = self.group.attributes.ome.multiscales
+        if not multiscales:
+            raise ValueError("Dataset group has no multiscales metadata")
+        for axis in multiscales[0].axes:
+            if isinstance(axis, SpaceAxis):
+                return axis.unit
+        return SpaceUnit.MICROMETER
+
+    @property
+    def shear_xz(self) -> float:
+        multiscales = self.group.attributes.ome.multiscales
+        if not multiscales:
+            return 0.0
+        affine = multiscales[0].datasets[0].affine
+        if affine is None:
+            return 0.0
+        ndim = len(affine.affine)
+        return float(affine.affine[ndim - 1][ndim - 3])
 
     def shards(self, channels: list[int], z_range: range | None = None) -> Iterator[Shard]:
         """Yield shards at every pyramid level for the given channels.
@@ -604,3 +888,28 @@ class OmeZarrDataset(SparseModel):
             dest = target / relpath
             dest.parent.mkdir(parents=True, exist_ok=True)
             dest.write_text(meta.model_dump_json(), encoding="utf-8")
+
+    @classmethod
+    def read_metadata(cls, target: Path | S3Path) -> "OmeZarrDataset":
+        """Read a 0.5 or 0.6 OME-Zarr / Zarr v3 dataset without modifying it.
+
+        Legacy 0.5 metadata is normalized to the internal 0.6 representation:
+        axes become a named coordinate system and flat scale/translation lists
+        become sequences. Existing transform values are preserved, including
+        pyramid translations; no new half-voxel offsets are inferred on read.
+        Writing the returned model emits 0.6 metadata at the requested destination.
+        """
+        raw = json.loads((target / "zarr.json").read_text(encoding="utf-8"))
+        ome = raw.get("attributes", {}).get("ome", {})
+        if ome.get("version") == "0.5":
+            ome["version"] = "0.6"
+        group = Zarr3GroupMeta.model_validate(raw)
+        multiscales = group.attributes.ome.multiscales or []
+        arrays: dict[ScaleLevel, Zarr3ArrayMeta] = {}
+        if multiscales:
+            for ds in multiscales[0].datasets:
+                level = ScaleLevel(int(ds.path))
+                arrays[level] = Zarr3ArrayMeta.model_validate_json(
+                    (target / ds.path / "zarr.json").read_text(encoding="utf-8")
+                )
+        return cls(group=group, arrays=arrays)

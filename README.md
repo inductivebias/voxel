@@ -183,3 +183,34 @@ Questions, bug reports, and feature proposals are welcome through
 [GitHub Issues](https://github.com/AllenNeuralDynamics/voxel/issues).
 
 Voxel is distributed under the [MIT License](LICENSE).
+
+## Acquisition geometry in OME-Zarr
+
+The writer stores axes in `(channel, stack z, camera y, camera x)` order. Stage coordinates are
+not automatically treated as image coordinates: for example, a physical X sweep occupies the
+stored `z` axis. Detection paths without `acquisition_geometry` retain an image-local zero origin
+and zero shear. Preview `rotation_deg` does not rotate acquired pixels or supply a calibration.
+
+A calibrated detection path can opt into stage placement and oblique shear in its hardware topology:
+
+```yaml
+hal:
+  detection:
+    camera_1:
+      filter_wheels: []
+      magnification: 8
+      acquisition_geometry:
+        # Logical stage axes corresponding to stored (stack z, camera y, camera x).
+        # Example only: use this permutation only if established by calibration.
+        stage_axes: [x, y, z]
+        offset: {z: 0, y: 0, x: 0}  # image-physical origin offset in micrometres
+        shear_xz: 0.5              # calibrated image-physical dx / dz; example only
+        shear_yz: 0
+```
+
+The first mapped axis must match the task's scan axis. The mapping assumes positive, calibrated
+axis directions; it does not encode arbitrary rotations or reflected image axes. Per-volume stage
+positions plus `offset` locate the first voxel in the final image-physical coordinate system. Voxel
+compensates the writer's pre-affine translation so shear does not accidentally shear this stage
+placement. Channel labels and emission-derived display colors are passed through automatically.
+Do not infer a shear or an axis permutation from this example for a particular microscope.

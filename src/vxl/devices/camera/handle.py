@@ -8,7 +8,7 @@ from pydantic import TypeAdapter
 from rigup.device.handle import Adapter, DeviceProperty
 from vxl_records import DatasetLocation, StorageSpec
 from vxlib.coalescer import Coalescer
-from vxlib.vector import IVec2D, Vec2D
+from vxlib.vector import IVec2D, Vec2D, Vec3D
 
 from rigup import DeviceHandle
 from vxl.devices.camera.base import (
@@ -106,6 +106,11 @@ class CameraHandle(DeviceHandle[Camera]):
         z_step: float,
         magnification: float,
         settings: WriterSettings,
+        origin: Vec3D | None = None,
+        shear_xz: float = 0.0,
+        shear_yz: float = 0.0,
+        channel_label: str = "channel 0",
+        channel_color: str = "FFFFFF",
     ) -> DatasetLocation:
         """Prepare camera and writer for a stack acquisition; return its durable dataset location.
 
@@ -122,6 +127,11 @@ class CameraHandle(DeviceHandle[Camera]):
             z_step=z_step,
             magnification=magnification,
             settings=settings,
+            origin=origin,
+            shear_xz=shear_xz,
+            shear_yz=shear_yz,
+            channel_label=channel_label,
+            channel_color=channel_color,
         )
         return _DATASET_LOCATION_ADAPTER.validate_python(result)
 

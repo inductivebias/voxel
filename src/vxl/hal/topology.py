@@ -1,11 +1,13 @@
 """Static microscope hardware topology models and validation."""
 
 import logging
+import math
 from collections.abc import Mapping
 from typing import Annotated, Literal, Self
 
 from pydantic import ConfigDict, Field, RootModel, StringConstraints, field_validator, model_validator
 from vxlib.schema import FrozenModel, identifier
+from vxlib.vector import Vec3D
 
 from rigup import DeviceConfig, RigConfig
 
@@ -47,10 +49,50 @@ class OpticalAssembly(FrozenModel):
     routing: set[str] = Field(default_factory=set)
 
 
+class AcquisitionGeometry(FrozenModel):
+    """Calibrated mapping from logical stage coordinates (µm) to stored image coordinates.
+
+    ``stage_axes`` names the stage axes corresponding to stored (stack z, camera y,
+    camera x). It does not rotate pixels or infer an oblique angle. Only configure
+    this when those axes are calibrated to the image basis; ``rotation_deg`` is a
+    preview display setting and is deliberately not used here.
+    """
+
+    stage_axes: tuple[StageAxisName, StageAxisName, StageAxisName]
+    offset: Vec3D = Field(default_factory=lambda: Vec3D(z=0, y=0, x=0))
+    shear_xz: float = Field(default=0.0, allow_inf_nan=False)
+    shear_yz: float = Field(default=0.0, allow_inf_nan=False)
+
+    @field_validator("stage_axes")
+    @classmethod
+    def _distinct_axes(
+        cls, value: tuple[StageAxisName, StageAxisName, StageAxisName]
+    ) -> tuple[StageAxisName, StageAxisName, StageAxisName]:
+        if len(set(value)) != 3:
+            raise ValueError("stage_axes must be a permutation of x, y, z")
+        return value
+
+    @field_validator("offset")
+    @classmethod
+    def _finite_offset(cls, value: Vec3D) -> Vec3D:
+        if not all(math.isfinite(v) for v in (value.z, value.y, value.x)):
+            raise ValueError("geometry offset must be finite")
+        return value
+
+    def writer_origin(self, position: Mapping[str, float]) -> Vec3D:
+        """Pre-shear origin whose final affine-transformed anchor is the mapped stage position."""
+        z, y, x = (position[axis] for axis in self.stage_axes)
+        z, y, x = z + self.offset.z, y + self.offset.y, x + self.offset.x
+        return Vec3D(z=z, y=y - self.shear_yz * z, x=x - self.shear_xz * z)
+
+
 class DetectionAssembly(OpticalAssembly):
     filter_wheels: list[str]
     magnification: float = Field(..., gt=0, description="Optical magnification of the detection path")
     rotation_deg: int = Field(0, description="Camera rotation relative to stage axes (multiple of 90)")
+    acquisition_geometry: AcquisitionGeometry | None = Field(
+        default=None, description="Calibrated stage/image mapping; absent means image-local origin and no shear"
+    )
 
     @field_validator("rotation_deg")
     @classmethod

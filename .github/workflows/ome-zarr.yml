@@ -1,0 +1,29 @@
+name: OME-Zarr integration
+
+on:
+  pull_request:
+    paths:
+      - 'omezarr/**'
+      - 'src/vxl/**'
+      - 'tests/**'
+      - 'pyproject.toml'
+      - 'uv.lock'
+      - '.github/workflows/ome-zarr.yml'
+  push:
+    branches: [mobi]
+
+permissions:
+  contents: read
+
+jobs:
+  writer-and-capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - run: uv sync --locked
+      - name: Writer, metadata, deskew and simulated camera integration
+        run: uv run --locked pytest omezarr/tests tests/slow/test_camera_lifecycle.py -k 'not s3' -m 'not hardware' -q

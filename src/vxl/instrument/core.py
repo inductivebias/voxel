@@ -1879,6 +1879,31 @@ class Instrument:
         """Open every channel's dataset for the volume and register where each is written."""
         volume = manifest.volumes[volume_index]
         settings = self._store.value.output
+
+        def geometry_kwargs(ch_id: str) -> dict[str, Any]:
+            channel = self._channel_config(ch_id)
+            geometry = self._hal.topology.detection[channel.detection].acquisition_geometry
+            kwargs: dict[str, Any] = {
+                "channel_label": channel.label or ch_id,
+                "channel_color": "FFFFFF" if channel.colormap == "white" else channel.colormap.lstrip("#").upper(),
+            }
+            if geometry is not None:
+                scan_axis = volume.scan.axis if volume.scan else "z"
+                if geometry.stage_axes[0] != scan_axis:
+                    raise OperationRejectedError(
+                        f"Detection '{channel.detection}' geometry maps stack z to stage {geometry.stage_axes[0]}, "
+                        f"but this volume scans stage {scan_axis}"
+                    )
+                position = {"x": volume.x, "y": volume.y, "z": volume.z_start}
+                if volume.scan is not None:
+                    position[scan_axis] = volume.scan.start
+                kwargs.update(
+                    origin=geometry.writer_origin(position), shear_xz=geometry.shear_xz, shear_yz=geometry.shear_yz
+                )
+            return kwargs
+
+        # Validate every channel before any writer starts opening a dataset.
+        geometry = {ch_id: geometry_kwargs(ch_id) for ch_id in channels}
         opened = await _gather_hardware(
             *(
                 ch.camera.open_stack(
@@ -1888,6 +1913,7 @@ class Instrument:
                     z_step=volume.z_step,
                     magnification=self._hal.topology.detection[self._channel_config(ch_id).detection].magnification,
                     settings=settings,
+                    **geometry[ch_id],
                 )
                 for ch_id, ch in channels.items()
             )

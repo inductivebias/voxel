@@ -195,8 +195,26 @@ class TestTransformValidation:
     """Tests for coordinate transformation validation rules."""
 
     def test_too_many_transforms(self):
-        """3 transforms should fail."""
-        with pytest.raises(ValidationError, match="Must have 1-2 transforms"):
+        """4 transforms or duplicate scale transforms should fail."""
+        with pytest.raises(ValidationError, match="Must have 1-3 transforms"):
+            Multiscale(
+                axes=[
+                    {"type": "space", "name": "y", "unit": "micrometer"},
+                    {"type": "space", "name": "x", "unit": "micrometer"},
+                ],
+                datasets=[
+                    {
+                        "path": "0",
+                        "coordinateTransformations": [
+                            {"type": "scale", "scale": [0.5, 0.5]},
+                            {"type": "translation", "translation": [0.0, 0.0]},
+                            {"type": "affine", "affine": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]]},
+                            {"type": "scale", "scale": [1.0, 1.0]},
+                        ],
+                    },
+                ],
+            )
+        with pytest.raises(ValidationError, match="literal_error"):
             Multiscale(
                 axes=[
                     {"type": "space", "name": "y", "unit": "micrometer"},

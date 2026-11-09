@@ -2,7 +2,14 @@ import pytest
 from pydantic import ValidationError
 
 from rigup import DeviceConfig
-from vxl.hal.topology import DetectionAssembly, HardwareTopology, IlluminationAssembly, OpticalRouting, StageAxes
+from vxl.hal.topology import (
+    AcquisitionGeometry,
+    DetectionAssembly,
+    HardwareTopology,
+    IlluminationAssembly,
+    OpticalRouting,
+    StageAxes,
+)
 
 
 def _hal_config(
@@ -248,3 +255,15 @@ def test_routing_selector_cannot_also_be_a_filter_wheel() -> None:
             ("hal", "optical_routing", "excitation_side", "routes", "left", "selectors", "selector"),
         )
     ]
+
+
+def test_acquisition_geometry_requires_calibrated_distinct_axes():
+    with pytest.raises(ValidationError, match="permutation"):
+        AcquisitionGeometry(stage_axes=("x", "x", "z"))
+    with pytest.raises(ValidationError, match="finite"):
+        AcquisitionGeometry(stage_axes=("z", "y", "x"), offset={"z": float("inf"), "y": 0, "x": 0})
+    geometry = AcquisitionGeometry(stage_axes=("x", "y", "z"), shear_xz=0.5)
+    origin = geometry.writer_origin({"x": 37000, "y": 5000, "z": 100})
+    assert origin.z == 37000
+    assert origin.y == 5000
+    assert origin.x + geometry.shear_xz * origin.z == 100

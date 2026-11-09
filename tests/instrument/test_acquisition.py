@@ -15,6 +15,7 @@ from vxl_records import (
 )
 
 from vxl.devices.camera import CaptureState
+from vxl.hal.topology import AcquisitionGeometry
 from vxl.instrument import (
     AcquisitionRequest,
     AcquisitionTask,
@@ -28,7 +29,7 @@ from vxl.instrument import (
     XYMode,
     ZRange,
 )
-from vxl.instrument.config import ProfilePatch
+from vxl.instrument.config import ProfilePatch, TaskPatch
 
 
 class _Writer:
@@ -38,11 +39,14 @@ class _Writer:
         self._close_error = close_error
         self._closing = False
         self.released = False
+        self.opened_kwargs: list[dict[str, object]] = []
 
     async def check_writable(self, _storage: StorageSpec) -> None:
         return
 
     async def open_stack(self, *, storage: StorageSpec, subpath: PurePosixPath, **_kwargs: object) -> LocalLocation:
+        self._closing = False
+        self.opened_kwargs.append(_kwargs)
         target = self._root / storage.path.as_posix() / f"{subpath.as_posix()}.ome.zarr"
         return LocalLocation(
             role=LocationRole.DESTINATION,
@@ -102,6 +106,9 @@ async def test_acquisition_manifest_tracks_completed_dataset(
     assert started.status is AcquisitionStatus.RUNNING
     assert started.volumes[0].task == "task"
     assert started.volumes[0].profile == "single_gfp"
+    assert "origin" not in writer.opened_kwargs[0]
+    assert "shear_xz" not in writer.opened_kwargs[0]
+    assert writer.opened_kwargs[0]["channel_label"] == "GFP"
     assert captures[0] == CaptureActivity()
     assert states[0].frames_captured == 0
     assert any(capture.channels == ("gfp",) for capture in captures)
@@ -234,3 +241,33 @@ async def test_acquisition_skips_unchanged_camera_reconfiguration(
     assert (await records.acquisitions.get(manifest.id)).status is AcquisitionStatus.COMPLETED
     assert not writer.released
     assert set_calls == []
+
+
+async def test_acquisition_passes_calibrated_geometry_and_channel_metadata(
+    opened_instrument: Instrument, writer: _Writer, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    instrument = opened_instrument
+    camera_id = instrument.state.value.imaging.channels["gfp"].detection
+    topology = instrument._hal.topology
+    detection = dict(topology.detection)
+    geometry = AcquisitionGeometry(
+        stage_axes=("z", "y", "x"), offset={"z": 5, "y": 20, "x": 30}, shear_xz=0.5, shear_yz=-0.25
+    )
+    detection[camera_id] = detection[camera_id].model_copy(update={"acquisition_geometry": geometry})
+    monkeypatch.setattr(instrument._hal, "_topology", topology.model_copy(update={"detection": detection}))
+    await instrument.update_task(
+        "task", TaskPatch(xy=XYDefinition(mode=XYMode.EXPLICIT_POINTS, points=[Point2D(x=0, y=0), Point2D(x=10, y=0)]))
+    )
+    started = await instrument.start_acquisition(
+        AcquisitionRequest(storage=StorageSpec(path=PurePosixPath("geometry")))
+    )
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    assert len(writer.opened_kwargs) == 2
+    for index, kwargs in enumerate(writer.opened_kwargs):
+        origin = kwargs["origin"]
+        assert origin.z == 5
+        assert origin.y + kwargs["shear_yz"] * origin.z == 20
+        assert origin.x + kwargs["shear_xz"] * origin.z == 30 + index * 10
+        assert kwargs["channel_label"] == instrument.state.value.imaging.channels["gfp"].label
+        assert kwargs["channel_color"] == instrument.state.value.imaging.channels["gfp"].colormap.lstrip("#").upper()
+    assert started.volumes[0].x == 0

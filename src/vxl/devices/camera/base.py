@@ -23,7 +23,7 @@ from pydantic import BaseModel, ConfigDict
 from vxl_records import DatasetLocation, StorageSpec
 from vxlib.dtype import Dtype
 from vxlib.schema import FrozenModel
-from vxlib.vector import IVec2D, Vec2D
+from vxlib.vector import IVec2D, Vec2D, Vec3D
 
 from rigup import Device, DeviceController, describe, enumerated, numeric, numeric_int
 from vxl.devices.base import DeviceType
@@ -318,6 +318,11 @@ class CameraController(DeviceController["Camera"]):
         storage: StorageSpec,
         subpath: PurePosixPath,
         settings: WriterSettings,
+        origin: Vec3D | None = None,
+        shear_xz: float = 0.0,
+        shear_yz: float = 0.0,
+        channel_label: str = "channel 0",
+        channel_color: str = "FFFFFF",
     ) -> DatasetLocation:
         """Prepare the camera + writer for a stack and return its durable dataset location.
 
@@ -355,6 +360,11 @@ class CameraController(DeviceController["Camera"]):
             volume_shape=UIVec3D(z=num_frames, y=frame.y, x=frame.x),
             voxel_size=UVec3D(z=z_step, y=eff_px.y, x=eff_px.x),
             dtype=self.device.pixel_type,
+            origin=origin,
+            shear_xz=shear_xz,
+            shear_yz=shear_yz,
+            channel_label=channel_label,
+            channel_color=channel_color,
         )
 
         # The coordinator persists across volumes so its ring is reused. Ring sizing happens inside
