@@ -62,7 +62,7 @@ class FramePosition(BaseModel, frozen=True):
 
 
 class RecordedPass(BaseModel, frozen=True):
-    """A validated pass: exactly ``RecorderArm.frames`` positions per marker.
+    """A pass with retained exposure events and explicit validation violations.
 
     ``readback`` holds what the driver accepted (sample rate, input filter and its
     timebase, terminals, buffer size).
@@ -73,6 +73,7 @@ class RecordedPass(BaseModel, frozen=True):
     motion_sample: int
     tolerance: float
     readback: dict[str, Any]
+    violations: list[str] = Field(default_factory=list)
 
 
 @dataclass
@@ -133,6 +134,7 @@ class PassAssociator:
         self._peak = -math.inf
         self._reversal = 0.0
         self._nonfinite = 0
+        self._worst_reversal: dict[str, Any] = {}
 
     @property
     def samples(self) -> int:
@@ -188,15 +190,26 @@ class PassAssociator:
         peak = np.fmax.accumulate(np.fmax(moving, self._peak))
         reversal = np.fmax.accumulate(np.fmax(peak - moving, self._reversal))
         reversals[offset:] = reversal
+        if float(reversal[-1]) > self._reversal:
+            index = int(np.argmax(peak - moving))
+            self._worst_reversal = {
+                "sample": start + offset + index,
+                "time_s": (start + offset + index) / self._rate_hz,
+                "position": float(moving[index]),
+                "peak_position": float(peak[index]),
+                "distance": float(reversal[-1]),
+            }
         self._peak = float(peak[-1])
         self._reversal = float(reversal[-1])
         return reversals
 
-    def result(self, readback: dict[str, Any]) -> RecordedPass:
+    def result(self, readback: dict[str, Any], *, validate: bool = True) -> RecordedPass:
         """Validate the whole pass and return each marker's frame positions.
 
+        Set ``validate=False`` to retain diagnostic events from an invalid pass.
+
         Raises:
-            ValueError: Listing every violation found.
+            ValueError: Listing every violation found when validation is enabled.
         """
         motion = self._motion
         violations: list[str] = []
@@ -219,7 +232,7 @@ class PassAssociator:
                 f"the encoder reversed by {last_reversal:g} between the motion start and the last exposure"
             )
 
-        if violations or motion is None:
+        if validate and (violations or motion is None):
             raise ValueError("Recorded pass is invalid:\n" + "\n".join(f"- {violation}" for violation in violations))
         return RecordedPass(
             frames={
@@ -230,9 +243,14 @@ class PassAssociator:
                 for name, track in self._tracks.items()
             },
             samples=self._samples,
-            motion_sample=motion,
+            motion_sample=motion if motion is not None else 0,
             tolerance=self.tolerance,
-            readback=readback,
+            readback={
+                **readback,
+                "worst_reversal": self._worst_reversal,
+                "marker_counts": {name: track.exposures for name, track in self._tracks.items()},
+            },
+            violations=violations,
         )
 
     def _marker_violations(self, name: str, track: _MarkerTrack) -> list[str]:

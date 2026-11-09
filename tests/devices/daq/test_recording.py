@@ -51,7 +51,8 @@ def test_pass_associator_any_block_split_returns_each_exposure_position(block):
     assert recorded.samples == len(positions)
     assert recorded.motion_sample == MOTION
     assert recorded.tolerance == pytest.approx(0.005 + 1.0 / RATE_HZ)
-    assert recorded.readback == {"sample_rate_hz": RATE_HZ}
+    assert recorded.readback["sample_rate_hz"] == RATE_HZ
+    assert recorded.readback["marker_counts"] == {"camera_a": 4, "camera_b": 4}
     for name, samples in edges.items():
         frames = recorded.frames[name]
         assert [frame.frame for frame in frames] == [0, 1, 2, 3]
@@ -268,3 +269,19 @@ async def test_position_recorder_handle_round_trip_through_rig():
         assert await lossy.get_state() == "idle"
     finally:
         await rig.close()
+
+
+def test_invalid_pass_retains_fire_indices_and_reversal_location():
+    positions, counts, edges = _ideal_pass()
+    counts["camera_a"] = np.searchsorted(edges["camera_a"][:-1], np.arange(len(positions)), side="right")
+    positions[300] -= 0.1
+    associator = PassAssociator(REQUEST, list(counts), rate_hz=RATE_HZ, filter_s=0, filter_clock_s=0)
+    associator.mark_motion(MOTION)
+    associator.add_block(positions, counts)
+    with pytest.raises(ValueError, match="Recorded pass is invalid"):
+        associator.result({})
+    result = associator.result({}, validate=False)
+    assert result.violations
+    assert len(result.frames["camera_a"]) == 3
+    assert [frame.sample for frame in result.frames["camera_b"]] == edges["camera_b"].tolist()
+    assert result.readback["worst_reversal"]["sample"] == 300

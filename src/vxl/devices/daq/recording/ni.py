@@ -111,6 +111,8 @@ class _Pass:
         self._worker = threading.Thread(target=self._drain, name=f"{uid}-recording", daemon=True)
         self._failure: BaseException | None = None
         self._closed = False
+        self._digital_last: dict[str, int] = {}
+        self._digital_events: dict[str, list[dict[str, Any]]] = {}
 
     @property
     def closed(self) -> bool:
@@ -162,7 +164,7 @@ class _Pass:
             failure.add_note(f"Cleanup also failed; abort() retries it: {cleanup_error}")
         if failure is not None:
             raise failure
-        return self._associator().result(self.readback)
+        return self._associator().result(self.readback, validate=False)
 
     def abort(self) -> None:
         self._stop.set()
@@ -233,7 +235,7 @@ class _Pass:
             if self._failure is None and (remaining := self._acquired() - self._associator().samples):
                 # A failed read is recorded in _failure and reported below with the worker's.
                 with contextlib.suppress(Exception):
-                    self._read_locked(remaining, include_clock=False)
+                    self._read_locked(remaining, include_clock=True)
             if self._failure is not None:
                 raise RuntimeError(f"{self._uid}: {_describe_failure(self._failure)}") from self._failure
 
@@ -257,15 +259,39 @@ class _Pass:
         positions = np.empty(samples, dtype=np.float64)
         counts = {name: np.empty(samples, dtype=np.uint32) for name in self._edge_reads}
         reads = [(self._position_read, positions), *((read, counts[name]) for name, read in self._edge_reads.items())]
+        digital: np.ndarray | None = None
         if include_clock:
-            # The clock lines' states are not recorded; reading them keeps their buffer from overflowing.
-            reads.append((self._clock_read, np.empty((len(self.lease.di_paths), samples), dtype=np.uint8)))
+            digital = np.empty((len(self.lease.di_paths), samples), dtype=np.uint8)
+            reads.append((self._clock_read, digital))
         for read, data in reads:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 raise TimeoutError(f"Timed out reading {samples} aligned samples")
             if (count := read(data, number_of_samples_per_channel=samples, timeout=remaining)) != samples:
                 raise RuntimeError(f"Short read of {count} of {samples} samples")
+        if digital is not None:
+            start = self._associator().samples
+            rate = self.readback["sample_rate_hz"]
+            for path, values in zip(self.lease.di_paths, digital, strict=True):
+                events = self._digital_events.setdefault(path, [])
+                previous = self._digital_last.get(path, int(values[0]))
+                changes = np.flatnonzero(np.diff(values.astype(np.int16), prepend=previous))
+                if not events:
+                    events.append({"sample": start, "time_s": start / rate, "level": int(values[0]), "initial": True})
+                for index in changes:
+                    if len(events) < 100000:
+                        events.append(
+                            {
+                                "sample": start + int(index),
+                                "time_s": (start + int(index)) / rate,
+                                "level": int(values[index]),
+                                "position": float(positions[index]),
+                            }
+                        )
+                    else:
+                        self.readback["digital_events_truncated"] = True
+                self._digital_last[path] = int(values[-1])
+            self.readback["digital_events"] = self._digital_events
         return positions, counts
 
 

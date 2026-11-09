@@ -2117,6 +2117,8 @@ class Instrument:
                     recorded = await recorder.finish(_RECORDER_FINISH_TIMEOUT_S)
                     progress.recording = False
                     report["recorded"] = recorded.model_dump(mode="json")
+                    if recorded.violations:
+                        report["recorder_error"] = "Recorded pass is invalid: " + "; ".join(recorded.violations)
                 except Exception as recorder_error:
                     report["recorder_error"] = str(recorder_error)
                 target = self._system.resolve_storage(manifest.storage, subpath).target / "scan_failure.json"
@@ -2153,6 +2155,8 @@ class Instrument:
         }
         target = self._system.resolve_storage(manifest.storage, subpath).target / "scan.json"
         await asyncio.to_thread(_write_json, target, record)
+        if recorded.violations:
+            raise RuntimeError("Recorded pass is invalid: " + "; ".join(recorded.violations))
 
     async def _await_pass(
         self,
