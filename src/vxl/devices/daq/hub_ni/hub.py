@@ -3,6 +3,8 @@
 import re
 from collections.abc import Iterable, Sequence
 
+from nidaqmx import Task as NiTask
+from nidaqmx.constants import LineGrouping
 from nidaqmx.errors import DaqError
 from nidaqmx.system import System as NiSystem
 from nidaqmx.system.device import Device as NiDevice
@@ -136,6 +138,16 @@ class NiDaqmx(Device):
     def get_pfi_path(self, terminal: str) -> str:
         """Resolve a PFI or its static-port alias without claiming an input route."""
         return self._resource_manager.pfi_path(terminal)
+
+    def read_digital_input(self, terminal: str) -> bool:
+        """Read one input once; preserve Boolean semantics instead of coercing arrays/masks."""
+        path = self._resource_manager.digital_input_path(terminal)
+        with NiTask() as task:
+            task.di_channels.add_di_chan(path, line_grouping=LineGrouping.CHAN_PER_LINE)
+            value = task.read()
+        if not isinstance(value, bool):
+            raise RuntimeError(f"Expected one Boolean from {path}, received {value!r}")
+        return value
 
     def reserve_ao_task(
         self,

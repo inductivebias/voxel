@@ -10,6 +10,7 @@ from vxl.devices.daq.clocked import EdgeDivision, EdgePacing, ni
 from vxl.devices.daq.clocked.ni import CounterTrigger, InputTrigger, NiSignalGenerator
 from vxl.devices.daq.clocked.waveform import validate_waveform
 from vxl.devices.daq.hub_ni import NiDaqModel, NiDaqmx
+from vxl.devices.daq.hub_ni import hub as hub_module
 from vxl.devices.daq.hub_ni.resources import _NiResourceManager, capabilities_for_model
 
 from .helpers import _signals, _triangle
@@ -213,6 +214,7 @@ def _ni_generator(
     hub._resource_manager = _NiResourceManager(
         device_name="Dev1", capabilities=capabilities_for_model(NiDaqModel.NI6738)
     )
+    hub.read_digital_input = MagicMock(return_value=False)
     generator = NiSignalGenerator("ao_test", hub=hub, ports={"galvo": "ao0", "etl": "ao1"}, trigger=trigger)
     return generator, fake
 
@@ -264,7 +266,7 @@ class TestNiSignalGeneratorEdgePacing:
             "low_ticks": 3,
             "high_ticks": 2,
         }
-        assert add_ticks.return_value.co_pulse_term == "/Dev1/PFI7", "divider pulses reach the leased output PFI"
+        assert add_ticks.return_value.co_pulse_term == "", "AO triggering stays internal unless export is requested"
         assert add_ticks.return_value.co_ctr_timebase_active_edge == Edge.RISING
         divider.timing.cfg_implicit_timing.assert_called_once_with(sample_mode=AcquisitionType.FINITE, samps_per_chan=3)
         assert fake.events == [
@@ -280,6 +282,10 @@ class TestNiSignalGeneratorEdgePacing:
             "initial_delay_ticks": 10,
             "source": "/Dev1/PFI1",
             "ao_trigger_source": "/Dev1/CTR0InternalOutput",
+            "counter": "/Dev1/ctr0",
+            "physical_counter_output": "",
+            "count_mode": "finite",
+            "gate_low_verified_before_start": False,
         }
 
     def test_start_paced_unfiltered_source_enables_synchronization(self, monkeypatch: pytest.MonkeyPatch):
@@ -317,7 +323,7 @@ class TestNiSignalGeneratorEdgePacing:
         assert fake.count("ao_test_clock") == 2, "the periodic counter task is rebuilt"
         periodic = fake.latest("ao_test_clock")
         periodic.co_channels.add_co_pulse_chan_freq.assert_called_once_with("/Dev1/ctr0", freq=100.0, duty_cycle=0.5)
-        assert periodic.co_channels.add_co_pulse_chan_freq.return_value.co_pulse_term == "/Dev1/PFI7"
+        assert periodic.co_channels.add_co_pulse_chan_freq.return_value.co_pulse_term == ""
         generator.start()
         assert fake.events[-2:] == [("start", "ao_test_ao"), ("start", "ao_test_clock")]
 
@@ -382,3 +388,47 @@ def test_window_gate_uses_continuous_counter_and_checks_exact_cycles(monkeypatch
     divider.wait_until_done.assert_not_called()
     assert ("stop", "ao_test_divider") in fake.events
     generator.teardown()
+
+
+def test_window_without_encoder_is_rejected():
+    with pytest.raises(ValueError, match="requires an encoder"):
+        CounterTrigger(window_source="pfi6")
+
+
+def test_encoder_and_window_aliases_cannot_be_the_same_pin(monkeypatch):
+    generator, fake = _ni_generator(monkeypatch, CounterTrigger(edge_source="pfi1", window_source="port1/line1"))
+    with pytest.raises(ValueError, match="distinct terminals"):
+        generator.setup(_signals())
+    assert fake.created == []
+    assert not generator._hub.assigned_pins
+
+
+def test_high_window_blocks_before_any_trigger_is_started(monkeypatch):
+    generator, fake = _set_up_ni_generator(monkeypatch, CounterTrigger(edge_source="pfi1", window_source="pfi6"))
+    monkeypatch.setattr(generator._hub, "read_digital_input", lambda _terminal: True)
+    with pytest.raises(RuntimeError, match="HIGH before motion"):
+        generator.start_paced(_DIVISION)
+    assert not fake.events
+    assert fake.count("ao_test_divider") == 0
+
+
+def test_explicit_counter_export_is_preserved(monkeypatch):
+    generator, fake = _set_up_ni_generator(monkeypatch, CounterTrigger(edge_source="pfi1", output="pfi2"))
+    result = generator.start_paced(_DIVISION)
+    assert result["physical_counter_output"] == "/Dev1/PFI2"
+    assert fake.latest("ao_test_divider").co_channels.add_co_pulse_chan_ticks.return_value.co_pulse_term == "/Dev1/PFI2"
+
+
+@pytest.mark.parametrize("value", [False, True, [False]])
+def test_gate_read_preserves_scalar_booleans_and_rejects_array_coercion(monkeypatch, value):
+    generator, _ = _ni_generator(monkeypatch, CounterTrigger())
+    factory = MagicMock()
+    task = factory.return_value.__enter__.return_value
+    task.read.return_value = value
+    monkeypatch.setattr(hub_module, "NiTask", factory)
+    if isinstance(value, bool):
+        assert NiDaqmx.read_digital_input(generator._hub, "PFI6") is value
+    else:
+        with pytest.raises(RuntimeError, match="one Boolean"):
+            NiDaqmx.read_digital_input(generator._hub, "PFI6")
+    assert task.di_channels.add_di_chan.call_args.args == ("/Dev1/port1/line6",)

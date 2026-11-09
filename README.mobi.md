@@ -147,3 +147,25 @@ The divider starts two encoder edges after window entry (the supported minimum),
 encoder-phase offset relative to the boundary; recorded exposure positions remain authoritative.
 The window and committed gate input are retained in scan metadata. A physical gate/polarity and
 position-timing test is required before enabling this optional mode on an instrument.
+
+### Encoder-trigger routing and startup checks
+
+The scan trigger path is encoder input → pause-gated counter divider → counter
+InternalOutput → retriggerable AO waveform → camera Trigger In. Counter pulses
+are not exported to a physical PFI unless `trigger.output` explicitly requests it.
+The counter's allocator still reserves its selected output route; disabling physical
+export does not change which counter is selected.
+
+`trigger.edge_source` and `trigger.window_source` are resolved once into named
+encoder and window routes. A window requires an encoder input, and the resolved
+inputs must be different terminals. Before starting any trigger output, the driver
+reads the configured gate through its static digital-input alias. A HIGH readback
+or an invalid non-scalar read aborts startup. This is the DAQ's logical readback,
+not an independent measurement of the voltage at the breakout.
+
+The acquisition diagnostics record the counter, physical output (empty for
+internal-only triggering), encoder source, AO trigger source, window source,
+and finite/windowed-continuous mode. These are effective driver readbacks.
+Windowed mode remains continuous with an exact-count check afterward; it is not
+a finite pulse cap. Division still counts A rising edges without direction, and
+nominal pacing does not enforce a camera-ready condition on each edge.

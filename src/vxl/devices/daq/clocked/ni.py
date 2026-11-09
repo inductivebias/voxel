@@ -19,7 +19,7 @@ from nidaqmx.constants import AcquisitionType as NiAcqType
 from nidaqmx.constants import Edge, Level, RegenerationMode, TaskMode, TriggerType
 from nidaqmx.task import Task as NiTask
 from nidaqmx.task.channels import COChannel
-from pydantic import BaseModel, ConfigDict, Discriminator, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Discriminator, Field, TypeAdapter, model_validator
 from vxlib.quantity import VoltageRange
 
 from vxl.devices.daq.hub_ni import NiDaqmx
@@ -33,7 +33,7 @@ class CounterTrigger(BaseModel):
 
     The trigger frequency derives from ``Signals.duration + rest_time``.
     ``output`` optionally specifies the NI terminal to which the counter pulse is
-    routed for downstream devices.
+    routed for downstream devices. Without it, triggering stays internal to the DAQ.
 
     ``edge_source`` optionally names an NI input whose rising edges the same counter
     can divide instead, for one finite run (``start_paced``). ``edge_filter_us`` is
@@ -47,6 +47,12 @@ class CounterTrigger(BaseModel):
     edge_source: str | None = None
     edge_filter_us: float = Field(default=0.0, ge=0)
     window_source: str | None = None
+
+    @model_validator(mode="after")
+    def _window_requires_encoder(self) -> "CounterTrigger":
+        if self.window_source is not None and self.edge_source is None:
+            raise ValueError("A scan window requires an encoder edge_source")
+        return self
 
 
 class InputTrigger(BaseModel):
@@ -115,6 +121,8 @@ class NiSignalGenerator(SignalGenerator):
 
         self._finite_repeat: int | None = None  # cycles in the current finite run; None = continuous
         self._edge_paced = False  # _co_task is the start_paced edge divider
+        self._encoder_input: str | None = None
+        self._window_input: str | None = None
 
     # ---- introspection ----
 
@@ -173,10 +181,19 @@ class NiSignalGenerator(SignalGenerator):
                 lease.release()
                 self._lease = None
                 raise RuntimeError("Counter-trigger reservation did not provide a counter and output route")
-            counter_trigger_resources = (lease.counter_path, lease.output_pfi_path)
+            # AO consumes InternalOutput; export a physical pulse only when explicitly requested.
+            counter_trigger_resources = (lease.counter_path, lease.output_pfi_path if trigger.output else "")
         self._counter_route = counter_trigger_resources
+        self._encoder_input = (
+            lease.input_pfi_paths[0] if isinstance(trigger, CounterTrigger) and trigger.edge_source else None
+        )
+        self._window_input = (
+            lease.input_pfi_paths[1] if isinstance(trigger, CounterTrigger) and trigger.window_source else None
+        )
 
         try:
+            if self._window_input is not None and self._window_input == self._encoder_input:
+                raise ValueError("Encoder and window inputs must be distinct terminals")  # noqa: TRY301 - release the lease on invalid routes.
             # Acquire the complete lease before creating any NI task. Keep task
             # handles on self immediately so cleanup can retry a failed close.
             self._ao_task = NiTask(f"{self.uid}_ao")
@@ -243,8 +260,7 @@ class NiSignalGenerator(SignalGenerator):
             freq=frequency_hz,
             duty_cycle=0.5,
         )
-        if output_pfi_path is not None:
-            chan.co_pulse_term = output_pfi_path
+        chan.co_pulse_term = output_pfi_path or ""
         co_task.timing.cfg_implicit_timing(sample_mode=NiAcqType.CONTINUOUS)
         return co_task
 
@@ -277,6 +293,8 @@ class NiSignalGenerator(SignalGenerator):
             self._counter_route = None
             self._finite_repeat = None
             self._edge_paced = False
+            self._encoder_input = None
+            self._window_input = None
 
     def _close_tasks_and_release(self, *, suppress_close_errors: bool) -> None:
         """Close every configured NI task before releasing the task-scoped lease.
@@ -427,7 +445,7 @@ class NiSignalGenerator(SignalGenerator):
         """Play ``division.cycles`` AO cycles, each started by dividing the edge source.
 
         The leased counter's periodic task is replaced by a finite pulse train clocked
-        by the edge source's rising edges: the first pulse after ``initial_delay``
+        by the edge source's rising edges (continuous when windowed): the first pulse after ``initial_delay``
         edges, then one every ``divider`` edges. Its pulses reach the output PFI like
         the periodic ones. On failure the generator is left stopped with its periodic
         counter task.
@@ -452,16 +470,29 @@ class NiSignalGenerator(SignalGenerator):
         if self._edge_paced:
             raise RuntimeError(f"{self.uid}: an edge-paced run is already active; stop() it first")
 
-        source_path = lease.input_pfi_paths[0]
+        source_path = self._encoder_input
+        if source_path is None:
+            raise RuntimeError("Encoder input was not resolved during setup")
+        if self._window_input is not None and self._hub.read_digital_input(self._window_input):
+            raise RuntimeError(
+                f"{self.uid}: scan window {self._window_input} is HIGH before motion; "
+                "the gate must be LOW before arming. No trigger output was started."
+            )
         self._close_counter_task()
         try:
             divider, channel = self._create_edge_divider(source_path, pacing.filter_s, division)
             readback = self._read_edge_divider(channel, source_path, pacing.filter_s, division)
             readback["ao_trigger_source"] = ao_task.triggers.start_trigger.dig_edge_src
+            readback["counter"] = self._counter_route[0] if self._counter_route else ""
+            readback["physical_counter_output"] = channel.co_pulse_term
+            readback["count_mode"] = "windowed_continuous" if self._window_input else "finite"
+            readback["gate_low_verified_before_start"] = self._window_input is not None
             if pacing.window_source is not None:
                 pause = divider.triggers.pause_trigger
                 if pause.trig_type != TriggerType.DIGITAL_LEVEL or pause.dig_lvl_when != Level.LOW:
                     raise RuntimeError("DAQ window gate did not commit as active-high")  # noqa: TRY301
+                if pause.dig_lvl_src != self._window_input:
+                    raise RuntimeError("Scan window terminal readback differs from configured gate")  # noqa: TRY301 - stop and restore the task.
                 readback["window_source"] = pause.dig_lvl_src
             # AO arms first (waits for a trigger), then the divider starts counting edges.
             ao_task.start()
@@ -478,7 +509,7 @@ class NiSignalGenerator(SignalGenerator):
     def _create_edge_divider(
         self, source_path: str, filter_s: float, division: EdgeDivision
     ) -> tuple[NiTask, COChannel]:
-        """Create and commit the finite edge-divider CO task on the leased counter."""
+        """Create the divider: finite without a window, continuous and pause-gated with one."""
         if self._counter_route is None:
             raise RuntimeError("edge divider requires a leased counter")
         counter_path, output_pfi_path = self._counter_route
@@ -509,7 +540,9 @@ class NiSignalGenerator(SignalGenerator):
                 raise RuntimeError("Window input was not reserved")
             pause = divider.triggers.pause_trigger
             pause.trig_type = TriggerType.DIGITAL_LEVEL
-            pause.dig_lvl_src = self._lease.input_pfi_paths[1]
+            if self._window_input is None:
+                raise RuntimeError("Window input was not resolved during setup")
+            pause.dig_lvl_src = self._window_input
             pause.dig_lvl_when = Level.LOW
         divider.timing.cfg_implicit_timing(
             sample_mode=NiAcqType.CONTINUOUS if windowed else NiAcqType.FINITE,
@@ -528,6 +561,7 @@ class NiSignalGenerator(SignalGenerator):
             ("high/low/initial-delay ticks", ticks, expected_ticks),
             ("timebase source", channel.co_ctr_timebase_src, source_path),
             ("timebase edge", channel.co_ctr_timebase_active_edge, Edge.RISING),
+            ("physical counter output", channel.co_pulse_term, self._counter_route[1] if self._counter_route else ""),
             ("filter enable", channel.co_ctr_timebase_dig_fltr_enable, filter_s > 0),
         ):
             if actual != expected:

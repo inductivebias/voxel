@@ -303,6 +303,11 @@ class _NiResourceManager:
                 raise ValueError(f"Terminal '{terminal}' is not a PFI terminal on {self._device_name}")
             return resolved.physical_path
 
+    def digital_input_path(self, terminal: str) -> str:
+        """Resolve a digital/PFI input to its static-port alias without claiming an output."""
+        with self._lock:
+            return self._digital_path_locked(self._resolve_locked(terminal))
+
     @property
     def ao_pins(self) -> list[str]:
         return [f"ao{index}" for index in sorted(self._available_ao)]
