@@ -66,6 +66,12 @@ _SCAN_POSITION_TOLERANCE = {"nm": 1000.0, "um": 1.0, "mm": 0.001}
 _TRANSIENT_WARNINGS = frozenset({"WV", "NI", "WM"})
 # Critical fault flags that disable the motor driver on Zaber closed-loop stages.
 _DRIVER_FAULT_FLAGS = frozenset({"FF", "FZ", "FH", "FO"})
+# Direct-drive linear motor stages (LDM*) ship with a 5000 mm/s² non-volatile default and 0 ms ramp time,
+# which trips WV voltage warnings and FF following errors; default them to 20 mm/s² positioning,
+# <= 10 mm/s² scanning, and a 50 ms S-curve ramp time when not explicitly configured.
+_LDM_DEFAULT_ACCELERATION = {"nm": 20_000_000.0, "um": 20_000.0, "mm": 20.0}
+_LDM_MAX_SCAN_ACCELERATION = {"nm": 10_000_000.0, "um": 10_000.0, "mm": 10.0}
+_LDM_DEFAULT_RAMPTIME_MS = 50.0
 
 # Position, velocity, and acceleration units for each configurable length unit.
 _UNITS = {
@@ -156,6 +162,27 @@ def _validate_motion_config(
             raise ValueError(f"{name} must be finite and nonnegative, got {value}")
     if scan_ramptime_ms is not None and scan_encoder is None:
         raise ValueError("scan_ramptime_ms requires continuous encoder scanning")
+
+
+def _ldm_motion_defaults(
+    peripheral_name: str,
+    units: str,
+    acceleration: float | None,
+    ramptime_ms: float | None,
+    scan_acceleration: float | None,
+    scan_ramptime_ms: float | None,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    if not peripheral_name.startswith("LDM"):
+        return acceleration, ramptime_ms, scan_acceleration, scan_ramptime_ms
+    if acceleration is None:
+        acceleration = _LDM_DEFAULT_ACCELERATION[units]
+    if ramptime_ms is None:
+        ramptime_ms = _LDM_DEFAULT_RAMPTIME_MS
+    if scan_acceleration is not None:
+        scan_acceleration = min(scan_acceleration, _LDM_MAX_SCAN_ACCELERATION[units])
+    if scan_ramptime_ms is None:
+        scan_ramptime_ms = ramptime_ms
+    return acceleration, ramptime_ms, scan_acceleration, scan_ramptime_ms
 
 
 def _check_channel(name: str, number: int, count: int) -> None:
@@ -931,6 +958,14 @@ class ZaberLinearAxis(ContinuousAxis):
             identity = self._axis.identity
             self._peripheral_name = identity.peripheral_name
             self._peripheral_serial_number = identity.peripheral_serial_number
+            acceleration, ramptime_ms, scan_acceleration, scan_ramptime_ms = _ldm_motion_defaults(
+                self._peripheral_name,
+                units,
+                acceleration,
+                ramptime_ms,
+                scan_acceleration,
+                scan_ramptime_ms,
+            )
             self._ttl_stepper: ZaberTTLStepper | None = None
             if ttl_input is not None and ttl_trigger is not None:
                 self._ttl_stepper = ZaberTTLStepper(

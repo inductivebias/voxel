@@ -1296,3 +1296,42 @@ def test_continuous_scan_clears_sticky_transient_warnings_and_axis_recovers_driv
     assert sdk.driver_enable_calls == 1
     axis.close()
     hub.close()
+
+
+def test_ldm_direct_drive_axes_default_to_gentle_acceleration_and_s_curve_ramptime(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub, _connection, x_sdk, y_sdk = controller
+    x_sdk.identity.peripheral_name = "LDM210C-AE54T10A"
+    y_sdk.identity.peripheral_name = "LDM210C-AE54T10A"
+    x_sdk.settings.values[S.MOTION_ACCELONLY] = 5_000_000.0
+    x_sdk.settings.values[S.MOTION_DECELONLY] = 5_000_000.0
+    y_sdk.settings.values[S.MOTION_ACCELONLY] = 5_000_000.0
+    y_sdk.settings.values[S.MOTION_DECELONLY] = 5_000_000.0
+
+    axis, scanner = scan_axis(hub, monkeypatch, scan_acceleration=20_000.0)
+    plain = zaber.ZaberLinearAxis("y_axis", hub=hub, device_serial=12345, axis_number=2)
+
+    assert axis.acceleration == 20_000.0
+    assert axis.ramptime_ms == 50.0
+    assert plain.acceleration == 20_000.0
+    assert plain.ramptime_ms == 50.0
+    assert scanner.info.acceleration == 10_000.0
+    assert scanner.info.ramptime_ms == 50.0
+
+    scanner.prepare(start=SCAN_START, speed=1_000.0)
+    assert x_sdk.settings.values[S.MOTION_ACCELONLY] == 10_000.0
+    assert x_sdk.settings.values[S.MOTION_DECELONLY] == 10_000.0
+    assert x_sdk.settings.values[S.MOTION_ACCEL_RAMPTIME] == 50.0
+    scanner.start(SCAN_TARGET)
+    x_sdk.busy = False
+    x_sdk.settings.values[S.POS] = SCAN_TARGET
+    scanner.finish(SCAN_TARGET)
+
+    # Restores the gentle 20 mm/s^2 positioning acceleration and 50 ms S-curve, never 5000 mm/s^2.
+    assert axis.acceleration == 20_000.0
+    assert axis.ramptime_ms == 50.0
+    axis.close()
+    plain.close()
+    hub.close()
