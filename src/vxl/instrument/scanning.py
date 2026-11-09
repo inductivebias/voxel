@@ -95,13 +95,18 @@ def plan_continuous_pass(
             "encoder transitions at this speed"
         )
 
+    window, window_errors = _window_plan(pacing, info, z_start, frames * z_step)
+    violations.extend(window_errors)
+
     ramptime_s = max(0.0, info.ramptime_ms) / 1000.0
     ramp = speed**2 / (2 * info.acceleration) + 0.5 * speed * ramptime_s
     initial_delay = max(scan.lead_in_edges, math.ceil(ramp / edge) + 2)
     start = z_start - (initial_delay - 1) * edge
     window_end = z_start + frames * z_step
     last_cycle_end = (
-        start + (initial_delay + (frames - 1) * divider + _TRAILING_EDGES) * edge + speed * (cycle + _LEAD_OUT_S)
+        z_start
+        + ((2 if window else 1) + (frames - 1) * divider + _TRAILING_EDGES) * edge
+        + speed * (cycle + _LEAD_OUT_S)
     )
     end = max(last_cycle_end, window_end + speed * _LEAD_OUT_S) + ramp
     if runway_s is not None:
@@ -116,10 +121,8 @@ def plan_continuous_pass(
         requested_end = window_end + runway
         if requested_start > start or requested_end < end:
             violations.append("runway is too short for acceleration, final exposure, and deceleration")
-        initial_delay = max(1, round(edges) + 1)
+        initial_delay = max(2, round(edges) + 1)
         start, end = requested_start, requested_end
-    window, window_errors = _window_plan(pacing, info, z_start, frames * z_step)
-    violations.extend(window_errors)
     # The gate excludes runway edges; two is the minimum supported NI delay.
     initial_delay = 2 if window is not None else initial_delay
     lower, upper = limits

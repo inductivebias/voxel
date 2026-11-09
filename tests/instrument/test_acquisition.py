@@ -3,6 +3,7 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 
 import pytest
+from ome_zarr_writer import ScaleLevel
 from vxl_records import (
     AcquisitionStatus,
     DatasetStatus,
@@ -29,7 +30,7 @@ from vxl.instrument import (
     XYMode,
     ZRange,
 )
-from vxl.instrument.config import ProfilePatch, TaskPatch
+from vxl.instrument.config import ProfilePatch, TaskPatch, WriterPatch
 
 
 class _Writer:
@@ -194,7 +195,8 @@ async def test_capture_uses_profile_lasers_independently_of_camera(
     await instrument.update_profile(ProfilePatch(lasers=selected))
     observed = []
 
-    async def start():
+    async def start(repeat: int | None = None):
+        assert repeat == 1
         enabled = set()
         for uid, laser in instrument._hal.lasers.items():
             if await laser.props.get_value("is_output_enabled"):
@@ -271,3 +273,56 @@ async def test_acquisition_passes_calibrated_geometry_and_channel_metadata(
         assert kwargs["channel_label"] == instrument.state.value.imaging.channels["gfp"].label
         assert kwargs["channel_color"] == instrument.state.value.imaging.channels["gfp"].colormap.lstrip("#").upper()
     assert started.volumes[0].x == 0
+
+
+async def test_stepped_batch_capture_starts_signal_generators_with_finite_batch_frame_repeat(
+    opened_instrument: Instrument,
+    writer: _Writer,
+    records: SQLiteRecords,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    await instrument.update_output(WriterPatch(max_level=ScaleLevel.L0, shard_z_chunks=1, batch_z_shards=1))
+    assert instrument.state.value.output.batch_z == 64
+    await instrument.update_profile(ProfilePatch(z_step=4.0))
+    await instrument.update_task("task", TaskPatch(z=ZRange(start=0.0, end=520.0)))
+    events: list[tuple[str, int | None]] = []
+    daq = instrument._hal.signal_generators["daq"]
+    orig_start = daq.start
+    orig_stop = daq.stop
+    orig_begin_batch = writer.begin_batch
+
+    async def begin_batch(frames: int) -> None:
+        events.append(("batch", frames))
+        await orig_begin_batch(frames)
+
+    async def start(repeat: int | None = None) -> None:
+        events.append(("start", repeat))
+        await orig_start(repeat)
+
+    async def stop() -> None:
+        events.append(("stop", None))
+        await orig_stop()
+
+    monkeypatch.setattr(instrument._hal.cameras["camera_1"], "begin_batch", begin_batch)
+    monkeypatch.setattr(daq, "start", start)
+    monkeypatch.setattr(daq, "stop", stop)
+
+    started = await instrument.start_acquisition(
+        AcquisitionRequest(storage=StorageSpec(path=PurePosixPath("finite-batches")))
+    )
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=5)
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.COMPLETED
+    assert events == [
+        ("batch", 64),
+        ("start", 64),
+        ("stop", None),
+        ("batch", 64),
+        ("start", 64),
+        ("stop", None),
+        ("batch", 3),
+        ("start", 3),
+        ("stop", None),
+        ("stop", None),
+    ]

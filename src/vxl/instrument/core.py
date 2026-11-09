@@ -1406,9 +1406,9 @@ class Instrument:
         for uid, signals in self.active_profile.sync.items():
             await self._hal.signal_generators[uid].load(signals)
 
-    async def _start_signal_generators(self) -> None:
+    async def _start_signal_generators(self, repeat: int | None = None) -> None:
         handles = [self._hal.signal_generators[uid] for uid in self.active_profile.sync]
-        await _gather_hardware(*(h.start() for h in handles))
+        await _gather_hardware(*(h.start() if repeat is None else h.start(repeat) for h in handles))
 
     async def _stop_signal_generators(self) -> None:
         handles = [self._hal.signal_generators[uid] for uid in self.active_profile.sync]
@@ -1856,14 +1856,16 @@ class Instrument:
                         for ch in self._profile_lasers(self._store.value.imaging.profiles[volume.profile])
                     )
                 )
-            await self._start_signal_generators()
-            async with asyncio.timeout(30.0 + 2 * frames * period):
-                while True:
-                    states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
-                    if all(state is CaptureState.DONE for state in states):
-                        break
-                    await asyncio.sleep(0.05)
-            await self._stop_signal_generators()
+            await self._start_signal_generators(repeat=frames)
+            try:
+                async with asyncio.timeout(30.0 + 2 * frames * period):
+                    while True:
+                        states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
+                        if all(state is CaptureState.DONE for state in states):
+                            break
+                        await asyncio.sleep(0.05)
+            finally:
+                await self._stop_signal_generators()
             await self._update_acquisition(
                 manifest, frames_captured=min((batch_idx + 1) * batch_z, volume.frames_total)
             )

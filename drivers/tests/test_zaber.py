@@ -1160,9 +1160,8 @@ def test_position_window_arms_once_and_disarms_on_cleanup(controller, monkeypatc
         assert trigger.enabled
         assert trigger.count == 1
     lower_exit = device.triggers.by_number[5]
-    assert lower_exit.condition == ("setting", 1, "encoder.pos", zaber.TriggerCondition.LT, 26000)
-    assert lower_exit.count == 0
-    assert lower_exit.actions[zaber.TriggerAction.A] == (0, "io set do 2 0")
+    assert not lower_exit.enabled, "an unbounded < start trigger would lock out the one-shot entry on 1-count dither"
+    assert lower_exit.actions == {}
     scanner.start(SCAN_TARGET)
     if cleanup == "finish":
         sdk.busy = False
@@ -1367,7 +1366,7 @@ def test_ldm_direct_drive_axes_default_to_gentle_acceleration_and_s_curve_rampti
     y_sdk.settings.values[S.MOTION_ACCELONLY] = 5_000_000.0
     y_sdk.settings.values[S.MOTION_DECELONLY] = 5_000_000.0
 
-    axis, scanner = scan_axis(hub, monkeypatch, scan_acceleration=20_000.0)
+    axis, scanner = scan_axis(hub, monkeypatch, scan_acceleration=None)
     plain = zaber.ZaberLinearAxis("y_axis", hub=hub, device_serial=12345, axis_number=2)
 
     assert axis.acceleration == 20_000.0
@@ -1390,5 +1389,10 @@ def test_ldm_direct_drive_axes_default_to_gentle_acceleration_and_s_curve_rampti
     assert axis.acceleration == 20_000.0
     assert axis.ramptime_ms == 50.0
     axis.close()
+
+    # An explicit scan_acceleration on an LDM axis is honored rather than silently clamped.
+    explicit_axis, explicit_scanner = scan_axis(hub, monkeypatch, scan_acceleration=20_000.0)
+    assert explicit_scanner.info.acceleration == 20_000.0
+    explicit_axis.close()
     plain.close()
     hub.close()

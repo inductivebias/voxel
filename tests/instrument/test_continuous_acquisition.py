@@ -416,6 +416,8 @@ async def test_window_is_armed_before_cameras_and_motion(
 
     original_start = axis.start_continuous_scan
     original_batch = writer.begin_batch
+    original_paced = generator.start_paced
+    original_wait = generator.wait_until_done
 
     async def start(target):
         events.append(("motion", target))
@@ -425,8 +427,18 @@ async def test_window_is_armed_before_cameras_and_motion(
         events.append(("camera", frames))
         await original_batch(frames)
 
+    async def start_paced(division: EdgeDivision):
+        events.append(("paced", division))
+        return await original_paced(division)
+
+    async def wait_until_done(timeout_s: float):
+        events.append(("wait_done", timeout_s > 0))
+        await original_wait(timeout_s)
+
     monkeypatch.setattr(axis, "get_continuous_scan_info", window_info)
     monkeypatch.setattr(generator, "get_edge_pacing", window_pacing)
+    monkeypatch.setattr(generator, "start_paced", start_paced)
+    monkeypatch.setattr(generator, "wait_until_done", wait_until_done)
     monkeypatch.setattr(axis, "arm_scan_window", arm)
     monkeypatch.setattr(axis, "start_continuous_scan", start)
     monkeypatch.setattr(instrument._hal.cameras["camera_1"], "begin_batch", batch)
@@ -435,8 +447,13 @@ async def test_window_is_armed_before_cameras_and_motion(
     await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
     manifest = await records.acquisitions.get(started.id)
     assert manifest.status is AcquisitionStatus.COMPLETED
-    assert events[:2] == [("window", 1000, 1160), ("camera", 2)]
-    assert events[2][0] == "motion"
+    assert events[:3] == [
+        ("window", 1000, 1160),
+        ("camera", 2),
+        ("paced", EdgeDivision(cycles=2, divider=4, initial_delay=2)),
+    ]
+    assert events[3][0] == "motion"
+    assert events[4] == ("wait_done", True)
     scan = json.loads((tmp_path / "data/run/volumes/000001/single_gfp/scan.json").read_text())
     assert scan["plan"]["window"] == [1000, 1160]
     assert scan["plan"]["division"]["initial_delay"] == 2

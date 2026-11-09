@@ -68,9 +68,9 @@ _TRANSIENT_WARNINGS = frozenset({"WV", "NI", "WM"})
 _DRIVER_FAULT_FLAGS = frozenset({"FF", "FZ", "FH", "FO"})
 # Direct-drive linear motor stages (LDM*) ship with a 5000 mm/s² non-volatile default and 0 ms ramp time,
 # which trips WV voltage warnings and FF following errors; default them to 20 mm/s² positioning,
-# <= 10 mm/s² scanning, and a 50 ms S-curve ramp time when not explicitly configured.
+# 10 mm/s² scanning, and a 50 ms S-curve ramp time when not explicitly configured.
 _LDM_DEFAULT_ACCELERATION = {"nm": 20_000_000.0, "um": 20_000.0, "mm": 20.0}
-_LDM_MAX_SCAN_ACCELERATION = {"nm": 10_000_000.0, "um": 10_000.0, "mm": 10.0}
+_LDM_DEFAULT_SCAN_ACCELERATION = {"nm": 10_000_000.0, "um": 10_000.0, "mm": 10.0}
 _LDM_DEFAULT_RAMPTIME_MS = 50.0
 
 # Position, velocity, and acceleration units for each configurable length unit.
@@ -151,10 +151,11 @@ def _validate_motion_config(
     speed: float | None,
     acceleration: float | None,
     ramptime_ms: float | None,
+    scan_acceleration: float | None,
     scan_ramptime_ms: float | None,
     scan_encoder: int | None,
 ) -> None:
-    for name, value in (("speed", speed), ("acceleration", acceleration)):
+    for name, value in (("speed", speed), ("acceleration", acceleration), ("scan_acceleration", scan_acceleration)):
         if value is not None and (not math.isfinite(value) or value <= 0):
             raise ValueError(f"{name} must be finite and positive, got {value}")
     for name, value in (("ramptime_ms", ramptime_ms), ("scan_ramptime_ms", scan_ramptime_ms)):
@@ -169,6 +170,7 @@ def _ldm_motion_defaults(
     units: str,
     acceleration: float | None,
     ramptime_ms: float | None,
+    scan_encoder: int | None,
     scan_acceleration: float | None,
     scan_ramptime_ms: float | None,
 ) -> tuple[float | None, float | None, float | None, float | None]:
@@ -178,8 +180,8 @@ def _ldm_motion_defaults(
         acceleration = _LDM_DEFAULT_ACCELERATION[units]
     if ramptime_ms is None:
         ramptime_ms = _LDM_DEFAULT_RAMPTIME_MS
-    if scan_acceleration is not None:
-        scan_acceleration = min(scan_acceleration, _LDM_MAX_SCAN_ACCELERATION[units])
+    if scan_encoder is not None and scan_acceleration is None:
+        scan_acceleration = _LDM_DEFAULT_SCAN_ACCELERATION[units]
     if scan_ramptime_ms is None:
         scan_ramptime_ms = ramptime_ms
     return acceleration, ramptime_ms, scan_acceleration, scan_ramptime_ms
@@ -355,7 +357,7 @@ class ZaberContinuousScanner(ContinuousScanner):
         acceleration: float,
         invalidate_settings: Callable[[], None],
         window_output: int | None = None,
-        window_triggers: tuple[int, int, int] | None = None,
+        window_triggers: tuple[int, int] | tuple[int, int, int] | None = None,
         ignore_voltage_warning: bool = False,
         ramptime_ms: float | None = None,
     ) -> None:
@@ -380,9 +382,11 @@ class ZaberContinuousScanner(ContinuousScanner):
         self._position_unit, self._velocity_unit, self._acceleration_unit = _UNITS[units]
         self._tolerance = _SCAN_POSITION_TOLERANCE[units]
         if (window_output is None) != (window_triggers is None):
-            raise ValueError("Configure window output and three trigger IDs together")
+            raise ValueError("Configure window output and trigger IDs together")
         if window_triggers is not None and (
-            len(window_triggers) != 3 or min(window_triggers) < 1 or len(set(window_triggers)) != 3
+            len(window_triggers) not in (2, 3)
+            or min(window_triggers) < 1
+            or len(set(window_triggers)) != len(window_triggers)
         ):
             raise ValueError("Window trigger IDs must be distinct positive numbers")
         self._ignore_voltage_warning = ignore_voltage_warning
@@ -641,7 +645,9 @@ class ZaberContinuousScanner(ContinuousScanner):
         failures = []
         for number in self._window_triggers:
             try:
-                self._device.triggers.get_trigger(number).disable()
+                trigger = self._device.triggers.get_trigger(number)
+                trigger.disable()
+                trigger.clear_action(TriggerAction.ALL)
             except Exception as error:
                 failures.append(error)
         try:
@@ -669,18 +675,18 @@ class ZaberContinuousScanner(ContinuousScanner):
                 conditions = (
                     (start, TriggerCondition.GE, 1),
                     (end, TriggerCondition.GE, 0),
-                    (start, TriggerCondition.LT, 0),
                 )
-                for number, (position, condition, value) in zip(self._window_triggers, conditions, strict=True):
+                for number, (position, condition, value) in zip(self._window_triggers[:2], conditions, strict=True):
                     trigger = self._device.triggers.get_trigger(number)
                     trigger.fire_when_setting(
                         self._axis.axis_number, "encoder.pos", condition, position, self._position_unit
                     )
                     trigger.on_fire(TriggerAction.A, 0, f"io set do {self._window_output} {value}")
                     trigger.clear_action(TriggerAction.B)
-                # Lower exit closes the gate on reversal; entry opens only once, so a return
-                # cannot reopen it. Arm both exit guards before permitting entry.
-                self._device.triggers.get_trigger(self._window_triggers[2]).enable()
+                # _disarm_window() synchronously forces the window output LOW before arming.
+                # Only one-shot entry (>= start) and upper-exit (>= end) triggers are armed;
+                # an unbounded lower-exit (< start) trigger would close the gate on a 1-count
+                # encoder dither at entry after the one-shot entry trigger has already spent its count.
                 self._device.triggers.get_trigger(self._window_triggers[1]).enable(count=1)
                 self._device.triggers.get_trigger(self._window_triggers[0]).enable(count=1)
                 self._window_armed = True
@@ -926,14 +932,11 @@ class ZaberLinearAxis(ContinuousAxis):
         scan_acceleration: float | None = None,
         scan_ramptime_ms: float | None = None,
         scan_window_output: int | None = None,
-        scan_window_triggers: tuple[int, int, int] | None = None,
+        scan_window_triggers: tuple[int, int] | tuple[int, int, int] | None = None,
         scan_ignore_voltage_warning: bool = False,
     ) -> None:
-        _validate_motion_config(speed, acceleration, ramptime_ms, scan_ramptime_ms, scan_encoder)
+        _validate_motion_config(speed, acceleration, ramptime_ms, scan_acceleration, scan_ramptime_ms, scan_encoder)
         _validate_ttl_config(ttl_input, ttl_trigger, ttl_status_output, ttl_status_trigger)
-        _validate_scan_config(
-            scan_encoder, scan_interpolation, scan_output_width_ns, scan_scale_period, scan_acceleration
-        )
         if (scan_window_output is not None or scan_window_triggers is not None) and scan_encoder is None:
             raise ValueError("A scan window requires continuous encoder scanning")
         if scan_window_triggers is not None and set(scan_window_triggers).intersection(
@@ -965,8 +968,12 @@ class ZaberLinearAxis(ContinuousAxis):
                 units,
                 acceleration,
                 ramptime_ms,
+                scan_encoder,
                 scan_acceleration,
                 scan_ramptime_ms,
+            )
+            _validate_scan_config(
+                scan_encoder, scan_interpolation, scan_output_width_ns, scan_scale_period, scan_acceleration
             )
             self._ttl_stepper: ZaberTTLStepper | None = None
             if ttl_input is not None and ttl_trigger is not None:

@@ -136,6 +136,7 @@ def test_line_scan_rejects_short_or_fractional_encoder_runway(runway_s: float) -
     )
     assert planned is None
     assert any("runway" in violation for violation in violations)
+    assert not any("32-bit counters" in violation for violation in violations)
 
 
 @pytest.mark.parametrize("rate", [7.13, 9.77])
@@ -189,6 +190,7 @@ def test_window_uses_window_entry_instead_of_runway_for_first_exposure():
     assert planned.window == (26060, 30060)
     assert planned.division.initial_delay == 2
     assert planned.first_exposure[0] == 26080
+    assert planned.end == pytest.approx(30180.0)
     assert planned.start < planned.window[0] < planned.window[1] < planned.end
 
 

@@ -167,9 +167,13 @@ class _FakeNiTasks:
         task.stop.side_effect = lambda: self.events.append(("stop", name))
         task.close.side_effect = lambda: self.events.append(("close", name))
         task.out_stream.total_samp_per_chan_generated = 0
-        task.triggers.start_trigger.cfg_dig_edge_start_trig.side_effect = lambda trigger_source, **_: setattr(
-            task.triggers.start_trigger, "dig_edge_src", trigger_source
-        )
+
+        def cfg_start_trig(trigger_source: str, trigger_edge: Edge = Edge.RISING) -> None:
+            task.triggers.start_trigger.trig_type = ni.TriggerType.DIGITAL_EDGE
+            task.triggers.start_trigger.dig_edge_src = trigger_source
+            task.triggers.start_trigger.dig_edge_edge = trigger_edge
+
+        task.triggers.start_trigger.cfg_dig_edge_start_trig.side_effect = cfg_start_trig
 
         def add_ticks(_counter: str, source: str, **kwargs: object) -> MagicMock:
             channel = task.co_channels.add_co_pulse_chan_ticks.return_value
@@ -367,17 +371,19 @@ class TestNiSignalGeneratorEdgePacing:
 
 
 @pytest.mark.parametrize("generated", [300, 400])
-def test_window_gate_uses_continuous_counter_and_checks_exact_cycles(monkeypatch, generated):
+def test_window_gate_uses_finite_counter_with_rising_edge_start_trigger_and_checks_exact_cycles(monkeypatch, generated):
     trigger = CounterTrigger(edge_source="pfi1", window_source="pfi6")
     generator, fake = _set_up_ni_generator(monkeypatch, trigger)
     readback = generator.start_paced(_DIVISION)
     divider = fake.latest("ao_test_divider")
-    pause = divider.triggers.pause_trigger
-    assert pause.trig_type == ni.TriggerType.DIGITAL_LEVEL
-    assert pause.dig_lvl_src == "/Dev1/PFI6"
-    assert pause.dig_lvl_when == Level.LOW
+    divider.triggers.start_trigger.cfg_dig_edge_start_trig.assert_called_once_with(
+        trigger_source="/Dev1/PFI6",
+        trigger_edge=Edge.RISING,
+    )
     assert readback["window_source"] == "/Dev1/PFI6"
-    divider.timing.cfg_implicit_timing.assert_called_once_with(sample_mode=AcquisitionType.CONTINUOUS, samps_per_chan=3)
+    assert readback["count_mode"] == "finite"
+    assert readback["gate_low_verified_before_start"] is True
+    divider.timing.cfg_implicit_timing.assert_called_once_with(sample_mode=AcquisitionType.FINITE, samps_per_chan=3)
     fake.latest("ao_test_ao").out_stream = _FakeOutStream([generated])
     generator._cycle_samples = 100
     if generated == 300:
@@ -385,9 +391,24 @@ def test_window_gate_uses_continuous_counter_and_checks_exact_cycles(monkeypatch
     else:
         with pytest.raises(RuntimeError, match="expected 300"):
             generator.wait_until_done(1)
-    divider.wait_until_done.assert_not_called()
-    assert ("stop", "ao_test_divider") in fake.events
+    divider.wait_until_done.assert_called_once_with(timeout=1)
+    assert ("stop", "ao_test_divider") not in fake.events
     generator.teardown()
+
+
+def test_window_start_trigger_readback_mismatch_restores_periodic_task(monkeypatch):
+    def corrupt_start_trigger(channel: MagicMock) -> None:
+        del channel
+        fake.latest("ao_test_divider").triggers.start_trigger.dig_edge_src = "/Dev1/PFI0"
+
+    trigger = CounterTrigger(edge_source="pfi1", window_source="pfi6")
+    generator, fake = _set_up_ni_generator(monkeypatch, trigger)
+    fake._commit_hook = corrupt_start_trigger
+    with pytest.raises(RuntimeError, match="Scan window terminal readback"):
+        generator.start_paced(_DIVISION)
+    assert not any(event == "start" for event, _ in fake.events)
+    assert ("close", "ao_test_divider") in fake.events
+    assert fake.count("ao_test_clock") == 2
 
 
 def test_window_without_encoder_is_rejected():

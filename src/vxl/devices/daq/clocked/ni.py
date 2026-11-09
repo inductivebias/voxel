@@ -375,12 +375,7 @@ class NiSignalGenerator(SignalGenerator):
         if self._co_task is None or self._ao_task is None:
             # Defensive: should not reach here — InputTrigger + repeat raises in start().
             raise RuntimeError(f"{self.uid}: no CO task to wait on (input-trigger path)")
-        if self._edge_paced and self.edge_pacing is not None and self.edge_pacing.window_source:
-            # Called after motion ends: the position gate has closed. A pause-gated counter
-            # must be continuous on NI 6738; exact AO/exposure counts are checked separately.
-            self._co_task.stop()
-        else:
-            self._co_task.wait_until_done(timeout=timeout_s)
+        self._co_task.wait_until_done(timeout=timeout_s)
         # The counter's last pulse has started the last AO cycle, which may still be playing.
         expected = self._finite_repeat * self._cycle_samples
         generated = self._wait_for_generated(self._ao_task, lambda count: count >= expected)
@@ -445,8 +440,9 @@ class NiSignalGenerator(SignalGenerator):
         """Play ``division.cycles`` AO cycles, each started by dividing the edge source.
 
         The leased counter's periodic task is replaced by a finite pulse train clocked
-        by the edge source's rising edges (continuous when windowed): the first pulse after ``initial_delay``
-        edges, then one every ``divider`` edges. Its pulses reach the output PFI like
+        by the edge source's rising edges (started by the scan window's rising edge when
+        windowed): the first pulse after ``initial_delay`` edges, then one every
+        ``divider`` edges. Its pulses reach the output PFI like
         the periodic ones. On failure the generator is left stopped with its periodic
         counter task.
 
@@ -485,15 +481,15 @@ class NiSignalGenerator(SignalGenerator):
             readback["ao_trigger_source"] = ao_task.triggers.start_trigger.dig_edge_src
             readback["counter"] = self._counter_route[0] if self._counter_route else ""
             readback["physical_counter_output"] = channel.co_pulse_term
-            readback["count_mode"] = "windowed_continuous" if self._window_input else "finite"
+            readback["count_mode"] = "finite"
             readback["gate_low_verified_before_start"] = self._window_input is not None
             if pacing.window_source is not None:
-                pause = divider.triggers.pause_trigger
-                if pause.trig_type != TriggerType.DIGITAL_LEVEL or pause.dig_lvl_when != Level.LOW:
-                    raise RuntimeError("DAQ window gate did not commit as active-high")  # noqa: TRY301
-                if pause.dig_lvl_src != self._window_input:
+                start_trigger = divider.triggers.start_trigger
+                if start_trigger.trig_type != TriggerType.DIGITAL_EDGE or start_trigger.dig_edge_edge != Edge.RISING:
+                    raise RuntimeError("DAQ window start trigger did not commit as rising-edge")  # noqa: TRY301
+                if start_trigger.dig_edge_src != self._window_input:
                     raise RuntimeError("Scan window terminal readback differs from configured gate")  # noqa: TRY301 - stop and restore the task.
-                readback["window_source"] = pause.dig_lvl_src
+                readback["window_source"] = start_trigger.dig_edge_src
             # AO arms first (waits for a trigger), then the divider starts counting edges.
             ao_task.start()
             divider.start()
@@ -509,7 +505,7 @@ class NiSignalGenerator(SignalGenerator):
     def _create_edge_divider(
         self, source_path: str, filter_s: float, division: EdgeDivision
     ) -> tuple[NiTask, COChannel]:
-        """Create the divider: finite without a window, continuous and pause-gated with one."""
+        """Create the finite edge divider, start-triggered by the scan window when configured."""
         if self._counter_route is None:
             raise RuntimeError("edge divider requires a leased counter")
         counter_path, output_pfi_path = self._counter_route
@@ -538,14 +534,14 @@ class NiSignalGenerator(SignalGenerator):
         if windowed:
             if self._lease is None or len(self._lease.input_pfi_paths) != 2:
                 raise RuntimeError("Window input was not reserved")
-            pause = divider.triggers.pause_trigger
-            pause.trig_type = TriggerType.DIGITAL_LEVEL
             if self._window_input is None:
                 raise RuntimeError("Window input was not resolved during setup")
-            pause.dig_lvl_src = self._window_input
-            pause.dig_lvl_when = Level.LOW
+            divider.triggers.start_trigger.cfg_dig_edge_start_trig(
+                trigger_source=self._window_input,
+                trigger_edge=Edge.RISING,
+            )
         divider.timing.cfg_implicit_timing(
-            sample_mode=NiAcqType.CONTINUOUS if windowed else NiAcqType.FINITE,
+            sample_mode=NiAcqType.FINITE,
             samps_per_chan=division.cycles,
         )
         divider.control(TaskMode.TASK_COMMIT)
