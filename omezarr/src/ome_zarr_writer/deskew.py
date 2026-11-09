@@ -22,11 +22,18 @@ from pathlib import Path
 import numpy as np
 from cloudpathlib import S3Path
 from numba import jit, prange
-from vxlib.vector import UIVec3D
+from vxlib.vector import UIVec3D, Vec3D
 
 from ome_zarr_writer.array import ArrayWriter
 from ome_zarr_writer.array.ts import TSArrayReader
-from ome_zarr_writer.dataset import DownscaleType, OmeZarrDataset
+from ome_zarr_writer.dataset import (
+    AffineTransform,
+    DownscaleType,
+    OmeZarrDataset,
+    ScaleLevel,
+    ScaleTransform,
+    TranslationTransform,
+)
 from ome_zarr_writer.sizing import MIN_SLOTS
 from ome_zarr_writer.storage import S3Store, Storage
 from ome_zarr_writer.writer import OMEZarrWriter, WriterConfig
@@ -159,6 +166,41 @@ def deskew_volume(
     return out
 
 
+def _physical_anchor(meta: OmeZarrDataset) -> Vec3D:
+    """Compose the L0 CZYX transform; reject geometry the X-only resampler cannot preserve."""
+    multiscales = meta.group.attributes.ome.multiscales
+    if not multiscales:
+        raise ValueError("Deskewing requires multiscales geometry")
+    shape = meta.arrays[ScaleLevel.L0].shape
+    if len(shape) != 4 or shape[0] != 1 or [str(axis.name) for axis in multiscales[0].axes] != ["c", "z", "y", "x"]:
+        raise ValueError("Deskewing currently requires a single-channel CZYX dataset")
+    if multiscales[0].datasets[0].path != "0":
+        raise ValueError("Deskewing requires L0 (path 0) as the first resolution level")
+    matrix = np.eye(5)
+    for transform in multiscales[0].datasets[0].sequence.transformations:
+        step = np.eye(5)
+        if isinstance(transform, ScaleTransform):
+            if transform.scale is None or len(transform.scale) != 4:
+                raise ValueError("Deskewing requires an inline CZYX scale")
+            step[np.arange(4), np.arange(4)] = transform.scale
+        elif isinstance(transform, TranslationTransform):
+            if transform.translation is None or len(transform.translation) != 4:
+                raise ValueError("Deskewing requires an inline CZYX translation")
+            step[:4, 4] = transform.translation
+        elif isinstance(transform, AffineTransform):
+            affine = np.asarray(transform.affine)
+            if affine.shape != (4, 5):
+                raise ValueError("Deskewing requires a CZYX affine transform")
+            step[:4, :] = affine
+        matrix = step @ matrix
+    voxel = meta.voxel_size
+    supported = np.diag([1.0, voxel.z, voxel.y, voxel.x])
+    supported[3, 1] = matrix[3, 1]
+    if not np.allclose(matrix[:4, :4], supported, rtol=1e-10, atol=1e-12):
+        raise ValueError("X-only deskewing does not support shear_yz, rotations, or other affine components")
+    return Vec3D(z=float(matrix[1, 4]), y=float(matrix[2, 4]), x=float(matrix[3, 4]))
+
+
 def deskew_dataset(
     source: Path | S3Path,
     storage: Storage,
@@ -177,10 +219,13 @@ def deskew_dataset(
     1. `shear_factor` if explicitly passed,
     2. `angle_deg` (`z_step * cos(angle_deg) / pixel_size_x`), or
     3. the source dataset's `AffineTransform` (`shear_xz * z_step / pixel_size_x`) in `zarr.json`.
+    Physical placement is retained, including the offset introduced by negative-shear padding.
+    Only single-channel CZYX data with XZ shear is supported; other affine components are rejected.
     """
     meta = OmeZarrDataset.read_metadata(source)
     v_shape = meta.volume_shape
     v_size = meta.voxel_size
+    anchor = _physical_anchor(meta)
 
     if shear_factor is None:
         if angle_deg is not None:
@@ -206,6 +251,8 @@ def deskew_dataset(
         dtype=meta.dtype,
         max_level=meta.max_level,
         downscale_type=downscale_type,
+        # Pixel padding for negative shear moves the output grid origin left.
+        origin=Vec3D(z=anchor.z, y=anchor.y, x=anchor.x + min_shift * v_size.x),
         shear_xz=0.0,
         channel_label=channel_label,
         channel_color=channel_color,

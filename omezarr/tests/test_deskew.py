@@ -1,5 +1,6 @@
 """Tests for oblique stage-scan deskewing (`ome_zarr_writer.deskew`) and OME-Zarr v0.6 affine metadata."""
 
+import json
 import math
 from pathlib import Path
 
@@ -72,10 +73,12 @@ def test_deskew_slice_writes_directly_into_preallocated_buffer() -> None:
 
 
 @pytest.mark.slow
-def test_deskew_dataset_streams_v06_pyramid_from_affine_metadata(tmp_path: Path) -> None:
+@pytest.mark.parametrize("shear_xz", [0.8, -0.8])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_deskew_dataset_streams_v06_pyramid_from_affine_metadata(tmp_path: Path, shear_xz: float, legacy: bool) -> None:
     z, y, x = 8, 16, 20
     voxel_size = UVec3D(z=0.5, y=0.4, x=0.4)
-    shear_xz = 0.8  # dx/dz in physical micrometers -> shear_factor = 0.8 * 0.5 / 0.4 = 1.0 px/slice
+    shear_factor = shear_xz * voxel_size.z / voxel_size.x
     raw_cfg = WriterConfig(
         volume_shape=UIVec3D(z=z, y=y, x=x),
         voxel_size=voxel_size,
@@ -83,7 +86,7 @@ def test_deskew_dataset_streams_v06_pyramid_from_affine_metadata(tmp_path: Path)
         max_level=ScaleLevel.L1,
         downscale_type=DownscaleType.MEAN,
         origin=Vec3D(z=37000.0, y=100.0, x=200.0),
-        shear_xz=shear_xz,
+        shear_xz=0.0 if legacy else shear_xz,
         channel_label="Bench 00",
         channel_color="00FFFF",
     )
@@ -102,14 +105,32 @@ def test_deskew_dataset_streams_v06_pyramid_from_affine_metadata(tmp_path: Path)
         writer.close()
 
     assert raw_path is not None
+    if legacy:
+        # Real 0.5 metadata has flat axes/scale/translation and no affine shear.
+        # An explicit shear_factor supplies the geometry when deskewing that legacy dataset.
+        path = raw_path / "zarr.json"
+        payload = json.loads(path.read_text())
+        ome = payload["attributes"]["ome"]
+        ome["version"] = "0.5"
+        multiscale = ome["multiscales"][0]
+        multiscale["axes"] = multiscale.pop("coordinateSystems")[0]["axes"]
+        for dataset in multiscale["datasets"]:
+            dataset["coordinateTransformations"] = dataset["coordinateTransformations"][0]["transformations"]
+        path.write_text(json.dumps(payload))
     raw_meta = OmeZarrDataset.read_metadata(raw_path)
     assert raw_meta.group.attributes.ome.version == "0.6"
-    assert raw_meta.shear_xz == pytest.approx(shear_xz)
+    assert raw_meta.shear_xz == pytest.approx(0.0 if legacy else shear_xz)
     assert raw_meta.voxel_size == voxel_size
 
-    deskewed_path = deskew_dataset(raw_path, Local(target=tmp_path / "deskewed_stack"), cval=0.0, slots=3)
+    deskewed_path = deskew_dataset(
+        raw_path,
+        Local(target=tmp_path / "deskewed_stack"),
+        shear_factor=shear_factor if legacy else None,
+        cval=0.0,
+        slots=3,
+    )
     deskewed_meta = OmeZarrDataset.read_metadata(deskewed_path)
-    expected_w = deskewed_width(x, z, shear_factor=1.0)
+    expected_w = deskewed_width(x, z, shear_factor=shear_factor)
     assert deskewed_meta.group.attributes.ome.version == "0.6"
     assert deskewed_meta.shear_xz == 0.0
     assert deskewed_meta.volume_shape == UIVec3D(z=z, y=y, x=expected_w)
@@ -118,8 +139,49 @@ def test_deskew_dataset_streams_v06_pyramid_from_affine_metadata(tmp_path: Path)
     assert deskewed_meta.group.attributes.ome.omero.channels[0].color == "00FFFF"
 
     l0_disk = TSArrayReader(deskewed_path / "0").read_3d(0, z)
-    expected_l0 = deskew_volume(raw_vol, shear_factor=1.0, cval=0.0)
+    expected_l0 = deskew_volume(raw_vol, shear_factor=shear_factor, cval=0.0)
     np.testing.assert_array_equal(l0_disk, expected_l0)
 
     l1_disk = TSArrayReader(deskewed_path / "1").read_3d(0, z // 2)
     assert l1_disk.shape == (z // 2, y // 2, expected_w // 2)
+
+    def world(metadata, point, level=0):
+        result = np.asarray(point, dtype=float)
+        for transform in metadata.group.attributes.ome.multiscales[0].datasets[level].sequence.transformations:
+            spec = transform.model_dump()
+            if spec["type"] == "scale":
+                result *= spec["scale"]
+            elif spec["type"] == "translation":
+                result += spec["translation"]
+            elif spec["type"] == "affine":
+                result = np.asarray(spec["affine"]) @ np.append(result, 1.0)
+        return result
+
+    # Corresponding landmarks must retain world coordinates, not just pixel appearance.
+    minimum = min(0.0, (z - 1) * shear_factor)
+    for zi in (0, z - 1):
+        point = [0.0, zi, 3.0, 4.0]
+        raw_world = world(raw_meta, point)
+        if legacy:
+            raw_world[3] += zi * shear_factor * voxel_size.x
+        deskew_world = world(deskewed_meta, [0.0, zi, 3.0, 4.0 + zi * shear_factor - minimum])
+        np.testing.assert_allclose(deskew_world, raw_world)
+    # L1 voxel centers coincide with the L0 grid's (2*i + 0.5) centers.
+    np.testing.assert_allclose(
+        world(deskewed_meta, [0.0, 1.0, 2.0, 3.0], 1), world(deskewed_meta, [0.0, 2.5, 4.5, 6.5])
+    )
+
+
+def test_deskew_rejects_yz_shear_before_creating_output(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    config = WriterConfig(
+        volume_shape=UIVec3D(z=8, y=16, x=20),
+        voxel_size=UVec3D(z=0.5, y=0.4, x=0.4),
+        max_level=ScaleLevel.L0,
+        shear_xz=0.8,
+        shear_yz=0.2,
+    )
+    monkeypatch.setattr(OmeZarrDataset, "read_metadata", lambda _target: config.dataset)
+    output = tmp_path / "unsupported"
+    with pytest.raises(ValueError, match="shear_yz"):
+        deskew_dataset(tmp_path / "source", Local(target=output))
+    assert not output.exists()

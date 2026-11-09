@@ -12,6 +12,7 @@ Contains:
   and a single iterator for shard enumeration.
 """
 
+import json
 import math
 from collections.abc import Iterator
 from enum import IntEnum, StrEnum
@@ -890,8 +891,19 @@ class OmeZarrDataset(SparseModel):
 
     @classmethod
     def read_metadata(cls, target: Path | S3Path) -> "OmeZarrDataset":
-        """Read Zarr v3 group + per-level array `zarr.json` files under `target`."""
-        group = Zarr3GroupMeta.model_validate_json((target / "zarr.json").read_text(encoding="utf-8"))
+        """Read a 0.5 or 0.6 OME-Zarr / Zarr v3 dataset without modifying it.
+
+        Legacy 0.5 metadata is normalized to the internal 0.6 representation:
+        axes become a named coordinate system and flat scale/translation lists
+        become sequences. Existing transform values are preserved, including
+        pyramid translations; no new half-voxel offsets are inferred on read.
+        Writing the returned model emits 0.6 metadata at the requested destination.
+        """
+        raw = json.loads((target / "zarr.json").read_text(encoding="utf-8"))
+        ome = raw.get("attributes", {}).get("ome", {})
+        if ome.get("version") == "0.5":
+            ome["version"] = "0.6"
+        group = Zarr3GroupMeta.model_validate(raw)
         multiscales = group.attributes.ome.multiscales or []
         arrays: dict[ScaleLevel, Zarr3ArrayMeta] = {}
         if multiscales:
