@@ -7,7 +7,7 @@ import pytest
 pytest.importorskip("zaber_motion", reason="needs the vxl-drivers `zaber` extra")
 
 from vxl_drivers.axes import zaber
-from vxl_drivers.axes.zaber_probe import probe_zaber
+from vxl_drivers.axes.zaber_probe import diagnose_zaber, probe_zaber
 from zaber_motion.exceptions import CommandFailedException, CommandFailedExceptionData, RequestTimeoutException
 
 from rigup import DeviceConfig, Rig, RigConfig
@@ -271,6 +271,24 @@ class FakeDevice:
             axis.device = self
         self.triggers = FakeTriggers()
         self.io = FakeIO()
+        self.flags: set[str] = set()
+        self.persistent_flags: set[str] = set()
+        self.warnings = SimpleNamespace(
+            get_flags=lambda: set(self.flags),
+            clear_flags=self._clear_warnings,
+        )
+        self.settings = FakeSettings(
+            {
+                zaber.SettingConstants.SYSTEM_VOLTAGE: 48.0,
+                zaber.SettingConstants.SYSTEM_CURRENT: 0.4,
+                zaber.SettingConstants.SYSTEM_TEMPERATURE: 31.5,
+            }
+        )
+
+    def _clear_warnings(self) -> set[str]:
+        previous = set(self.flags)
+        self.flags = set(self.persistent_flags)
+        return previous
 
     def get_axis(self, axis_number: int) -> FakeAxis:
         return self._axes[axis_number]
@@ -1274,8 +1292,11 @@ def test_continuous_scan_clears_sticky_transient_warnings_and_axis_recovers_driv
 
     # Sticky transient warnings (WV, NI, WM) from earlier motion/halt clear before prepare checks readiness.
     sdk.flags = {"WV", "NI"}
+    assert sdk.device is not None
+    sdk.device.flags = {"WV"}
     scanner.prepare(start=SCAN_START, speed=1_000.0)
     assert sdk.flags == set()
+    assert sdk.device.flags == set()
     scanner.reset()
 
     # Persistent WV (when not ignored) still blocks prepare after clear.
@@ -1289,13 +1310,49 @@ def test_continuous_scan_clears_sticky_transient_warnings_and_axis_recovers_driv
     # Clear warnings command clears FF/FZ and re-enables the disabled motor driver.
     sdk.driver_enabled = False
     sdk.flags = {"FF", "FZ"}
+    sdk.device.flags = {"WV"}
     assert axis.warnings == ["FF", "FZ"]
     remaining = axis.clear_warnings()
     assert remaining == []
+    assert sdk.device.flags == set()
     assert sdk.driver_enabled
     assert sdk.driver_enable_calls == 1
     axis.close()
     hub.close()
+
+
+def test_diagnose_zaber_classifies_stale_vs_persistent_wv_without_moving_axes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    axis = FakeAxis(1)
+    axis.settings.values[zaber.SettingConstants.ENCODER_POS] = 25_000.0
+    device = FakeDevice(150584, [axis])
+    connection = FakeConnection([device])
+    install_connection(monkeypatch, connection)
+
+    # 1. Stale latched WV clears and stays clear when system.voltage is nominal (48.0 V).
+    axis.flags = {"WV"}
+    device.flags = {"WV"}
+    report_stale = diagnose_zaber(serial=150584, host="zaber-150584.local", settle_s=0.0)
+    assert report_stale.wv_status == "cleared_stale"
+    assert report_stale.system_voltage_after_v == 48.0
+    assert report_stale.axes[0].warnings_before == ("WV",)
+    assert report_stale.axes[0].warnings_after == ()
+    assert not axis.move_absolute_calls
+    assert not axis.home_calls
+
+    # 2. Persistent WV with ~1.3 V ADC reading is classified as the X-MCC voltage-sense ADC/terminal anomaly.
+    connection.closed = False
+    device.settings.values[zaber.SettingConstants.SYSTEM_VOLTAGE] = 1.3
+    axis.flags = {"WV"}
+    axis.persistent_flags = {"WV"}
+    device.flags = {"WV"}
+    device.persistent_flags = {"WV"}
+    report_adc = diagnose_zaber(serial=150584, host="zaber-150584.local", settle_s=0.0)
+    assert report_adc.wv_status == "persistent_adc_anomaly"
+    assert report_adc.system_voltage_after_v == 1.3
+    assert "2-pin" in report_adc.diagnosis
+    assert report_adc.axes[0].warnings_after == ("WV",)
 
 
 def test_ldm_direct_drive_axes_default_to_gentle_acceleration_and_s_curve_ramptime(

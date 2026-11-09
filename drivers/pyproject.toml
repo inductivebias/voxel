@@ -23,6 +23,7 @@ dependencies = [
 vxl-drivers = "vxl_drivers.cli.main:main"
 vxl-calibrate-mpds = "vxl_drivers.lasers.mpds.cli:main"
 vxl-pvcam-diagnose = "vxl_drivers.cameras.pvcam_diagnose:main"
+vxl-zaber-diagnose = "vxl_drivers.axes.zaber_probe:diagnose_main"
 
 [project.optional-dependencies]
 # vxl-drivers shell: Tab completion and history on Windows

@@ -572,6 +572,8 @@ class ZaberContinuousScanner(ContinuousScanner):
             state = self._state()
             if state["warnings"] and set(state["warnings"]).issubset(_TRANSIENT_WARNINGS):
                 self._axis.warnings.clear_flags()
+                if set(self._device.warnings.get_flags()).issubset(_TRANSIENT_WARNINGS):
+                    self._device.warnings.clear_flags()
                 state = self._state()
             self._check_settled(state, "start", start)
             settings = self._axis.settings
@@ -1142,6 +1144,8 @@ class ZaberLinearAxis(ContinuousAxis):
     def clear_warnings(self) -> list[str]:
         with self.hub.lock:
             cleared = self._axis.warnings.clear_flags()
+            if set(self._device.warnings.get_flags()).issubset(_TRANSIENT_WARNINGS):
+                self._device.warnings.clear_flags()
             if cleared & _DRIVER_FAULT_FLAGS:
                 self._axis.driver_enable()
             return sorted(self._axis.warnings.get_flags())

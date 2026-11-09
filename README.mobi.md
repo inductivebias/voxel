@@ -169,3 +169,32 @@ and finite/windowed-continuous mode. These are effective driver readbacks.
 Windowed mode remains continuous with an exact-count check afterward; it is not
 a finite pulse cap. Division still counts A rising edges without direction, and
 nominal pacing does not enforce a camera-ready condition on each edge.
+
+## Zaber voltage (`WV`) and motion diagnostics
+
+`vxl-zaber-diagnose` (or `python -m vxl_drivers.axes.zaber_probe --diagnose`) inspects a Zaber ASCII
+controller without moving any axis or losing homed state:
+
+```bash
+uv run vxl-zaber-diagnose --host <controller-host>
+```
+
+1. **No power cycle is required for the software check.** If TCP port `55551` (device-only) is
+   already held by a running Voxel or Zaber Launcher session, `vxl-zaber-diagnose` automatically
+   falls back to TCP port `55550` so it can read telemetry in place.
+2. It reads controller `system.voltage` (rated `24.0–48.0 V DC` on X-MCC), `system.current`,
+   `system.temperature`, device-level warnings, and per-axis position, encoder position, homed
+   state, speed, acceleration, S-curve `motion.accel.ramptime`, and axis warnings.
+3. While all axes are idle, it clears both axis-level and device-level warnings
+   (`warnings clear`), waits `0.5 s`, and re-reads `system.voltage` and warning flags to classify
+   any `WV` (Voltage Out of Range) flag:
+   - **`cleared_stale`**: `WV` was latched from an earlier high-deceleration stop or transient dip
+     and stays clear after `warnings clear`.
+   - **`persistent_adc_anomaly`**: `WV` immediately re-asserts while idle and `system.voltage` reads
+     below `5 V` (for example `~1.3 V`) while the controller and stages operate normally. This
+     indicates a voltage-sense ADC or 2-pin power terminal contact anomaly on the controller. To test
+     the physical connector, note the current axis positions, power down the controller (`WR` will
+     require re-homing after power-up), unplug and firmly re-seat the removable 2-pin `24–48 V DC`
+     terminal block, tighten its screw terminals, power back up, and re-run `vxl-zaber-diagnose`.
+   - **`persistent_out_of_range`**: `WV` re-asserts while idle and `system.voltage` is outside the
+     rated `24–48 V DC` supply window.

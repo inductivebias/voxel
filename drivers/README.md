@@ -134,6 +134,11 @@ See the [driver module](src/vxl_drivers/power_meters/thorlabs.py) for setup note
 | Thorlabs MFF101 flip mount | `vxl_drivers.axes.thorlabs.MFF101` | `thorlabs` extra |
 | Thorlabs FW212C filter wheel | `vxl_drivers.axes.fw212c.FW212C` | Serial support included; found by USB serial |
 
+`vxl-zaber-diagnose` (or `python -m vxl_drivers.axes.zaber_probe --diagnose`) reads controller
+`system.voltage`, `system.temperature`, device and per-axis warnings, and motion settings without
+moving or un-homing any stage, and tests whether a `WV` (Voltage Out of Range) warning is a stale
+latched flag or actively re-asserted while idle.
+
 ## Install vendor support
 
 Install only the optional dependency needed by the hardware being configured. From the Voxel workspace, for example:
