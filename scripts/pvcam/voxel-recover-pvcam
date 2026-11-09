@@ -1,0 +1,90 @@
+#!/usr/bin/python3 -I
+"""Root-owned, argument-restricted recovery of Photometrics PCIe camera endpoints."""
+import fcntl
+import os
+from pathlib import Path
+import subprocess
+import sys
+import time
+
+PCI = Path('/sys/bus/pci/devices')
+
+
+def read(path):
+    return path.read_text(encoding='ascii').strip().lower()
+
+
+def endpoints():
+    return [p for p in PCI.iterdir()
+            if read(p / 'vendor') == '0x1b6b' and read(p / 'device') == '0x0001']
+
+
+def run(*args):
+    subprocess.run(args, check=True, timeout=15,
+                   env={'PATH': '/usr/sbin:/usr/bin:/sbin:/bin', 'LANG': 'C'})
+
+
+def main():
+    if sys.argv[1:] not in ([], ['--retrain']):
+        raise RuntimeError('Only the optional --retrain argument is supported')
+    if os.geteuid() != 0:
+        raise RuntimeError('Run this installed helper through sudo')
+    # /run is root-owned; serialize recovery attempts from separate camera processes.
+    fd = os.open('/run/voxel-recover-pvcam.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    with os.fdopen(fd, 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        for process in Path('/proc').iterdir():
+            if not process.name.isdigit():
+                continue
+            try:
+                descriptors = list((process / 'fd').iterdir())
+            except FileNotFoundError:
+                continue
+            for descriptor in descriptors:
+                try:
+                    target = os.readlink(descriptor)
+                except FileNotFoundError:
+                    continue
+                if target.startswith('/dev/pvcamPCIE_'):
+                    raise RuntimeError(f'Camera is open in PID {process.name}; close the instrument first')
+        cameras = endpoints()
+        if not cameras:
+            # Do not reset arbitrary PLX bridges when camera topology is unknown.
+            raise RuntimeError('No known Kinetix endpoints; refusing untargeted PCIe bridge resets')
+        bridges = sorted({p.resolve().parent for p in cameras})
+        for bridge in bridges:
+            if read(bridge / 'class') != '0x060400':
+                raise RuntimeError(f'Unexpected upstream device {bridge.name}')
+            children = {p.resolve() for p in PCI.iterdir() if p.resolve().parent == bridge}
+            if not children.issubset({p.resolve() for p in cameras}):
+                raise RuntimeError(f'Bridge {bridge.name} also serves non-camera devices')
+        if Path('/sys/module/pvcam_pcie').exists():
+            run('/usr/sbin/modprobe', '-r', 'pvcam_pcie')
+        try:
+            for device in [*bridges, *cameras]:
+                (device / 'power/control').write_text('on\n', encoding='ascii')
+            for camera in cameras:
+                (camera / 'remove').write_text('1\n', encoding='ascii')
+            if '--retrain' in sys.argv:
+                for bridge in bridges:
+                    try:
+                        run('/usr/bin/setpci', '-s', bridge.name, 'BRIDGE_CONTROL=0x40:0x40')
+                        time.sleep(0.1)
+                    finally:
+                        run('/usr/bin/setpci', '-s', bridge.name, 'BRIDGE_CONTROL=0x00:0x40')
+                time.sleep(0.5)
+            Path('/sys/bus/pci/rescan').write_text('1\n', encoding='ascii')
+            for camera in endpoints():
+                (camera / 'power/control').write_text('on\n', encoding='ascii')
+        finally:
+            run('/usr/sbin/modprobe', 'pvcam_pcie')
+        run('/usr/bin/udevadm', 'settle', '--timeout=5')
+        print('PVCAM PCIe recovery completed')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except Exception as error:
+        print(f'PVCAM recovery failed: {error}', file=sys.stderr)
+        sys.exit(1)
