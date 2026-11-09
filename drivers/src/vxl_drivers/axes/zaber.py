@@ -308,6 +308,7 @@ class ZaberContinuousScanner(ContinuousScanner):
         invalidate_settings: Callable[[], None],
         window_output: int | None = None,
         window_triggers: tuple[int, int, int] | None = None,
+        ignore_voltage_warning: bool = False,
     ) -> None:
         if encoder < 1:
             raise ValueError(f"scan_encoder must be positive, got {encoder}")
@@ -333,6 +334,7 @@ class ZaberContinuousScanner(ContinuousScanner):
             len(window_triggers) != 3 or min(window_triggers) < 1 or len(set(window_triggers)) != 3
         ):
             raise ValueError("Window trigger IDs must be distinct positive numbers")
+        self._ignore_voltage_warning = ignore_voltage_warning
         self._window_output = window_output
         self._window_triggers = window_triggers
         self._window_armed = False
@@ -484,7 +486,8 @@ class ZaberContinuousScanner(ContinuousScanner):
             raise ValueError(f"scan {name} {position:g} {self._units} is outside limits [{lower:g}, {upper:g}]")
 
     def _check_settled(self, state: dict[str, Any], name: str, position: float) -> None:
-        if state["moving"] or not state["homed"] or state["warnings"]:
+        blocking = set(state["warnings"]) - ({"WV"} if self._ignore_voltage_warning else set())
+        if state["moving"] or not state["homed"] or blocking:
             raise RuntimeError(
                 f"the axis must be idle, homed and warning-free at the scan {name}; "
                 f"moving={state['moving']}, homed={state['homed']}, warnings={state['warnings']}"
@@ -642,6 +645,7 @@ class ZaberContinuousScanner(ContinuousScanner):
                 consecutive += 1
                 if consecutive > _SCAN_POLL_RETRIES:
                     raise
+        flags = set(flags) - ({"WV"} if self._ignore_voltage_warning else set())
         if flags:
             raise RuntimeError(f"Zaber reported {', '.join(sorted(flags))} during the continuous scan")
         return busy
@@ -849,6 +853,7 @@ class ZaberLinearAxis(ContinuousAxis):
         scan_acceleration: float | None = None,
         scan_window_output: int | None = None,
         scan_window_triggers: tuple[int, int, int] | None = None,
+        scan_ignore_voltage_warning: bool = False,
     ) -> None:
         for name, value in (("speed", speed), ("acceleration", acceleration)):
             if value is not None and (not math.isfinite(value) or value <= 0):
@@ -914,6 +919,7 @@ class ZaberLinearAxis(ContinuousAxis):
                     invalidate_settings=self._settings.clear,
                     window_output=scan_window_output,
                     window_triggers=scan_window_triggers,
+                    ignore_voltage_warning=scan_ignore_voltage_warning,
                 )
             if speed is not None:
                 self.speed = speed

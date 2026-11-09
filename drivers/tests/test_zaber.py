@@ -1194,3 +1194,25 @@ def test_continuous_scan_crash_recovery_restores_motion_speed_from_axis_storage(
     assert not sdk.storage.key_exists("voxel.scan.originals")
     recovered.close()
     hub.close()
+
+
+def test_scan_voltage_exception_preserves_other_fault_checks(controller, monkeypatch):
+    hub, _, sdk, _ = controller
+    axis, scanner = scan_axis(hub, monkeypatch, scan_ignore_voltage_warning=True)
+    state = {"moving": False, "homed": True, "warnings": ["WV"], "position": SCAN_START, "encoder_position": SCAN_START}
+    scanner._check_settled(state, "start", SCAN_START)
+    for flags in (["WV", "FF"], ["WR"]):
+        with pytest.raises(RuntimeError, match="warning-free"):
+            scanner._check_settled({**state, "warnings": flags}, "start", SCAN_START)
+    with pytest.raises(RuntimeError):
+        scanner._check_settled({**state, "homed": False}, "start", SCAN_START)
+    scanner._originals = {}
+    sdk.flags = ["WV"]
+    scanner.is_scanning()
+    sdk.flags = ["WV", "FF"]
+    with pytest.raises(RuntimeError, match="FF"):
+        scanner.is_scanning()
+    scanner._originals = None
+    sdk.flags = []
+    axis.close()
+    hub.close()
