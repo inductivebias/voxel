@@ -372,6 +372,8 @@ class _NiResourceManager:
                 resolved_output = self._resolve_locked(output_pfi)
                 if resolved_output.kind is not _TerminalKind.PFI:
                     raise ValueError(f"Output terminal '{output_pfi}' is not a PFI terminal")
+                if resolved_output in resolved_inputs:
+                    raise ValueError("Counter output must not drive its own trigger or encoder input PFI")
 
             resources: set[_ResourceKey] = {("terminal", terminal.canonical_name) for terminal in resolved_ao}
             resources.update(
@@ -390,7 +392,9 @@ class _NiResourceManager:
 
             counter: _ResolvedTerminal | None = None
             if needs_counter:
-                counter, resolved_output = self._select_counter_locked(resources, resolved_output)
+                # Inputs may be shared by readers, but must not be driven by this task's output.
+                input_resources = {("terminal", terminal.canonical_name) for terminal in resolved_inputs}
+                counter, resolved_output = self._select_counter_locked(resources | input_resources, resolved_output)
                 resources.add(("terminal", counter.canonical_name))
                 resources.add(("terminal", resolved_output.canonical_name))
 

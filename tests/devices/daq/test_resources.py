@@ -100,3 +100,32 @@ def test_reserve_input_task_invalid_request_raises(kwargs, message):
 def test_reserve_ao_task_counter_trigger_lists_its_counter_path():
     lease = _manager().reserve_ao_task(owner_uid="pacer", ao_terminals=["ao0"], hardware_timed=True, needs_counter=True)
     assert lease.counter_paths == (lease.counter_path,) == ("/Dev1/ctr0",)
+
+
+def test_counter_output_cannot_drive_its_own_gate_input():
+    manager = _manager()
+    with pytest.raises(ValueError, match="own trigger or encoder input"):
+        manager.reserve_ao_task(
+            owner_uid="pacer",
+            ao_terminals=["ao0"],
+            hardware_timed=True,
+            needs_counter=True,
+            input_pfis=["pfi1", "pfi6"],
+            output_pfi="/Dev1/PFI6",
+        )
+    assert not manager.assigned_pins
+
+
+def test_automatic_counter_output_avoids_its_encoder_source():
+    manager = _manager()
+    lease = manager.reserve_ao_task(
+        owner_uid="pacer",
+        ao_terminals=["ao0"],
+        hardware_timed=True,
+        needs_counter=True,
+        input_pfis=["pfi7", "pfi6"],
+    )
+    assert lease.output_pfi_path not in lease.input_pfi_paths
+    assert lease.counter_path == "/Dev1/ctr1"
+    assert lease.output_pfi_path == "/Dev1/PFI2"
+    lease.release()
