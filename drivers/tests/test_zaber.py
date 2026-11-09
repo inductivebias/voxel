@@ -138,6 +138,9 @@ class FakeIO:
     def set_digital_output(self, channel: int, value: object) -> None:
         self.digital_outputs[channel] = value
 
+    def get_digital_output(self, channel: int) -> int:
+        return int(self.digital_outputs.get(channel) is zaber.DigitalOutputAction.ON)
+
 
 class FakeStorage:
     def __init__(self) -> None:
@@ -1396,3 +1399,51 @@ def test_ldm_direct_drive_axes_default_to_gentle_acceleration_and_s_curve_rampti
     explicit_axis.close()
     plain.close()
     hub.close()
+
+
+def test_window_is_closed_before_prepare_and_failed_finish(controller, monkeypatch):
+    hub, _, sdk, _ = controller
+    axis, scanner = scan_axis(hub, monkeypatch, scan_window_output=2, scan_window_triggers=(3, 4, 5))
+    sdk.device.triggers.by_number[3].enable()
+    sdk.device.io.digital_outputs[2] = zaber.DigitalOutputAction.ON
+    scanner.prepare(start=SCAN_START, speed=2000)
+    assert not sdk.device.triggers.by_number[3].enabled
+    assert sdk.device.io.get_digital_output(2) == 0
+    scanner.arm_window(26000, 29000)
+    sdk.device.io.digital_outputs[2] = zaber.DigitalOutputAction.ON
+    with pytest.raises(RuntimeError):
+        scanner.finish(SCAN_TARGET)  # Still at scan start: final-state validation fails.
+    assert sdk.device.io.get_digital_output(2) == 0
+    assert not any(t.enabled for t in sdk.device.triggers.by_number.values())
+    axis.close()
+
+
+def test_window_reset_readback_failure_is_reported_and_other_cleanup_attempted(controller, monkeypatch):
+    hub, _, sdk, _ = controller
+    axis, scanner = scan_axis(hub, monkeypatch, scan_window_output=2, scan_window_triggers=(3, 4, 5))
+    scanner.prepare(start=SCAN_START, speed=2000)
+    scanner.arm_window(26000, 29000)
+    with monkeypatch.context() as m:
+        m.setattr(sdk.device.io, "get_digital_output", lambda _channel: 1)
+        with pytest.raises(RuntimeError, match="window off"):
+            scanner.reset()
+        assert sdk.settings.values["encoder.2.out.enable"] == 0
+        assert not any(t.enabled for t in sdk.device.triggers.by_number.values())
+    scanner.reset()
+    axis.close()
+
+
+def test_window_disarm_forces_off_even_if_one_trigger_disable_fails(controller, monkeypatch):
+    hub, _, sdk, _ = controller
+    axis, scanner = scan_axis(hub, monkeypatch, scan_window_output=2, scan_window_triggers=(3, 4, 5))
+    scanner.prepare(start=SCAN_START, speed=2000)
+    scanner.arm_window(26000, 29000)
+    sdk.device.io.digital_outputs[2] = zaber.DigitalOutputAction.ON
+    sdk.device.triggers.by_number[3].fail_disable = True
+    with pytest.raises(ExceptionGroup, match="Could not disable scan window"):
+        scanner.disarm_window()
+    assert sdk.device.io.get_digital_output(2) == 0
+    assert not sdk.device.triggers.by_number[4].enabled
+    assert not sdk.device.triggers.by_number[5].enabled
+    sdk.device.triggers.by_number[3].fail_disable = False
+    axis.close()

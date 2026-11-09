@@ -101,6 +101,9 @@ class ContinuousAxisHandle(DeviceHandle[ContinuousAxis]):
     async def arm_scan_window(self, start: float, end: float) -> None:
         await self.call("arm_scan_window", start, end)
 
+    async def disarm_scan_window(self) -> None:
+        await self.call("disarm_scan_window")
+
     async def start_continuous_scan(self, target: float) -> None:
         await self.call("start_continuous_scan", target)
 

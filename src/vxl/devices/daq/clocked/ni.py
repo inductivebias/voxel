@@ -47,11 +47,24 @@ class CounterTrigger(BaseModel):
     edge_source: str | None = None
     edge_filter_us: float = Field(default=0.0, ge=0)
     window_source: str | None = None
+    allow_high_window_at_start: bool = Field(
+        default=False,
+        description=(
+            "Diagnostic override: allow arming with the window HIGH; "
+            "still requires a rising edge unless separately bypassed."
+        ),
+    )
+    bypass_window_start_for_diagnostics: bool = Field(
+        default=False,
+        description="Diagnostic only: count encoder edges immediately without waiting for the window edge.",
+    )
 
     @model_validator(mode="after")
     def _window_requires_encoder(self) -> "CounterTrigger":
         if self.window_source is not None and self.edge_source is None:
             raise ValueError("A scan window requires an encoder edge_source")
+        if self.bypass_window_start_for_diagnostics and self.window_source is None:
+            raise ValueError("Window start bypass requires a configured window_source")
         return self
 
 
@@ -469,10 +482,17 @@ class NiSignalGenerator(SignalGenerator):
         source_path = self._encoder_input
         if source_path is None:
             raise RuntimeError("Encoder input was not resolved during setup")
-        if self._window_input is not None and self._hub.read_digital_input(self._window_input):
-            raise RuntimeError(
-                f"{self.uid}: scan window {self._window_input} is HIGH before motion; "
-                "the gate must be LOW before arming. No trigger output was started."
+        window_high = self._window_input is not None and self._hub.read_digital_input(self._window_input)
+        if window_high:
+            message = f"{self.uid}: scan window {self._window_input} is HIGH before motion"
+            if not isinstance(self._trigger, CounterTrigger) or not (
+                self._trigger.allow_high_window_at_start or self._trigger.bypass_window_start_for_diagnostics
+            ):
+                raise RuntimeError(message + "; the gate must be LOW before arming. No trigger output was started.")
+            self._log.warning(
+                "%s; diagnostic override enabled%s",
+                message,
+                "; still waiting for a rising edge" if not self._trigger.bypass_window_start_for_diagnostics else "",
             )
         self._close_counter_task()
         try:
@@ -482,8 +502,19 @@ class NiSignalGenerator(SignalGenerator):
             readback["counter"] = self._counter_route[0] if self._counter_route else ""
             readback["physical_counter_output"] = channel.co_pulse_term
             readback["count_mode"] = "finite"
-            readback["gate_low_verified_before_start"] = self._window_input is not None
-            if pacing.window_source is not None:
+            readback["gate_low_verified_before_start"] = self._window_input is not None and not window_high
+            readback["gate_high_before_start"] = window_high
+            bypass_window = (
+                isinstance(self._trigger, CounterTrigger) and self._trigger.bypass_window_start_for_diagnostics
+            )
+            if pacing.window_source is not None and bypass_window:
+                readback["window_source"] = self._window_input or ""
+                readback["window_start_bypassed"] = True
+                self._log.warning(
+                    "Diagnostic window bypass: counting encoder edges immediately; runway frames expected"
+                )
+            elif pacing.window_source is not None:
+                readback["window_start_bypassed"] = False
                 start_trigger = divider.triggers.start_trigger
                 if start_trigger.trig_type != TriggerType.DIGITAL_EDGE or start_trigger.dig_edge_edge != Edge.RISING:
                     raise RuntimeError("DAQ window start trigger did not commit as rising-edge")  # noqa: TRY301
@@ -531,7 +562,8 @@ class NiSignalGenerator(SignalGenerator):
         # unfiltered source is synchronized.
         channel.co_ctr_timebase_dig_sync_enable = filter_s == 0
         windowed = self.edge_pacing is not None and self.edge_pacing.window_source is not None
-        if windowed:
+        bypass_window = isinstance(self._trigger, CounterTrigger) and self._trigger.bypass_window_start_for_diagnostics
+        if windowed and not bypass_window:
             if self._lease is None or len(self._lease.input_pfi_paths) != 2:
                 raise RuntimeError("Window input was not reserved")
             if self._window_input is None:

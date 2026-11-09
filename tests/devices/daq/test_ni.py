@@ -290,6 +290,7 @@ class TestNiSignalGeneratorEdgePacing:
             "physical_counter_output": "",
             "count_mode": "finite",
             "gate_low_verified_before_start": False,
+            "gate_high_before_start": False,
         }
 
     def test_start_paced_unfiltered_source_enables_synchronization(self, monkeypatch: pytest.MonkeyPatch):
@@ -440,6 +441,19 @@ def test_explicit_counter_export_is_preserved(monkeypatch):
     assert fake.latest("ao_test_divider").co_channels.add_co_pulse_chan_ticks.return_value.co_pulse_term == "/Dev1/PFI2"
 
 
+def test_high_window_diagnostic_override_keeps_start_trigger_and_records_actual_level(monkeypatch):
+    trigger = CounterTrigger(edge_source="pfi1", window_source="pfi6", allow_high_window_at_start=True)
+    generator, fake = _set_up_ni_generator(monkeypatch, trigger)
+    monkeypatch.setattr(generator._hub, "read_digital_input", lambda _terminal: True)
+    result = generator.start_paced(_DIVISION)
+    assert result["gate_high_before_start"] is True
+    assert result["gate_low_verified_before_start"] is False
+    start_trigger = fake.latest("ao_test_divider").triggers.start_trigger
+    assert start_trigger.dig_edge_src == "/Dev1/PFI6"
+    assert start_trigger.dig_edge_edge == Edge.RISING
+    assert ("start", "ao_test_divider") in fake.events
+
+
 @pytest.mark.parametrize("value", [False, True, [False]])
 def test_gate_read_preserves_scalar_booleans_and_rejects_array_coercion(monkeypatch, value):
     generator, _ = _ni_generator(monkeypatch, CounterTrigger())
@@ -453,3 +467,23 @@ def test_gate_read_preserves_scalar_booleans_and_rejects_array_coercion(monkeypa
         with pytest.raises(RuntimeError, match="one Boolean"):
             NiDaqmx.read_digital_input(generator._hub, "PFI6")
     assert task.di_channels.add_di_chan.call_args.args == ("/Dev1/port1/line6",)
+
+
+@pytest.mark.parametrize("window_high", [False, True])
+def test_diagnostic_window_bypass_starts_finite_divider_without_window_edge(monkeypatch, window_high):
+    trigger = CounterTrigger(edge_source="pfi1", window_source="pfi6", bypass_window_start_for_diagnostics=True)
+    generator, fake = _set_up_ni_generator(monkeypatch, trigger)
+    monkeypatch.setattr(generator._hub, "read_digital_input", lambda _terminal: window_high)
+    result = generator.start_paced(_DIVISION)
+    divider = fake.latest("ao_test_divider")
+    divider.triggers.start_trigger.cfg_dig_edge_start_trig.assert_not_called()
+    divider.timing.cfg_implicit_timing.assert_called_once_with(sample_mode=AcquisitionType.FINITE, samps_per_chan=3)
+    assert result["window_start_bypassed"] is True
+    assert result["gate_high_before_start"] is window_high
+    assert result["count_mode"] == "finite"
+    assert ("start", "ao_test_divider") in fake.events
+
+
+def test_window_bypass_requires_window_source():
+    with pytest.raises(ValueError, match="requires a configured window_source"):
+        CounterTrigger(edge_source="pfi1", bypass_window_start_for_diagnostics=True)

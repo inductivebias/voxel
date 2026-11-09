@@ -116,9 +116,10 @@ checks require the corresponding operator opt-in. Optional SDK and GUI modules u
 
 ## Maintaining the fork
 
-Keep generic drivers and application changes here. Instrument identities, wiring, local network
-configuration, commissioning records, and acquired data belong in a private rig repository.
-The public fork must remain usable without those files.
+Keep generic drivers and application changes here. The commissioned window interface is documented
+in [MOBI_WIRING.md](MOBI_WIRING.md). Instrument identities, local network configuration, calibration,
+raw commissioning records, and acquired data belong in a private rig repository. The public fork
+must remain usable without those files.
 
 `main` tracks upstream; `mobi` carries focused integration commits. Prefer upstreaming each driver
 or independent fix, then remove the equivalent fork change when upstream provides it. Keep trial
@@ -130,19 +131,24 @@ of acquisition when the normal Voxel path can serve the same workflow.
 ## Optional position window for encoder-paced scans
 
 A Zaber scanner can reserve a controller digital output with `scan_window_output` and three
-`scan_window_triggers` (entry, upper exit, lower exit). The NI counter trigger must also name
+`scan_window_triggers` (entry, upper exit, and a third reserved slot). Only the first two
+one-shot triggers are armed; the third is disabled and cleared. The NI counter trigger must also name
 its corresponding TTL-level PFI input as `window_source`. Both sides must be configured together;
 the existing encoder A/B signals remain continuous for position recording. Dedicated trigger IDs
 and the output must not be shared with another axis's stepping/status configuration.
 
-The gate opens once when measured position reaches the scan start, closes at the exclusive scan
-end, and closes if position reverses below the start. It cannot reopen during that pass. Initialization,
+The gate opens once when measured position reaches the scan start and closes at the exclusive
+scan end. It cannot reopen during that pass. A reversal below the start does not close it; an
+unbounded lower-exit trigger is intentionally not armed because entry dither could close the
+window after the one-shot entry has fired. Initialization,
 normal finish, cancellation, failure cleanup, and device close disable the gate. This is controller
 trigger logic, not a process-independent safety interlock or a direction-aware position comparator.
 Reversals within the window can still affect encoder-A edge division and are checked by the recorder.
 
-NI 6738 pause gating requires a continuous counter task. Windowed acquisitions therefore validate
-exact AO cycle and exposure counts after the pass rather than relying on a finite counter pulse limit.
+The NI divider waits for a rising window edge, then generates a finite number of encoder-paced
+pulses. The falling edge does not pause or terminate this finite train; the pulse limit and recorded
+positions/counts are checked separately. AO retriggers can still be rejected while a waveform is
+playing, so the requested counter count alone does not guarantee actual camera TTLs or exposures.
 The divider starts two encoder edges after window entry (the supported minimum), introducing an
 encoder-phase offset relative to the boundary; recorded exposure positions remain authoritative.
 The window and committed gate input are retained in scan metadata. A physical gate/polarity and
@@ -150,8 +156,8 @@ position-timing test is required before enabling this optional mode on an instru
 
 ### Encoder-trigger routing and startup checks
 
-The scan trigger path is encoder input → pause-gated counter divider → counter
-InternalOutput → retriggerable AO waveform → camera Trigger In. Counter pulses
+The scan trigger path is encoder input → finite counter divider started by the window edge →
+counter InternalOutput → retriggerable AO waveform → camera Trigger In. Counter pulses
 are not exported to a physical PFI unless `trigger.output` explicitly requests it.
 The counter's allocator still reserves its selected output route; disabling physical
 export does not change which counter is selected.
@@ -166,9 +172,26 @@ not an independent measurement of the voltage at the breakout.
 The acquisition diagnostics record the counter, physical output (empty for
 internal-only triggering), encoder source, AO trigger source, window source,
 and finite/windowed-continuous mode. These are effective driver readbacks.
-Windowed mode remains continuous with an exact-count check afterward; it is not
-a finite pulse cap. Division still counts A rising edges without direction, and
-nominal pacing does not enforce a camera-ready condition on each edge.
+Windowed mode uses a finite pulse cap and still validates actual AO cycles and exposures.
+Division counts A rising edges without direction, and nominal pacing does not enforce a
+camera-ready condition on each edge.
+
+The window is reset before return-to-start motion and again before preparation. Disarming disables
+all reserved window triggers, commands the output OFF and verifies its controller readback. Finish,
+capture failure and cancellation close it before recorder/writer cleanup; cleanup continues after
+errors and retries reset. The controller readback is distinct from the DAQ input voltage. Abrupt
+host/process loss still requires an independent watchdog/interlock if guaranteed closure is needed.
+
+Two diagnostic options default to `false` and must remain disabled for normal acquisition:
+
+- `allow_high_window_at_start` permits arming with a HIGH input, but still waits for a new rising
+  edge unless the separate bypass is enabled.
+- `bypass_window_start_for_diagnostics` starts the finite encoder divider immediately, without a
+  window edge. It can acquire runway frames and does not validate window alignment.
+
+Diagnostics report `gate_high_before_start`, `gate_low_verified_before_start` and
+`window_start_bypassed` alongside effective routing. Commission the electrical interface using the
+stationary OFF/ON/OFF procedure in [MOBI_WIRING.md](MOBI_WIRING.md) before testing motion.
 
 ## Zaber voltage (`WV`) and motion diagnostics
 

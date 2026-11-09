@@ -116,6 +116,11 @@ class ContinuousScanner(ABC):
         """Arm a one-pass position gate; reset/finish must disable it."""
         raise NotImplementedError("This axis has no position window output")
 
+    def disarm_window(self) -> None:
+        """Close a supported position window without stopping or restoring the axis."""
+        if self.info.window_available:
+            raise NotImplementedError("This scanner must implement window disarming")
+
     @abstractmethod
     def start(self, target: float) -> None:
         """Start the single constant-speed move to `target`. Never retried."""
@@ -249,6 +254,11 @@ class ContinuousAxisController(DeviceController["ContinuousAxis"]):
     @describe(label="Arm Scan Window")
     async def arm_scan_window(self, start: float, end: float) -> None:
         await self._run_sync(self._prepared_scanner().arm_window, start, end)
+
+    @describe(label="Disarm Scan Window")
+    async def disarm_scan_window(self) -> None:
+        if self._continuous_scanner is not None:
+            await self._run_sync(self._continuous_scanner.disarm_window)
 
     @describe(label="Start Continuous Scan")
     async def start_continuous_scan(self, target: float) -> None:

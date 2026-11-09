@@ -1959,6 +1959,10 @@ class Instrument:
     async def _position_volume(
         self, volume: PlannedVolume, planned: ContinuousPass | None, progress: "_PassProgress | None"
     ) -> None:
+        if planned is not None and progress is not None:
+            # Close a previous pass's window before any return-to-start movement.
+            progress.prepared = True
+            await self._volume_scan_axis(volume).reset_continuous_scan()
         if volume.scan is not None and planned is not None:
             if violations := await self._hold_violations(volume):
                 raise OperationRejectedError("; ".join(violations))
@@ -2139,6 +2143,10 @@ class Instrument:
                 "prepared": prepared,
             }
             try:
+                await axis.disarm_scan_window()
+            except Exception:
+                logger.exception("Could not close scan window; teardown will retry")
+            try:
                 await _disable_lasers_and_halt(self._all_lasers(), axis, halt=True)
                 await self._stop_signal_generators()
                 try:
@@ -2156,6 +2164,7 @@ class Instrument:
                 logger.exception("Could not save continuous scan failure diagnostics")
             raise
 
+        await axis.disarm_scan_window()
         recorded = await recorder.finish(_RECORDER_FINISH_TIMEOUT_S)
         progress.recording = False
         final = await axis.finish_continuous_scan(planned.end)
@@ -2267,8 +2276,17 @@ class Instrument:
 
         unfinished = progress is not None and not progress.finished
         halt = unfinished and progress is not None and progress.moving
+        window_errors: list[Exception] = []
+        if progress is not None:
+            try:
+                # This must precede waits for motion, DAQ, recorder or writers.
+                await scanning_axis.disarm_scan_window()
+            except Exception as error:
+                logger.exception("cleanup: closing the scan window failed")
+                window_errors.append(error)
         laser_chans = self._all_lasers()
         laser_results, errors = await _disable_lasers_and_halt(laser_chans, scanning_axis, halt=halt)
+        errors[:0] = window_errors
         errors[:0] = _report("disable_laser_output", laser_chans, laser_results, collect=True)
         try:
             await self._stop_signal_generators()

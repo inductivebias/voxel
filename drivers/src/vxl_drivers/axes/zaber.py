@@ -605,6 +605,7 @@ class ZaberContinuousScanner(ContinuousScanner):
         with self._lock:
             if self._originals is not None:
                 raise RuntimeError("a continuous scan is already prepared; finish or reset it first")
+            self._disarm_window()
             self._check_ready(start)
             self._originals = {name: self._axis.settings.get(name) for name in self._changed}
             self._status_timeouts = 0
@@ -652,11 +653,18 @@ class ZaberContinuousScanner(ContinuousScanner):
                 failures.append(error)
         try:
             self._device.io.set_digital_output(self._window_output, DigitalOutputAction.OFF)
+            if self._device.io.get_digital_output(self._window_output) != 0:
+                raise RuntimeError(f"scan window DO{self._window_output} did not reset LOW")  # noqa: TRY301
         except Exception as error:
             failures.append(error)
         if failures:
             raise ExceptionGroup("Could not disable scan window", failures)
         self._window_armed = False
+
+    def disarm_window(self) -> None:
+        """Close the position window without waiting for motion or recorder cleanup."""
+        with self._lock:
+            self._disarm_window()
 
     def arm_window(self, start: float, end: float) -> None:
         with self._lock:
@@ -751,6 +759,7 @@ class ZaberContinuousScanner(ContinuousScanner):
 
     def finish(self, target: float) -> dict[str, Any]:
         with self._lock:
+            self._disarm_window()
             if self._originals is None:
                 raise RuntimeError("prepare the continuous scan first")
             state = self._state()
