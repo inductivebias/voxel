@@ -200,3 +200,29 @@ def test_window_requires_both_sides(stage, daq):
     )
     assert planned is None
     assert any("configured together" in error for error in errors)
+
+
+def test_plan_continuous_pass_accounts_for_s_curve_ramptime_and_clears_window_before_decelerating() -> None:
+    # With short trigger pulses (3.5 ms) and large step spacing, the hardware window
+    # [z_start, z_start + frames * z_step] extends past the last trigger pulse; deceleration (end - ramp)
+    # must still begin strictly after window[1].
+    s_curve_info = INFO.model_copy(update={"acceleration": 10_000.0, "ramptime_ms": 50.0, "window_available": True})
+    window_pacing = PACING.model_copy(update={"window_source": "pfi6"})
+    planned, errors = plan_continuous_pass(
+        z_start=26_060.0,
+        z_step=80.0,
+        frames=50,
+        signals=make_signals(duration="3.5 ms", rest_time="76.5 ms"),
+        scan=SCAN,
+        info=s_curve_info,
+        pacing=window_pacing,
+        limits=(0.0, 210_000.0),
+    )
+    assert not errors
+    assert planned is not None
+    assert planned.window is not None
+    assert planned.window == (26_060.0, 30_060.0)
+    # At 1000 um/s, 10000 um/s^2, and 50 ms ramptime: ramp = 1000^2 / 20000 + 0.5 * 1000 * 0.05 = 50 + 25 = 75 um.
+    ramp = 75.0
+    decel_start = planned.end - ramp
+    assert decel_start > planned.window[1]

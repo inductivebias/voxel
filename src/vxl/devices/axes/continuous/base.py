@@ -82,12 +82,14 @@ class ContinuousScanInfo(BaseModel, frozen=True):
         edge_spacing: Axis travel, in axis units, per exported encoder A rising edge.
         acceleration: Acceleration the scan uses, in axis units per second squared.
         max_speed: Fastest speed the exported encoder signal supports, in axis units per second.
+        ramptime_ms: S-curve jerk-limiting ramp time in milliseconds (0 for plain trapezoidal ramps).
     """
 
     window_available: bool = False
     edge_spacing: float
     acceleration: float
     max_speed: float
+    ramptime_ms: float = 0.0
 
 
 class ContinuousScanner(ABC):

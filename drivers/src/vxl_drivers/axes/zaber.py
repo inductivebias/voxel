@@ -62,6 +62,10 @@ _SCAN_STOP_TIMEOUT_S = 5.0
 _ORIGINALS_STORAGE_KEY = "voxel.scan.originals"
 # How far the planned and measured positions may be from a scan's start or target: 1 µm in each unit.
 _SCAN_POSITION_TOLERANCE = {"nm": 1000.0, "um": 1.0, "mm": 0.001}
+# Sticky non-fault warnings that remain latched after an earlier move/halt until `warnings clear`.
+_TRANSIENT_WARNINGS = frozenset({"WV", "NI", "WM"})
+# Critical fault flags that disable the motor driver on Zaber closed-loop stages.
+_DRIVER_FAULT_FLAGS = frozenset({"FF", "FZ", "FH", "FO"})
 
 # Position, velocity, and acceleration units for each configurable length unit.
 _UNITS = {
@@ -135,6 +139,23 @@ def _validate_scan_config(*values: float | None) -> None:
             "configure scan_encoder, scan_interpolation, scan_output_width_ns, scan_scale_period "
             "and scan_acceleration together"
         )
+
+
+def _validate_motion_config(
+    speed: float | None,
+    acceleration: float | None,
+    ramptime_ms: float | None,
+    scan_ramptime_ms: float | None,
+    scan_encoder: int | None,
+) -> None:
+    for name, value in (("speed", speed), ("acceleration", acceleration)):
+        if value is not None and (not math.isfinite(value) or value <= 0):
+            raise ValueError(f"{name} must be finite and positive, got {value}")
+    for name, value in (("ramptime_ms", ramptime_ms), ("scan_ramptime_ms", scan_ramptime_ms)):
+        if value is not None and (not math.isfinite(value) or value < 0):
+            raise ValueError(f"{name} must be finite and nonnegative, got {value}")
+    if scan_ramptime_ms is not None and scan_encoder is None:
+        raise ValueError("scan_ramptime_ms requires continuous encoder scanning")
 
 
 def _check_channel(name: str, number: int, count: int) -> None:
@@ -309,6 +330,7 @@ class ZaberContinuousScanner(ContinuousScanner):
         window_output: int | None = None,
         window_triggers: tuple[int, int, int] | None = None,
         ignore_voltage_warning: bool = False,
+        ramptime_ms: float | None = None,
     ) -> None:
         if encoder < 1:
             raise ValueError(f"scan_encoder must be positive, got {encoder}")
@@ -322,6 +344,8 @@ class ZaberContinuousScanner(ContinuousScanner):
         for name, value in (("scan_scale_period", scale_period), ("scan_acceleration", acceleration)):
             if not math.isfinite(value) or value <= 0:
                 raise ValueError(f"{name} must be finite and positive, got {value}")
+        if ramptime_ms is not None and (not math.isfinite(ramptime_ms) or ramptime_ms < 0):
+            raise ValueError(f"scan_ramptime_ms must be finite and nonnegative, got {ramptime_ms}")
         self._lock = lock
         self._axis = axis
         self._device = axis.device
@@ -348,6 +372,7 @@ class ZaberContinuousScanner(ContinuousScanner):
         self._interpolation = interpolation
         self._output_width_ns = output_width_ns
         self._acceleration = acceleration
+        self._ramptime_ms = None if ramptime_ms is None else float(round(ramptime_ms))
         self._invalidate_settings = invalidate_settings
         rate_limit = scale_period / (interpolation * output_width_ns * 1e-9)
         self._info = ContinuousScanInfo(
@@ -355,16 +380,20 @@ class ZaberContinuousScanner(ContinuousScanner):
             edge_spacing=4 * scale_period / interpolation,
             acceleration=acceleration,
             max_speed=_SCAN_SPEED_MARGIN * rate_limit,
+            ramptime_ms=self._ramptime_ms or 0.0,
         )
         # Output enable first, so restoring in order turns the output off before any other change.
-        self._changed = (
+        changed: list[str] = [
             self._enable,
             f"encoder.{encoder}.out.interpolation",
             f"encoder.{encoder}.out.width",
             SettingConstants.MAXSPEED,
             SettingConstants.MOTION_ACCELONLY,
             SettingConstants.MOTION_DECELONLY,
-        )
+        ]
+        if self._ramptime_ms is not None:
+            changed.append(SettingConstants.MOTION_ACCEL_RAMPTIME)
+        self._changed = tuple(changed)
         self._originals: dict[str, float] | None = self._load_persisted_originals()
         self._started = False
         self._status_timeouts = 0
@@ -432,6 +461,15 @@ class ZaberContinuousScanner(ContinuousScanner):
             self._originals[SettingConstants.MOTION_ACCELONLY] = native
             self._originals[SettingConstants.MOTION_DECELONLY] = native
             self._persist_originals()
+
+    def update_motion_ramptime_ms(self, ramptime_ms: float) -> None:
+        """Update the motion acceleration ramp time that will be restored when the current scan ends."""
+        with self._lock:
+            if self._originals is None:
+                return
+            if SettingConstants.MOTION_ACCEL_RAMPTIME in self._originals:
+                self._originals[SettingConstants.MOTION_ACCEL_RAMPTIME] = float(round(ramptime_ms))
+                self._persist_originals()
 
     def _verify_native(self, name: str, expected: float) -> float:
         with self._lock:
@@ -505,6 +543,9 @@ class ZaberContinuousScanner(ContinuousScanner):
             if any(trigger.enabled for trigger in self._device.triggers.get_enabled_states()):
                 raise RuntimeError("disable every Zaber trigger before scanning; reset any TTL stepper first")
             state = self._state()
+            if state["warnings"] and set(state["warnings"]).issubset(_TRANSIENT_WARNINGS):
+                self._axis.warnings.clear_flags()
+                state = self._state()
             self._check_settled(state, "start", start)
             settings = self._axis.settings
             if settings.get(self._enable) != 0:
@@ -514,8 +555,8 @@ class ZaberContinuousScanner(ContinuousScanner):
                 raise RuntimeError(f"the axis follows encoder {default:g}, not scan encoder {self._encoder}")
             if settings.get(SettingConstants.CLOOP_ENABLE) != 1:
                 raise RuntimeError("closed-loop control must be on to scan")
-            # The scan's lead-in and stopping distance assume a plain trapezoidal profile.
-            if settings.get(SettingConstants.MOTION_ACCEL_RAMPTIME) != 0:
+            # When scan_ramptime_ms is not configured, require a plain trapezoidal profile.
+            if self._ramptime_ms is None and settings.get(SettingConstants.MOTION_ACCEL_RAMPTIME) != 0:
                 raise RuntimeError("motion.accel.ramptime must be 0 to scan")
             self._check_within_limits("start", start)
         return state
@@ -542,6 +583,8 @@ class ZaberContinuousScanner(ContinuousScanner):
                 # The accel alias writes acceleration and deceleration but reads back acceleration only.
                 accel = self._set_verified(SettingConstants.ACCEL, self._acceleration, self._acceleration_unit)
                 self._verify_native(SettingConstants.MOTION_DECELONLY, accel)
+                if self._ramptime_ms is not None:
+                    self._set_verified(SettingConstants.MOTION_ACCEL_RAMPTIME, self._ramptime_ms)
                 self._set_verified(self._enable, 1)
             except BaseException as error:
                 try:
@@ -842,6 +885,7 @@ class ZaberLinearAxis(ContinuousAxis):
         units: str = "um",
         speed: float | None = None,
         acceleration: float | None = None,
+        ramptime_ms: float | None = None,
         ttl_input: int | None = None,
         ttl_trigger: int | None = None,
         ttl_status_output: int | None = None,
@@ -851,13 +895,12 @@ class ZaberLinearAxis(ContinuousAxis):
         scan_output_width_ns: int | None = None,
         scan_scale_period: float | None = None,
         scan_acceleration: float | None = None,
+        scan_ramptime_ms: float | None = None,
         scan_window_output: int | None = None,
         scan_window_triggers: tuple[int, int, int] | None = None,
         scan_ignore_voltage_warning: bool = False,
     ) -> None:
-        for name, value in (("speed", speed), ("acceleration", acceleration)):
-            if value is not None and (not math.isfinite(value) or value <= 0):
-                raise ValueError(f"{name} must be finite and positive, got {value}")
+        _validate_motion_config(speed, acceleration, ramptime_ms, scan_ramptime_ms, scan_encoder)
         _validate_ttl_config(ttl_input, ttl_trigger, ttl_status_output, ttl_status_trigger)
         _validate_scan_config(
             scan_encoder, scan_interpolation, scan_output_width_ns, scan_scale_period, scan_acceleration
@@ -920,11 +963,14 @@ class ZaberLinearAxis(ContinuousAxis):
                     window_output=scan_window_output,
                     window_triggers=scan_window_triggers,
                     ignore_voltage_warning=scan_ignore_voltage_warning,
+                    ramptime_ms=scan_ramptime_ms if scan_ramptime_ms is not None else ramptime_ms,
                 )
             if speed is not None:
                 self.speed = speed
             if acceleration is not None:
                 self.acceleration = acceleration
+            if ramptime_ms is not None:
+                self.ramptime_ms = ramptime_ms
         except Exception:
             hub.release_axis(device_serial, axis_number)
             raise
@@ -966,6 +1012,14 @@ class ZaberLinearAxis(ContinuousAxis):
         except CommandFailedException as error:
             # The controller, not the host, enforces limit.min/limit.max on every move.
             if error.details.response_data != "BADDATA":
+                try:
+                    flags = self.warnings
+                except Exception:
+                    flags = []
+                error.add_note(
+                    f"Zaber serial {self.device_serial} axis {self.axis_number} rejected {request} "
+                    f"({error.details.response_data}); active warnings: {flags}"
+                )
                 raise
             raise ValueError(
                 f"Zaber serial {self.device_serial} axis {self.axis_number} rejected {request}; "
@@ -1040,6 +1094,23 @@ class ZaberLinearAxis(ContinuousAxis):
         with self.hub.lock:
             return self._axis.is_homed()
 
+    @property
+    @describe(label="Warnings", desc="Latched warning and fault flags reported by the controller.")
+    def warnings(self) -> list[str]:
+        with self.hub.lock:
+            return sorted(self._axis.warnings.get_flags())
+
+    @describe(
+        label="Clear Warnings",
+        desc="Clear latched warnings and re-enable the motor driver if a fault disabled it.",
+    )
+    def clear_warnings(self) -> list[str]:
+        with self.hub.lock:
+            cleared = self._axis.warnings.clear_flags()
+            if cleared & _DRIVER_FAULT_FLAGS:
+                self._axis.driver_enable()
+            return sorted(self._axis.warnings.get_flags())
+
     def set_zero_here(self) -> None:
         self.set_logical_position(0.0)
 
@@ -1093,6 +1164,26 @@ class ZaberLinearAxis(ContinuousAxis):
                 self._continuous_scanner.update_motion_acceleration(value)
                 return
             self._set_setting(SettingConstants.ACCEL, value, self._acceleration_unit, positive=True)
+
+    @property
+    @describe(
+        label="Acceleration Ramp Time",
+        units="ms",
+        desc="S-curve jerk-limiting ramp time in milliseconds (0 for plain trapezoidal ramps).",
+    )
+    def ramptime_ms(self) -> float:
+        return self._setting(SettingConstants.MOTION_ACCEL_RAMPTIME, Units.NATIVE)
+
+    @ramptime_ms.setter
+    def ramptime_ms(self, value: float) -> None:
+        if not math.isfinite(value) or value < 0:
+            raise ValueError(f"{SettingConstants.MOTION_ACCEL_RAMPTIME} must be finite and nonnegative, got {value}")
+        rounded = float(round(value))
+        with self.hub.lock:
+            if self._continuous_scanner is not None and self._continuous_scanner.is_prepared:
+                self._continuous_scanner.update_motion_ramptime_ms(rounded)
+                return
+            self._set_setting(SettingConstants.MOTION_ACCEL_RAMPTIME, rounded, Units.NATIVE)
 
     @property
     def backlash(self) -> None:

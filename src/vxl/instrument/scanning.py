@@ -95,12 +95,15 @@ def plan_continuous_pass(
             "encoder transitions at this speed"
         )
 
-    ramp = speed**2 / (2 * info.acceleration)
+    ramptime_s = max(0.0, info.ramptime_ms) / 1000.0
+    ramp = speed**2 / (2 * info.acceleration) + 0.5 * speed * ramptime_s
     initial_delay = max(scan.lead_in_edges, math.ceil(ramp / edge) + 2)
     start = z_start - (initial_delay - 1) * edge
-    end = (
-        start + (initial_delay + (frames - 1) * divider + _TRAILING_EDGES) * edge + ramp + speed * (cycle + _LEAD_OUT_S)
+    window_end = z_start + frames * z_step
+    last_cycle_end = (
+        start + (initial_delay + (frames - 1) * divider + _TRAILING_EDGES) * edge + speed * (cycle + _LEAD_OUT_S)
     )
+    end = max(last_cycle_end, window_end + speed * _LEAD_OUT_S) + ramp
     if runway_s is not None:
         runway = speed * runway_s
         edges = runway / edge
@@ -110,7 +113,7 @@ def plan_continuous_pass(
         if not math.isclose(edges, round(edges), rel_tol=1e-9, abs_tol=1e-9):
             violations.append("runway distance must be a whole number of encoder edges")
         requested_start = z_start - runway
-        requested_end = z_start + frames * z_step + runway
+        requested_end = window_end + runway
         if requested_start > start or requested_end < end:
             violations.append("runway is too short for acceleration, final exposure, and deceleration")
         initial_delay = max(1, round(edges) + 1)

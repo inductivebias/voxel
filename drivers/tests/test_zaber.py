@@ -185,11 +185,26 @@ class FakeAxis:
         self.busy = False
         self.homed = True
         self.flags: set[str] = set()
-        self.warnings = SimpleNamespace(get_flags=lambda: set(self.flags))
+        self.persistent_flags: set[str] = set()
+        self.driver_enabled = True
+        self.driver_enable_calls = 0
+        self.warnings = SimpleNamespace(
+            get_flags=lambda: set(self.flags),
+            clear_flags=self._clear_warnings,
+        )
         self.move_absolute_calls: list[tuple[float, object, bool]] = []
         self.move_relative_calls: list[tuple[float, object, bool]] = []
         self.home_calls: list[bool] = []
         self.stop_calls: list[bool] = []
+
+    def _clear_warnings(self) -> set[str]:
+        previous = set(self.flags)
+        self.flags = set(self.persistent_flags)
+        return previous
+
+    def driver_enable(self) -> None:
+        self.driver_enable_calls += 1
+        self.driver_enabled = True
 
     def get_position(self, unit: object) -> float:
         del unit
@@ -1214,5 +1229,70 @@ def test_scan_voltage_exception_preserves_other_fault_checks(controller, monkeyp
         scanner.is_scanning()
     scanner._originals = None
     sdk.flags = []
+    axis.close()
+    hub.close()
+
+
+def test_continuous_scan_supports_configured_s_curve_ramptime_and_restores_it(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub, _connection, sdk, _y_sdk = controller
+    axis, scanner = scan_axis(
+        hub,
+        monkeypatch,
+        speed=5_000.0,
+        acceleration=20_000.0,
+        ramptime_ms=50.0,
+        scan_acceleration=10_000.0,
+        scan_ramptime_ms=80.0,
+    )
+    assert axis.ramptime_ms == 50.0
+    assert scanner.info.ramptime_ms == 80.0
+    assert scanner.info.acceleration == 10_000.0
+
+    scanner.prepare(start=SCAN_START, speed=1_000.0)
+    assert sdk.settings.values[S.MOTION_ACCEL_RAMPTIME] == 80.0
+    axis.ramptime_ms = 60.0
+    assert sdk.settings.values[S.MOTION_ACCEL_RAMPTIME] == 80.0, "active scan ramptime stays intact while prepared"
+
+    scanner.start(SCAN_TARGET)
+    sdk.busy = False
+    sdk.settings.values[S.POS] = SCAN_TARGET
+    scanner.finish(SCAN_TARGET)
+    assert axis.ramptime_ms == 60.0
+    axis.close()
+    hub.close()
+
+
+def test_continuous_scan_clears_sticky_transient_warnings_and_axis_recovers_driver_faults(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    hub, _connection, sdk, _y_sdk = controller
+    axis, scanner = scan_axis(hub, monkeypatch)
+
+    # Sticky transient warnings (WV, NI, WM) from earlier motion/halt clear before prepare checks readiness.
+    sdk.flags = {"WV", "NI"}
+    scanner.prepare(start=SCAN_START, speed=1_000.0)
+    assert sdk.flags == set()
+    scanner.reset()
+
+    # Persistent WV (when not ignored) still blocks prepare after clear.
+    sdk.flags = {"WV"}
+    sdk.persistent_flags = {"WV"}
+    with pytest.raises(RuntimeError, match="warning-free"):
+        scanner.prepare(start=SCAN_START, speed=1_000.0)
+    sdk.persistent_flags.clear()
+    sdk.flags.clear()
+
+    # Clear warnings command clears FF/FZ and re-enables the disabled motor driver.
+    sdk.driver_enabled = False
+    sdk.flags = {"FF", "FZ"}
+    assert axis.warnings == ["FF", "FZ"]
+    remaining = axis.clear_warnings()
+    assert remaining == []
+    assert sdk.driver_enabled
+    assert sdk.driver_enable_calls == 1
     axis.close()
     hub.close()
