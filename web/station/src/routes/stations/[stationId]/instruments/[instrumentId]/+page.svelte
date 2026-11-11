@@ -109,6 +109,19 @@
   const locked = $derived(!instrument || instrument.busy || instrument.edits.pending);
 
   const preferenceKey = $derived(`${routeParams.stationId}/${routeParams.instrumentId}`);
+  const excludedTaskIds = $derived(prefs.plan.excludedTasks.get()[preferenceKey] ?? []);
+  const selectedTaskIds = $derived(tasks.filter((task) => !excludedTaskIds.includes(task.id)).map((task) => task.id));
+  const selectedTaskSet = $derived(new Set(selectedTaskIds));
+  const selectedVolumes = $derived(
+    instrument?.plannedVolumes.filter((volume) => selectedTaskSet.has(volume.task)) ?? []
+  );
+
+  function selectTask(taskId: string, selected: boolean): void {
+    const excluded = new Set(excludedTaskIds);
+    if (selected) excluded.delete(taskId);
+    else excluded.add(taskId);
+    prefs.plan.excludedTasks.set({ ...prefs.plan.excludedTasks.get(), [preferenceKey]: [...excluded] });
+  }
   const currentPosition = $derived.by(() => {
     const x = instrument?.stage.x.position?.value;
     const y = instrument?.stage.y.position?.value;
@@ -148,7 +161,7 @@
   const percent = $derived.by(() => {
     if (!manifest?.volumes.length || !active) return 0;
     const current = framesTotal ? Math.min(1, active.frames_captured / framesTotal) : 0;
-    return Math.round(((finished(manifest) + current) / manifest.volumes.length) * 100);
+    return Math.round(((active.volume_index + current) / manifest.volumes.length) * 100);
   });
 
   let lastRunId = $state<string | null>(null);
@@ -230,12 +243,12 @@
   function readyChecks(source: Instrument): ReadyCheck[] {
     const out: ReadyCheck[] = [];
     out.push(
-      source.plannedVolumes.length
+      selectedVolumes.length
         ? {
             tone: 'ok',
-            text: `${plural(source.plan.length, 'task')} → ${plural(source.plannedVolumes.length, 'volume')}`
+            text: `${plural(selectedTaskIds.length, 'selected task')} → ${plural(selectedVolumes.length, 'volume')}`
           }
-        : { tone: 'block', text: 'No tasks planned' }
+        : { tone: 'block', text: tasks.length ? 'No tasks selected' : 'No tasks planned' }
     );
     for (const device of source.devices.values()) {
       if (deviceReady(device)) continue;
@@ -257,11 +270,19 @@
   }
 
   function estimateSeconds(source: Instrument): number {
-    return source.plannedVolumes.reduce((total, item) => {
-      const period = Math.max(
+    return selectedVolumes.reduce((total, item) => {
+      let period = Math.max(
         0,
         ...Object.values(profiles[item.profile]?.sync ?? {}).map((signals) => signals.duration + signals.rest_time)
       );
+      const wiring = source.hal.continuous_scan;
+      const signals = wiring ? profiles[item.profile]?.sync[wiring.generator] : undefined;
+      if (item.scan?.target_frame_rate_hz != null && wiring && signals) {
+        period = Math.max(
+          1 / item.scan.target_frame_rate_hz,
+          (signals.duration + wiring.rearm_margin_s + 1 / signals.sample_rate) * (1 + wiring.speed_tolerance)
+        );
+      }
       return total + framesOf(item) * period;
     }, 0);
   }
@@ -269,7 +290,7 @@
   function estimateGb(source: Instrument): number | null {
     const { channels } = source.state.imaging;
     let megabytes = 0;
-    for (const item of source.plannedVolumes) {
+    for (const item of selectedVolumes) {
       for (const channelId of profiles[item.profile]?.channels ?? []) {
         const frameMb = source.cameras.get(channels[channelId]?.detection ?? '')?.frameSizeMb?.value;
         if (typeof frameMb !== 'number') return null;
@@ -319,11 +340,21 @@
     if (instrument === target) await goto(resolve(TASK_ROUTE, { ...routeParams, taskId: task.id }));
   }
 
-  async function addLine(): Promise<void> {
+  async function addLine(array = false): Promise<void> {
     const target = instrument;
     const z = target?.stage.z.position?.value;
     if (!target || !currentPosition || z == null || !currentProfile || locked) return;
     const task = createLineTask({ ...currentPosition, z }, currentProfile, target.hal.continuous_scan?.axis ?? 'x');
+    const previous = [...target.plan].reverse().find((candidate) => candidate.scan?.axis === 'x');
+    if (array && previous?.scan) task.scan = { ...previous.scan };
+    if (task.scan) {
+      const sync = target.imaging.profiles[currentProfile]?.sync[target.hal.continuous_scan?.generator ?? ''];
+      task.scan.target_frame_rate_hz ??= sync ? 1 / (sync.duration + sync.rest_time) : 100;
+      task.scan.camera_rate_fraction = null;
+      if (array) {
+        task.scan.y_stack = { start: currentPosition.y, end: currentPosition.y + 500, step: 500 };
+      }
+    }
     await target.addTask(task);
     if (instrument === target) await goto(resolve(TASK_ROUTE, { ...routeParams, taskId: task.id }));
   }
@@ -345,11 +376,13 @@
   }
 
   async function start(source: Instrument): Promise<void> {
+    const taskIds = [...selectedTaskIds];
+    if (!taskIds.length) return;
     starting = true;
     try {
       const record = await source.startAcquisition({
         storage: store === LOCAL_STORE ? { path } : { path, remote: { store, root, stage } },
-        task_ids: null
+        task_ids: taskIds
       });
       lastRunId = record.id;
     } catch (error) {
@@ -390,6 +423,16 @@
     >
       <Plus class="size-3.5" /> X-Scan
     </Button>
+    <Button
+      variant="outline"
+      disabled={!canAddPosition ||
+        instrument?.stage.z.position?.value == null ||
+        instrument?.hal.continuous_scan?.axis !== 'x'}
+      onclick={() => reportFailure(addLine(true))}
+      title="Repeat X sweeps at successive Y positions, holding Z fixed"
+    >
+      <Plus class="size-3.5" /> XY-Scan
+    </Button>
     <Button variant="outline" disabled={!canAddArea} onclick={() => reportFailure(addArea())}>
       <Plus class="size-3.5" />
       Area
@@ -422,6 +465,9 @@
     {/if}
 
     <Section heading="Tasks">
+      {#snippet trailing()}
+        <span class="text-sm text-fg-muted tabular-nums">{selectedTaskIds.length} of {tasks.length} selected</span>
+      {/snippet}
       {#if tasks.length}
         <Sortable.Root
           items={tasks}
@@ -440,13 +486,23 @@
               >
                 <span class="grip flex-1" aria-hidden="true"></span>
               </Sortable.Handle>
+              <Checkbox
+                value={selectedTaskSet.has(task.id)}
+                onChange={(checked) => selectTask(task.id, checked)}
+                disabled={locked || starting}
+                aria-label={`Include Task ${index + 1} in acquisition`}
+                title="Include this task in the next acquisition"
+              />
               <a
                 href={resolve(TASK_ROUTE, { ...routeParams, taskId: task.id })}
-                class="flex min-w-0 flex-1 flex-col gap-0.5 py-2 pr-2.5 focus-visible:outline-2 focus-visible:outline-focus"
+                class={cn(
+                  'flex min-w-0 flex-1 flex-col gap-0.5 py-2 pr-2.5 pl-2 focus-visible:outline-2 focus-visible:outline-focus',
+                  !selectedTaskSet.has(task.id) && 'opacity-50'
+                )}
               >
                 <span class="flex min-w-0 items-center gap-2">
                   <span class="min-w-0 flex-1 truncate text-base text-fg">Task {index + 1}</span>
-                  <Badge>{task.scan ? 'X-Scan' : TASK_TYPES[task.xy.mode]}</Badge>
+                  <Badge>{task.scan?.y_stack ? 'XY-Scan' : task.scan ? 'X-Scan' : TASK_TYPES[task.xy.mode]}</Badge>
                   {#if instrument}
                     <span class="text-sm text-fg-muted tabular-nums">{plural(taskVolumes(task.id), 'volume')}</span>
                   {/if}
@@ -637,10 +693,26 @@
         {/if}
       </Section>
     {:else if result}
-      <Section heading={STATUS[result.status].heading} variant="raised" class="frame-docked-bottom">
+      {@const diagnosticErrors =
+        result.status === 'completed' &&
+        result.continue_on_error &&
+        result.volumes.some((item) => item.status === 'failed')}
+      <Section
+        heading={diagnosticErrors ? 'Diagnostic run finished' : STATUS[result.status].heading}
+        variant="raised"
+        class="frame-docked-bottom"
+      >
         {#snippet trailing()}
-          <Badge tone={STATUS[result.status].tone}>{STATUS[result.status].label}</Badge>
+          <Badge tone={diagnosticErrors ? 'warning' : STATUS[result.status].tone}
+            >{diagnosticErrors ? 'Finished with errors' : STATUS[result.status].label}</Badge
+          >
         {/snippet}
+        {#if diagnosticErrors}
+          <p class="text-sm text-warning-fg">
+            Strip errors were logged and the scan continued. Failed strips retain their partial data; inspect
+            diagnostics.json and History.
+          </p>
+        {/if}
         {#if result.failure}
           <p class="text-sm text-danger-fg">{result.failure.kind}: {result.failure.message}</p>
         {/if}
@@ -702,7 +774,7 @@
           {/if}
           <dl class={DETAILS}>
             <dt>Volumes</dt>
-            <dd>{instrument.plannedVolumes.length}</dd>
+            <dd>{selectedVolumes.length}</dd>
             <dt>Time</dt>
             <dd>{formatDuration(estimateSeconds(instrument))}</dd>
             <dt>Data</dt>

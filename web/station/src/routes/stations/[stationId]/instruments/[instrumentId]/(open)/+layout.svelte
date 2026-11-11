@@ -24,7 +24,9 @@
 </script>
 
 {#if selected.open}
-  {@render children()}
+  {#key selected.open.sessionId}
+    {@render children()}
+  {/key}
 {:else}
   <PageFallback items={[{ label: title }]}>
     {#if brokenFile}

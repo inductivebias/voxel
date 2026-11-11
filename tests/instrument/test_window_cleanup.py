@@ -21,7 +21,9 @@ async def test_return_to_start_resets_window_before_moving():
     axis = SimpleNamespace(reset_continuous_scan=reset, move_abs=move)
     inst = SimpleNamespace(_volume_scan_axis=lambda _v: axis, _hold_violations=AsyncMock(return_value=[]))
     progress = _PassProgress()
-    await Instrument._position_volume(inst, SimpleNamespace(scan=object()), SimpleNamespace(start=10), progress)
+    await Instrument._position_volume(
+        inst, SimpleNamespace(scan=SimpleNamespace(y_stack=None)), SimpleNamespace(start=10), progress
+    )
     assert events == ["reset", "move"]
     assert progress.prepared
     assert not progress.moving

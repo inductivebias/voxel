@@ -17,7 +17,7 @@
   const AXIS_SPINS = [
     ['x', 10],
     ['y', 10],
-    ['z', 1]
+    ['z', 10]
   ] as const;
 </script>
 

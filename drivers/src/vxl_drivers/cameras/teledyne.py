@@ -435,9 +435,10 @@ class PyvcamDevice:
             return int(self._camera.bit_depth_host)
 
     def set_geometry(self, x: int, y: int, w: int, h: int, binning: int) -> None:
-        # set_roi replaces the single region and keeps PyVCAM's current binning, which the
-        # binning assignment then updates on that region; both only take effect at start_live.
+        # On multi-ROI cameras, set_roi appends once a crop replaces the default ROI.
+        # Voxel owns one region, so reset the list before applying every geometry update.
         with self._lock:
+            self._camera.reset_rois()
             self._camera.set_roi(x, y, w, h)
             self._camera.binning = binning
 

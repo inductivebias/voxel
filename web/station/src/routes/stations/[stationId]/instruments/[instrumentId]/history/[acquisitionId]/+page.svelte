@@ -65,6 +65,10 @@
     manifest && current ? divergence(settingsOf(manifest.state_snapshot), settingsOf(current)) : []
   );
   const finished = $derived(manifest?.volumes.filter((volume) => volume.status === 'completed').length ?? 0);
+  const warnings = $derived(manifest?.volumes.flatMap((volume) => volume.warnings ?? []) ?? []);
+  const diagnosticErrors = $derived(
+    manifest?.continue_on_error ? manifest.volumes.filter((volume) => volume.status === 'failed').length : 0
+  );
   const historyHref = $derived(resolve('/stations/[stationId]/instruments/[instrumentId]/history', routeParams));
 
   let copied = $state(false);
@@ -154,11 +158,31 @@
         <dl class="grid grid-cols-[minmax(--spacing(20),max-content)_minmax(0,1fr)] gap-x-3 gap-y-1.5 text-sm">
           <dt class="text-fg-muted">Status</dt>
           <dd class="flex min-w-0 flex-wrap items-baseline gap-x-2">
-            <Badge tone={STATUS_TONES[manifest.status]}>{STATUS_LABELS[manifest.status]}</Badge>
+            <Badge
+              tone={manifest.status === 'completed' && (warnings.length || diagnosticErrors)
+                ? 'warning'
+                : STATUS_TONES[manifest.status]}
+            >
+              {manifest.status === 'completed' && diagnosticErrors
+                ? 'Finished with strip errors'
+                : manifest.status === 'completed' && warnings.length
+                  ? 'Done with warnings'
+                  : STATUS_LABELS[manifest.status]}
+            </Badge>
             {#if manifest.failure}
               <span class="min-w-0 text-danger-fg">{manifest.failure.kind}: {manifest.failure.message}</span>
             {/if}
           </dd>
+          {#if warnings.length}
+            <dt class="text-warning-fg">Warnings</dt>
+            <dd class="min-w-0 text-warning-fg">
+              <ul class="space-y-1">
+                {#each warnings as warning, index (index)}
+                  <li>{warning}</li>
+                {/each}
+              </ul>
+            </dd>
+          {/if}
           <dt class="text-fg-muted">Started</dt>
           <dd class="text-fg">{dateFormat.format(new Date(manifest.started_at ?? manifest.created_at))}</dd>
           {#if manifest.ended_at}

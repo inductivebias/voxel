@@ -117,6 +117,16 @@
     if (task?.scan) patchTask({ scan: { ...task.scan, ...patch } }, context);
   }
 
+  function updateRows(patch: Partial<NonNullable<LineScan['y_stack']>>, context: EditContext = {}): void {
+    if (task?.scan?.y_stack) updateScan({ y_stack: { ...task.scan.y_stack, ...patch } }, context);
+  }
+
+  const sweepCount = $derived(
+    task?.scan?.y_stack
+      ? Math.floor((task.scan.y_stack.end - task.scan.y_stack.start) / task.scan.y_stack.step + 1e-9) + 1
+      : 1
+  );
+
   function updateHold(axis: 'x' | 'y' | 'z', value: number, context: EditContext): void {
     if (!task) return;
     if (axis === 'z') patchTask({ z: { type: 'fixed', start: value, end: value } }, context);
@@ -224,6 +234,12 @@
     if (!profile || !wiring) return null;
     const sync = profile.sync[wiring.generator];
     if (!sync) return null;
+    if (task.scan.target_frame_rate_hz != null) {
+      return Math.max(
+        1 / task.scan.target_frame_rate_hz,
+        (sync.duration + wiring.rearm_margin_s + 1 / sync.sample_rate) * (1 + wiring.speed_tolerance)
+      );
+    }
     if (task.scan.camera_rate_fraction === null) return sync.duration + sync.rest_time;
     if (profileId !== instrument.activeProfileId) return null;
     const cameraIds = [...new Set(profile.channels.map((id) => instrument.imaging.channels[id].detection))];
@@ -308,12 +324,12 @@
   {@const stage = instrument.stage}
   <div class="flex page-body flex-col gap-4 pb-0!">
     {#if task.scan}
-      <Section heading="X-Scan" variant="bordered">
+      <Section heading={task.scan.y_stack ? 'XY-Scan' : 'X-Scan'} variant="bordered">
         <div class="flex flex-col gap-3">
           <FieldRow label="Axis">
             <Select
               value={task.scan.axis}
-              options={['x', 'y', 'z'] as const}
+              options={task.scan.y_stack ? (['x'] as const) : (['x', 'y', 'z'] as const)}
               formatLabel={(axis) => axis.toUpperCase()}
               onChange={(axis) => updateScan({ axis })}
               {disabled}
@@ -343,7 +359,8 @@
             <NumberBox
               value={task.scan.spacing}
               min={0.001}
-              step={0.1}
+              step={0.001}
+              bigStep={0.1}
               suffix="µm"
               aria-label="Sampling distance in micrometres"
               onEditStart={() => instrument.edits.hold()}
@@ -351,8 +368,58 @@
               {disabled}
             />
           </FieldRow>
+          <FieldRow label="Targeted framerate">
+            <NumberBox
+              value={task.scan.target_frame_rate_hz ??
+                (scanPeriod(task.profiles[0]) ? 1 / scanPeriod(task.profiles[0])! : 100)}
+              min={0.001}
+              step={0.001}
+              bigStep={1}
+              suffix="Hz"
+              aria-label="Targeted framerate"
+              onEditStart={() => instrument.edits.hold()}
+              onChange={(target_frame_rate_hz, edit) =>
+                updateScan({ target_frame_rate_hz, camera_rate_fraction: null }, edit)}
+              {disabled}
+            />
+          </FieldRow>
+          {#if task.scan.y_stack}
+            <FieldRow label="Y range">
+              <StageNumericField
+                stage={instrument.stage}
+                axis="y"
+                value={task.scan.y_stack.start}
+                prefix="Start"
+                {unit}
+                onChange={(start, edit) => updateRows({ start }, edit)}
+                {disabled}
+              />
+              <StageNumericField
+                stage={instrument.stage}
+                axis="y"
+                value={task.scan.y_stack.end}
+                prefix="End"
+                {unit}
+                onChange={(end, edit) => updateRows({ end }, edit)}
+                {disabled}
+              />
+            </FieldRow>
+            <FieldRow label="Y step">
+              <NumberBox
+                value={task.scan.y_stack.step}
+                min={0.001}
+                step={0.001}
+                bigStep={10}
+                suffix="µm"
+                aria-label="Y step between X sweeps"
+                onEditStart={() => instrument.edits.hold()}
+                onChange={(step, edit) => updateRows({ step }, edit)}
+                {disabled}
+              />
+            </FieldRow>
+          {/if}
           {#each ['x', 'y', 'z'] as const as axis}
-            {#if axis !== task.scan.axis}
+            {#if axis !== task.scan.axis && !(axis === 'y' && task.scan.y_stack)}
               <FieldRow label={`Hold ${axis.toUpperCase()}`}>
                 <StageNumericField
                   stage={instrument.stage}
@@ -366,7 +433,12 @@
             {/if}
           {/each}
           <p class="text-sm text-fg-muted">
-            The end position is exclusive. Held axes must already be at these positions; this task does not move them.
+            {#if task.scan.y_stack}
+              Each X end is exclusive. Y moves between sweeps, up to the inclusive Y end in whole steps. Z must already
+              be at its hold position. Every sweep runs in positive X and is saved as a separate volume.
+            {:else}
+              The end position is exclusive. Held axes must already be at these positions; this task does not move them.
+            {/if}
           </p>
           {#each task.profiles as profileId}
             {@const sync = Object.values(instrument.imaging.profiles[profileId]?.sync ?? {})[0]}
@@ -377,9 +449,11 @@
                 <p class="font-medium text-fg">{profileLabel(profileId)}</p>
                 <ul class="mt-1 list-disc space-y-0.5 pl-5 tabular-nums">
                   <li>
-                    Frame rate: {(1 / period).toFixed(2)} Hz ({task.scan.camera_rate_fraction === null
-                      ? 'manual DAQ timing'
-                      : 'automatic camera timing'})
+                    Frame rate: {(1 / period).toFixed(2)} Hz ({task.scan.target_frame_rate_hz != null
+                      ? 'targeted framerate'
+                      : task.scan.camera_rate_fraction === null
+                        ? 'manual DAQ timing'
+                        : 'automatic camera timing'})
                   </li>
                   <li>{task.scan.axis.toUpperCase()} stage speed: {speed.toFixed(3)} µm/s</li>
                   <li>
@@ -387,7 +461,24 @@
                       (task.scan.end - task.scan.start) / task.scan.spacing
                     ).toLocaleString()}
                   </li>
-                  <li>Scan duration: {((task.scan.end - task.scan.start) / speed).toFixed(1)} s</li>
+                  <li>
+                    Scan duration{task.scan.y_stack ? ' per sweep' : ''}: {(
+                      (task.scan.end - task.scan.start) /
+                      speed
+                    ).toFixed(1)} s
+                  </li>
+                  {#if task.scan.y_stack}
+                    <li>Y sweeps: {sweepCount.toLocaleString()} at {task.scan.y_stack.step} µm steps</li>
+                    <li>
+                      Total frames per camera: {(
+                        Math.round((task.scan.end - task.scan.start) / task.scan.spacing) * sweepCount
+                      ).toLocaleString()}
+                    </li>
+                    <li>
+                      Total sweep time: {(((task.scan.end - task.scan.start) / speed) * sweepCount).toFixed(1)} s, plus return
+                      travel and Y positioning
+                    </li>
+                  {/if}
                   <li>
                     Runway per side: {task.scan.runway_s} s ({formatCoordinate(speed * task.scan.runway_s)}
                     {unit.label})
@@ -400,8 +491,13 @@
                   </li>
                 </ul>
                 <p class="mt-2">
-                  Automatic timing uses the slower camera with a safety margin and respects DAQ re-arm time. Timing is
-                  checked again after applying the profile at scan start.
+                  {#if task.scan.target_frame_rate_hz != null}
+                    Stage speed is sampling × frame rate. DAQ re-arm limits may reduce the effective rate. Camera
+                    exposure timing is checked at scan start; the target is not automatically reduced to the SDK rate.
+                  {:else}
+                    Automatic timing uses the slower camera with a safety margin and respects DAQ re-arm time. Timing is
+                    checked again after applying the profile at scan start.
+                  {/if}
                 </p>
               </div>
             {:else}

@@ -417,3 +417,20 @@ def test_arm_coerced_clock_rate_closes_every_task_before_starting(monkeypatch):
 
     assert not any(event == "start" for event, _ in ni.events)
     assert _closed_everything(hub, ni, recorder)
+
+
+@pytest.mark.parametrize("filter_us", [0.0, 20.48])
+def test_encoder_marker_shares_the_encoder_terminal_filter(monkeypatch, filter_us):
+    ni = FakeNi()
+    hub, recorder = _recorder(monkeypatch, ni, markers={"encoder_edges": "pfi0"}, filter_us=filter_us)
+    try:
+        recorder.arm(REQUEST)
+        (marker,) = ni.tasks["marker0"].channels
+        assert marker.ci_count_edges_term == "/Dev1/PFI0"
+        assert marker.ci_count_edges_dig_fltr_enable is (filter_us > 0)
+        assert marker.ci_count_edges_dig_sync_enable is (filter_us == 0)
+        if filter_us:
+            assert marker.ci_count_edges_dig_fltr_min_pulse_width == pytest.approx(filter_us * 1e-6)
+    finally:
+        recorder.abort()
+    assert _closed_everything(hub, ni, recorder)

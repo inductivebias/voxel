@@ -83,15 +83,19 @@ class SimulatedPositionRecorder(PositionRecorder):
             positions = request.origin + np.floor(travel / step) * step
             counts = {name: np.searchsorted(marks, positions, side="right") for name, marks in targets.items()}
             associator.add_block(positions, counts)
-        return associator.result(
+        recorded = associator.result(
             {
                 "sample_rate_hz": _RATE_HZ,
                 "filter_s": self.filter_s,
                 "filter_clock_s": 0.0,
                 "encoder_a": self.encoder_a,
                 "markers": self.markers,
-            }
+            },
+            validate=False,
         )
+        if recorded.errors:
+            raise ValueError("Recorded pass is invalid: " + "; ".join(recorded.violations))
+        return recorded
 
     def abort(self) -> None:
         self._request = None

@@ -285,3 +285,28 @@ def test_invalid_pass_retains_fire_indices_and_reversal_location():
     assert len(result.frames["camera_a"]) == 3
     assert [frame.sample for frame in result.frames["camera_b"]] == edges["camera_b"].tolist()
     assert result.readback["worst_reversal"]["sample"] == 300
+
+
+@pytest.mark.parametrize("corrupt", [_irregular_spacing, _reversal, _late_first_exposure])
+def test_spatial_violations_are_classified_as_warnings(corrupt):
+    positions, counts, edges = _ideal_pass()
+    corrupt(positions, counts, edges)
+    associator = PassAssociator(REQUEST, list(counts), rate_hz=RATE_HZ, filter_s=0, filter_clock_s=0)
+    associator.mark_motion(MOTION)
+    associator.add_block(positions, counts)
+    recorded = associator.result({}, validate=False)
+    assert recorded.warnings
+    assert recorded.violations == recorded.warnings
+    assert not recorded.errors
+
+
+def test_missing_frames_remain_fatal_even_with_spatial_warnings():
+    positions, counts, edges = _ideal_pass()
+    _drop_last(positions, counts, edges)
+    _reversal(positions, counts, edges)
+    associator = PassAssociator(REQUEST, list(counts), rate_hz=RATE_HZ, filter_s=0, filter_clock_s=0)
+    associator.mark_motion(MOTION)
+    associator.add_block(positions, counts)
+    recorded = associator.result({}, validate=False)
+    assert recorded.warnings
+    assert any("expected 4 exposures, recorded 3" in error for error in recorded.errors)

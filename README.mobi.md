@@ -46,6 +46,23 @@ existing stepwise acquisition remains available. Its planner is in
 
 ## X-Scan tasks
 
+For a diagnostic acquisition, `POST /instrument/acquisition/options` with
+`{"continue_on_error": true}` arms **only the next accepted run** (under the session API prefix).
+`GET` on the same path reports the armed option. A request's explicit `continue_on_error`
+overrides it, and the accepted manifest retains the chosen policy. After a strip error and
+successful cleanup, execution logs the exception, preserves the failed/partial strip, and
+attempts the next strip. Run-level `diagnostics.json` lists these errors, while per-strip scan
+records and the acquisition journal retain detailed evidence. A diagnostic run can finish
+with failed strips; the UI labels this outcome and does not count those strips as successful.
+Operator cancellation, failed cleanup, invalid preflight, and errors persisting the diagnostic
+record still stop execution. The one-shot option resets after a run is accepted.
+
+
+The Run page's task checkboxes select which tasks enter the next acquisition. Unchecked
+tasks remain saved and editable; volume, time, and data estimates use only checked tasks.
+The selection is remembered in this browser for each station/instrument. New tasks are
+checked by default. At least one task must be selected before acquisition can start.
+
 With `hal.continuous_scan` configured, **+ X-Scan** sits beside Position and Area in the
 Run page. Select the physical axis, a positive scan window (end exclusive), and sampling in
 micrometres. A compact list under each profile shows the nominal frame rate, stage speed, frame
@@ -54,7 +71,22 @@ The hardware configuration's `axis` identifies the axis
 whose encoder is wired to the DAQ; it defaults to `z` for existing continuous-volume setups.
 There is no need to remap the physical stage axes.
 
-X-Scan tasks default to automatic camera timing (`scan.camera_rate_fraction: 0.95`). After
+The task editor's **Targeted framerate** sets `scan.target_frame_rate_hz`. Stage speed is
+sampling × target frame rate; the summary shows the effective rate and speed, including any
+DAQ re-arm limit. This target takes precedence over SDK timing and profile rest time. Exposure
+must fit the fastest expected trigger interval, but camera readout capacity still needs to be
+verified experimentally. Editing the target does not change other tasks or preview timing.
+
+**+ XY-Scan** repeats positive-X sweeps at successive Y positions. It inherits the latest
+X-Scan settings and adds an inclusive Y range and a **Y step**, defaulting to **500 µm** of
+physical movement between sweep centers. This is a step distance, not an overlap percentage.
+The last sweep is the last whole step within the Y range. Each sweep is a separate volume;
+its Y position and the full array definition are retained in the acquisition manifest. X returns
+with its trigger window closed, Y moves only between sweeps, and Z remains at its saved hold
+position. Cancellation also halts an in-progress Y positioning move. The summary includes
+sweep count, total frames, and sweep time; return travel and Y moves add overhead.
+
+Older X-Scan tasks without a target retain automatic camera timing (`scan.camera_rate_fraction: 0.95`). After
 applying each profile, the controller queries each camera's acquisition rate limit, selects the
 slowest, and applies the fraction and configured stage-speed tolerance. Speed is sampling times
 that safe rate, further limited by the DAQ waveform duration, re-arm margin, and one sample tick.
@@ -76,7 +108,8 @@ speed, not the exact time spent accelerating.
 
 The other axes must already be stationary within 1 µm of the saved hold positions. Use their
 crosshair buttons to adopt the current positions. X-Scan tasks never issue motion commands to
-those held axes. Profiles must have camera triggers and no stage-step waveforms. Preflight
+those held axes. XY-Scan tasks additionally position Y automatically before each sweep.
+Profiles must have camera triggers and no stage-step waveforms. Preflight
 checks the configured encoder axis, spacing, runway, travel limits, exposure time, and DAQ
 re-arm budget. Camera readout throughput still needs to be verified on the actual cameras.
 
@@ -89,7 +122,11 @@ sweep. Interpret it with the manifest and recorded exposure positions.
 
 The encoder has an unknown initial phase: nominal sample locations are not exact absolute
 position comparisons. `scan.json` records measured exposure locations and validates their
-spacing and counts. Existing Z-volume continuous configurations retain their prior behavior;
+spacing and counts. A complete capture with spacing, reversal, or first-exposure-position deviations completes with spatial
+warnings, retained in the scan recording and volume manifest and shown in acquisition history.
+Missing/extra exposures, invalid recordings, and capture/write/cleanup
+errors still fail the run in normal mode. A completed volume means the capture finished, not that spatial sampling
+has been independently validated. Existing Z-volume continuous configurations retain their prior behavior;
 Position/Area tasks on an X/Y continuous-scan configuration retain stepwise Z behavior.
 
 ## Status and verification

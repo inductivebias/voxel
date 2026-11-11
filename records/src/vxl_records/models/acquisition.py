@@ -84,6 +84,25 @@ class AcquisitionFailure(RecordModel):
     message: str = Field(min_length=1)
 
 
+class YScanRows(RecordModel):
+    """Inclusive Y sweep positions, with a physical step in micrometres."""
+
+    start: float = Field(allow_inf_nan=False)
+    end: float = Field(allow_inf_nan=False)
+    step: float = Field(default=500, gt=0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _check_range(self) -> Self:
+        if self.end < self.start:
+            raise ValueError("Y end must be at least Y start")
+        return self
+
+    @property
+    def positions(self) -> list[float]:
+        count = math.floor((self.end - self.start) / self.step + 1e-9) + 1
+        return [self.start + i * self.step for i in range(count)]
+
+
 class LineScan(RecordModel):
     """Positive, encoder-paced sweep in micrometres; the acquisition end is exclusive."""
 
@@ -93,9 +112,13 @@ class LineScan(RecordModel):
     spacing: float = Field(gt=0, allow_inf_nan=False)
     runway_s: float = Field(default=1, gt=0, allow_inf_nan=False)
     camera_rate_fraction: float | None = Field(default=0.95, gt=0, lt=1, allow_inf_nan=False)
+    target_frame_rate_hz: float | None = Field(default=None, gt=0, allow_inf_nan=False)
+    y_stack: YScanRows | None = None
 
     @model_validator(mode="after")
     def _check_window(self) -> Self:
+        if self.y_stack is not None and self.axis != "x":
+            raise ValueError("a Y array requires X sweeps")
         count = (self.end - self.start) / self.spacing
         if count < 1 or not math.isclose(count, round(count), rel_tol=1e-9, abs_tol=1e-9):
             raise ValueError("line scan end must exceed start by a whole number of sample spacings")
@@ -138,6 +161,7 @@ class AcquisitionVolume(PlannedVolume):
 
     status: VolumeStatus = VolumeStatus.PENDING
     datasets: dict[ChannelName, Dataset] = Field(default_factory=dict)
+    warnings: list[str] = Field(default_factory=list)
 
     def transition(self, status: VolumeStatus) -> Self:
         """Return this volume in a valid next lifecycle state."""
@@ -203,6 +227,7 @@ class AcquisitionManifest(RecordModel):
     started_at: AwareDatetime | None = None
     ended_at: AwareDatetime | None = None
     failure: AcquisitionFailure | None = None
+    continue_on_error: bool = False
     storage: StorageSpec
     state_snapshot: dict[str, JsonValue]
     hardware_snapshot: dict[str, JsonValue]
@@ -289,9 +314,12 @@ class AcquisitionManifest(RecordModel):
         volume = self._get_volume(volume_index).register_datasets(datasets)
         return self._replace_volume(volume_index, volume)
 
-    def complete_volume(self, volume_index: int) -> Self:
+    def complete_volume(self, volume_index: int, *, warnings: list[str] | None = None) -> Self:
         """Complete one volume and all of its datasets."""
-        return self._replace_volume(volume_index, self._get_volume(volume_index).complete())
+        volume = self._get_volume(volume_index).complete()
+        if warnings:
+            volume = volume.model_copy(update={"warnings": list(dict.fromkeys([*volume.warnings, *warnings]))})
+        return self._replace_volume(volume_index, volume)
 
     def terminalize_volume(
         self,

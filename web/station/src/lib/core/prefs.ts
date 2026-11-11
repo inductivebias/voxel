@@ -72,7 +72,8 @@ export const prefs = {
   },
 
   plan: {
-    defaults: pref<Record<string, PlanDefaults>>('ui:plan:defaults', {})
+    defaults: pref<Record<string, PlanDefaults>>('ui:plan:defaults', {}),
+    excludedTasks: pref<Record<string, string[]>>('ui:plan:excluded-tasks', {})
   },
 
   logs: {

@@ -268,6 +268,8 @@ export interface LineScan {
   spacing: number;
   runway_s: number;
   camera_rate_fraction?: number | null;
+  target_frame_rate_hz?: number | null;
+  y_stack?: { start: number; end: number; step: number } | null;
 }
 
 /** Persisted acquisition intent expanded into concrete volumes by the instrument. */
@@ -486,6 +488,7 @@ export interface PlannedVolume {
 export interface AcquisitionVolume extends PlannedVolume {
   status: VolumeStatus;
   datasets: Record<string, AcquisitionDataset>;
+  warnings?: string[];
 }
 
 /** Parameters of an acquisition run; `task_ids=null` → every planned task in traversal order. */
@@ -493,6 +496,7 @@ export interface AcquisitionRequest {
   storage: StorageSpec;
   task_ids?: string[] | null;
   operator?: string | null;
+  continue_on_error?: boolean | null;
 }
 
 export interface AcquisitionFailure {
@@ -512,6 +516,7 @@ export interface AcquisitionManifest {
   started_at: string | null;
   ended_at: string | null;
   failure: AcquisitionFailure | null;
+  continue_on_error?: boolean;
   storage: StorageSpec;
   state_snapshot: InstrumentState;
   hardware_snapshot: HALConfig;

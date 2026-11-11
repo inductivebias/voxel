@@ -196,11 +196,12 @@ class AcquisitionCatalog:
         acquisition_id: UUID,
         *,
         volume_index: int,
+        warnings: list[str] | None = None,
     ) -> AcquisitionManifest:
         """Atomically make a volume and all its datasets available and complete."""
 
         def edit(manifest: AcquisitionManifest) -> AcquisitionManifest:
-            return manifest.complete_volume(volume_index)
+            return manifest.complete_volume(volume_index, warnings=warnings)
 
         return await self._commit(acquisition_id, edit)
 

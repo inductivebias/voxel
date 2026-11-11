@@ -311,7 +311,8 @@ class NiPositionRecorder(PositionRecorder):
 
     ``filter_us`` enables NI's digital filter on both encoder inputs. NI rejects that
     filter together with input synchronization (-200770), so synchronization is enabled
-    only when unfiltered. Marker inputs are unfiltered. Positions are the filtered,
+    only when unfiltered. Marker inputs are unfiltered unless they share an encoder
+    terminal, in which case they must share that terminal's filter. Positions are the filtered,
     quantized encoder record in the units of ``RecorderArm`` (NI's meters scale is used
     as a plain linear scale).
     """
@@ -426,7 +427,11 @@ class NiPositionRecorder(PositionRecorder):
             recording.edges[name] = task
             channel = task.ci_channels.add_ci_count_edges_chan(counter, edge=Edge.RISING, initial_count=0)
             channel.ci_count_edges_term = terminal
-            channel.ci_count_edges_dig_fltr_enable = False
+            # A marker may observe an encoder terminal for diagnostics. NI shares
+            # each PFI's filter and synchronization across counters and rejects conflicts.
+            marker_filter_s = self.filter_s if terminal in (encoder_a, encoder_b) else 0.0
+            _apply_input_filter(channel, "ci_count_edges_dig_fltr", marker_filter_s)
+            channel.ci_count_edges_dig_sync_enable = synchronized if terminal in (encoder_a, encoder_b) else False
             edge_channels[name] = channel
 
         clock = recording.add_task("clock")
@@ -483,7 +488,15 @@ class NiPositionRecorder(PositionRecorder):
             "encoder_b": encoder_b,
             "edge_spacing": edge_spacing,
             "markers": {
-                name: {"counter": counter, "terminal": terminal}
+                name: {
+                    "counter": counter,
+                    "terminal": terminal,
+                    "filter_s": (
+                        edge_channels[name].ci_count_edges_dig_fltr_min_pulse_width
+                        if edge_channels[name].ci_count_edges_dig_fltr_enable
+                        else 0.0
+                    ),
+                }
                 for name, counter, terminal in zip(
                     self._markers, lease.counter_paths[1:], marker_terminals, strict=True
                 )

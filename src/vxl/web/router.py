@@ -128,6 +128,10 @@ class _SetProps(BaseModel):
     properties: dict[str, Any]
 
 
+class _AcquisitionOptions(BaseModel):
+    continue_on_error: bool
+
+
 class _ExecuteCommand(BaseModel):
     args: list[Any] = Field(default_factory=list)
     kwargs: dict[str, Any] = Field(default_factory=dict)
@@ -608,6 +612,16 @@ async def execute_device_command(
         return await instrument.execute_device_command(device_id, command_name, body.args, body.kwargs)
     except KeyError as error:
         raise HTTPException(status_code=404, detail=str(error.args[0])) from error
+
+
+@instrument_router.get("/acquisition/options")
+async def get_acquisition_options(instrument: InstrumentDep) -> _AcquisitionOptions:
+    return _AcquisitionOptions(continue_on_error=instrument.continue_on_error_next)
+
+
+@instrument_router.post("/acquisition/options", status_code=204)
+async def set_acquisition_options(body: _AcquisitionOptions, instrument: InstrumentDep) -> None:
+    await instrument.set_continue_on_error_next(body.continue_on_error)
 
 
 @instrument_router.post("/acquisition")

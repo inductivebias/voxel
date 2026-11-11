@@ -74,6 +74,12 @@ class RecordedPass(BaseModel, frozen=True):
     tolerance: float
     readback: dict[str, Any]
     violations: list[str] = Field(default_factory=list)
+    warnings: list[str] = Field(default_factory=list)
+
+    @property
+    def errors(self) -> list[str]:
+        """Fatal recording violations; spatial warnings remain available separately."""
+        return [message for message in self.violations if message not in self.warnings]
 
 
 @dataclass
@@ -213,6 +219,7 @@ class PassAssociator:
         """
         motion = self._motion
         violations: list[str] = []
+        warnings: list[str] = []
         if self._samples < 2:
             violations.append(f"recorded {self._samples} samples; at least two are needed")
         if motion is None:
@@ -224,13 +231,13 @@ class PassAssociator:
 
         last_sample, last_reversal = -1, 0.0
         for name, track in self._tracks.items():
-            violations.extend(self._marker_violations(name, track))
+            violations.extend(self._marker_violations(name, track, warnings=warnings))
             if track.samples and track.samples[-1] > last_sample:
                 last_sample, last_reversal = track.samples[-1], track.reversals[-1]
         if last_reversal > _REVERSAL_LIMIT:
-            violations.append(
-                f"the encoder reversed by {last_reversal:g} between the motion start and the last exposure"
-            )
+            warnings.append(f"the encoder reversed by {last_reversal:g} between the motion start and the last exposure")
+
+        violations.extend(warnings)
 
         if validate and (violations or motion is None):
             raise ValueError("Recorded pass is invalid:\n" + "\n".join(f"- {violation}" for violation in violations))
@@ -251,9 +258,10 @@ class PassAssociator:
                 "marker_counts": {name: track.exposures for name, track in self._tracks.items()},
             },
             violations=violations,
+            warnings=warnings,
         )
 
-    def _marker_violations(self, name: str, track: _MarkerTrack) -> list[str]:
+    def _marker_violations(self, name: str, track: _MarkerTrack, *, warnings: list[str]) -> list[str]:
         request, tolerance, motion = self._request, self.tolerance, self._motion
         violations: list[str] = []
         if track.first_count:
@@ -271,13 +279,13 @@ class PassAssociator:
             violations.append(f"{name}: {early} exposures at or before the motion sample {motion}")
         errors = np.abs(np.diff(track.positions) - request.spacing)
         if (wrong := int(np.count_nonzero(errors > tolerance))) > 0:
-            violations.append(
+            warnings.append(
                 f"{name}: {wrong} exposure gaps differ from the spacing {request.spacing:g} by more than "
                 f"{tolerance:g} (worst by {float(errors.max()):g})"
             )
         low, high = request.first_exposure
         if track.positions and not low - tolerance <= track.positions[0] <= high + tolerance:
-            violations.append(
+            warnings.append(
                 f"{name}: first exposure at {track.positions[0]:g} is outside [{low:g}, {high:g}] ± {tolerance:g}"
             )
         return violations

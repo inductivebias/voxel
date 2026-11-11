@@ -48,7 +48,6 @@
 
   let windowMin = $state(0);
   let windowMax = $state(0);
-  let hasAutoFit = $state(false);
   let svgWidth = $state(256);
   let columnWidth = $state(288);
   let dragging = $state<'min' | 'max' | null>(null);
@@ -238,7 +237,11 @@
     const pad = (hi - lo) * 0.15;
     windowMin = Math.round((Math.max(0, lo - pad) / (numBins - 1)) * dataTypeMax);
     windowMax = Math.round((Math.min(numBins - 1, hi + pad) / (numBins - 1)) * dataTypeMax);
-    hasAutoFit = true;
+  }
+
+  function resetWindow() {
+    windowMin = 0;
+    windowMax = dataTypeMax;
   }
 
   function autoLevels() {
@@ -261,13 +264,7 @@
   // ── Effects ───────────────────────────────────────────────────────
 
   $effect.pre(() => {
-    windowMin = 0;
-    windowMax = dataTypeMax;
-    hasAutoFit = false;
-  });
-
-  $effect(() => {
-    if (hasValidData && !hasAutoFit) autoFit();
+    resetWindow();
   });
 </script>
 
@@ -378,21 +375,14 @@
   </div>
 
   <ContextMenu.Root>
-    <ContextMenu.Trigger class="relative bg-transparent" bind:ref={histContainerEl} ondblclick={autoLevels}>
+    <ContextMenu.Trigger class="relative bg-transparent" bind:ref={histContainerEl} ondblclick={resetWindow}>
       {@render histSvg()}
     </ContextMenu.Trigger>
     <ContextMenu.Content class="min-w-36" side="top" align="start">
       <ContextMenu.Item onSelect={autoLevels} disabled={!hasValidData}>Auto Levels</ContextMenu.Item>
       <ContextMenu.Item onSelect={autoFit} disabled={!hasValidData}>Auto Fit</ContextMenu.Item>
       <ContextMenu.Separator />
-      <ContextMenu.Item
-        onSelect={() => {
-          windowMin = 0;
-          windowMax = dataTypeMax;
-        }}
-      >
-        Reset Window
-      </ContextMenu.Item>
+      <ContextMenu.Item onSelect={resetWindow}>Reset Window</ContextMenu.Item>
       {#if onVisibilityChange}
         <ContextMenu.Separator />
         <ContextMenu.Item onSelect={() => onVisibilityChange?.(!visible)}>

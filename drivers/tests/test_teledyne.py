@@ -1051,3 +1051,26 @@ def test_timing_limit_cached_and_invalidated_by_settings(
     cam.binning = 2
     assert cam.acquisition_rate_limit_hz == 80
     assert len(calls) == 3
+
+
+@pytest.mark.parametrize("binning", [1, 2, 4])
+def test_geometry_replaces_pyvcam_roi_instead_of_appending(binning: int) -> None:
+    """Exercise real PyVCAM ROI-list behavior without opening PVCAM or camera hardware."""
+    native_type = pytest.importorskip("pyvcam.camera").Camera
+    native = object.__new__(native_type)
+    native._Camera__is_open = True
+    native._Camera__sensor_size = (64, 48)
+    native._Camera__limited_binnings = None
+    native._Camera__default_roi = native_type.RegionOfInterest(0, 63, 1, 0, 47, 1)
+    native._Camera__rois = [native._Camera__default_roi]
+    native.get_param = lambda *_: 16  # Kinetix supports multiple native ROIs.
+    device = object.__new__(teledyne.PyvcamDevice)
+    device._camera = native
+    device._lock = threading.RLock()
+
+    for x, y, w, h in [(8, 8, 32, 24), (8, 8, 32, 24), (16, 12, 16, 16), (0, 0, 8, 8), (0, 0, 64, 48)]:
+        device.set_geometry(x, y, w, h, binning)
+        assert len(native.rois) == 1
+        roi = native.rois[0]
+        assert (roi.s1, roi.p1, roi.s2, roi.p2) == (x, y, x + w - 1, y + h - 1)
+        assert (roi.sbin, roi.pbin) == (binning, binning)

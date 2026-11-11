@@ -32,6 +32,7 @@ from vxl.instrument import (
     XYMode,
     ZRange,
 )
+from vxl.instrument.config import TaskPatch
 
 STORAGE = StorageSpec(path=PurePosixPath("run"))
 
@@ -76,6 +77,7 @@ class _Writer:
         return
 
     async def open_stack(self, *, storage: StorageSpec, subpath: PurePosixPath, **_kwargs: object) -> LocalLocation:
+        self._closing = False
         target = self._root / storage.path.as_posix() / f"{subpath.as_posix()}.ome.zarr"
         return LocalLocation(role=LocationRole.DESTINATION, status=LocationStatus.WRITING, host="h", path=str(target))
 
@@ -502,3 +504,308 @@ async def test_continuous_progress_uses_first_camera_before_completion(fail: boo
     assert [call.kwargs["frames_captured"] for call in update.call_args_list] == [5, 10, 15]
     assert all(call.args == (manifest,) for call in update.call_args_list)
     count_b.assert_not_awaited()
+
+
+async def test_complete_capture_with_spatial_warnings_finishes_volume(
+    opened_instrument: Instrument,
+    writer: _Writer,
+    records: SQLiteRecords,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    await add_task(instrument)
+    recorder = instrument._hal.recorders["scan_recorder"]
+    original = recorder.finish
+    warning = "camera_1: 1 exposure gaps differ from the spacing 80 by more than 5 (worst by 10)"
+
+    async def finish(timeout_s):
+        recorded = await original(timeout_s)
+        return recorded.model_copy(update={"violations": [warning], "warnings": [warning]})
+
+    monkeypatch.setattr(recorder, "finish", finish)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.COMPLETED
+    assert manifest.failure is None
+    assert manifest.volumes[0].status is VolumeStatus.COMPLETED
+    assert manifest.volumes[0].warnings == [warning]
+    assert writer.batches == [2]
+    assert manifest.volumes[0].datasets["gfp"].status is DatasetStatus.COMPLETED
+    scan = json.loads((tmp_path / "data/run/volumes/000001/single_gfp/scan.json").read_text())
+    assert scan["recorded"]["warnings"] == [warning]
+    assert scan["recorded"]["violations"] == [warning]
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+async def test_target_frame_rate_controls_speed_without_querying_camera_limit(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    task = instrument.state.value.plan[0]
+    await instrument.update_task(
+        task.id,
+        TaskPatch(
+            scan=task.scan.model_copy(
+                update={
+                    "target_frame_rate_hz": 5,
+                    "runway_s": 1,
+                    "camera_rate_fraction": 0.95,
+                }
+            )
+        ),
+    )
+    query = AsyncMock(side_effect=AssertionError("explicit targets must not query SDK timing"))
+    monkeypatch.setattr(instrument, "_camera_scan_rate", query)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.COMPLETED, manifest.failure
+    report = json.loads((tmp_path / "data/run/volumes/000001/single_gfp/scan.json").read_text())
+    assert report["plan"]["speed"] == pytest.approx(400)  # 80 um * 5 Hz, independent of profile's 12.5 Hz.
+    assert report["line_scan"]["target_frame_rate_hz"] == 5
+    query.assert_not_awaited()
+    assert writer.batches == [2]
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+@pytest.mark.parametrize("start_warning", [False, True])
+async def test_x_scan_array_positions_y_between_sweeps_and_keeps_z_fixed(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+    monkeypatch: pytest.MonkeyPatch,
+    start_warning: bool,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    task = instrument.state.value.plan[0]
+    scan = LineScan.model_validate({**task.scan.model_dump(), "y_stack": {"start": 0, "end": 250, "step": 100}})
+    await instrument.update_task(task.id, TaskPatch(scan=scan))
+    rows = instrument.planned_volumes.value
+    assert [v.y for v in rows] == [0, 100, 200]
+    y_moves, sweep_y = [], []
+    y_axis = instrument._hal.stage.y
+    original_move = y_axis.move_abs
+    original_start = instrument._hal.stage.x.start_continuous_scan
+    warning = "camera_1: first exposure is outside the predicted position range"
+    if start_warning:
+        recorder = instrument._hal.recorders["scan_recorder"]
+        original_finish = recorder.finish
+
+        async def finish(*args, **kwargs):
+            recorded = await original_finish(*args, **kwargs)
+            return recorded.model_copy(update={"violations": [warning], "warnings": [warning]})
+
+        monkeypatch.setattr(recorder, "finish", finish)
+
+    async def move_y(target, **kwargs):
+        assert await instrument._hal.stage.x.props.get_value("scan_mode") == "IDLE"
+        assert await instrument._hal.recorders["scan_recorder"].get_state() == "idle"
+        y_moves.append(target)
+        await original_move(target, **kwargs)
+
+    async def start_sweep(target):
+        sweep_y.append(await y_axis.get_position())
+        assert not await y_axis.is_moving()
+        await original_start(target)
+
+    async def forbidden_z(*_args, **_kwargs):
+        pytest.fail("Z must not move in an X-Scan array")
+
+    monkeypatch.setattr(y_axis, "move_abs", move_y)
+    monkeypatch.setattr(instrument._hal.stage.z, "move_abs", forbidden_z)
+    monkeypatch.setattr(instrument._hal.stage.x, "start_continuous_scan", start_sweep)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.COMPLETED, manifest.failure
+    assert y_moves == [100, 200]
+    assert sweep_y == [0, 100, 200]
+    assert [v.y for v in manifest.volumes] == [0, 100, 200]
+    assert all(v.scan.y_stack.step == 100 for v in manifest.volumes)
+    assert all(v.warnings == ([warning] if start_warning else []) for v in manifest.volumes)
+    assert writer.batches == [2, 2, 2]
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+async def test_cancelling_array_during_y_positioning_halts_y(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    task = instrument.state.value.plan[0]
+    await instrument.update_task(
+        task.id,
+        TaskPatch(
+            scan=LineScan.model_validate(
+                {
+                    **task.scan.model_dump(),
+                    "y_stack": {"start": 100, "end": 100},
+                }
+            )
+        ),
+    )
+    moving = asyncio.Event()
+    halt = AsyncMock()
+
+    async def move_y(*_args, **_kwargs):
+        moving.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(instrument._hal.stage.y, "move_abs", move_y)
+    monkeypatch.setattr(instrument._hal.stage.y, "halt", halt)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(moving.wait(), timeout=5)
+    await instrument.stop_acquisition()
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.CANCELLED
+    halt.assert_awaited_once()
+    assert writer.batches == []
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+async def test_explicit_target_rejects_exposure_longer_than_target_period(
+    opened_instrument: Instrument,
+    writer: _Writer,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    await instrument.set_device_properties("camera_1", {"exposure_time_ms": 100})
+    task = instrument.state.value.plan[0]
+    await instrument.update_task(
+        task.id,
+        TaskPatch(
+            scan=task.scan.model_copy(
+                update={
+                    "target_frame_rate_hz": 20,
+                    "runway_s": 1,
+                }
+            )
+        ),
+    )
+    with pytest.raises(OperationRejectedError, match="exposure must be shorter"):
+        await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    assert writer.batches == []
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+async def test_diagnostic_run_continues_after_strip_error_and_logs_it_once(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    task = instrument.state.value.plan[0]
+    await instrument.update_task(
+        task.id,
+        TaskPatch(
+            scan=LineScan.model_validate(
+                {
+                    **task.scan.model_dump(),
+                    "y_stack": {"start": 0, "end": 200, "step": 100},
+                }
+            )
+        ),
+    )
+    recorder = instrument._hal.recorders["scan_recorder"]
+    finish = recorder.finish
+    calls = 0
+
+    async def fail_first_recording(*args, **kwargs):
+        nonlocal calls
+        recorded = await finish(*args, **kwargs)
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("simulated marker read failure")
+        return recorded
+
+    monkeypatch.setattr(recorder, "finish", fail_first_recording)
+    await instrument.set_continue_on_error_next(True)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    assert started.continue_on_error
+    assert not instrument.continue_on_error_next
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.COMPLETED, manifest.failure
+    assert [v.status for v in manifest.volumes] == [VolumeStatus.FAILED, VolumeStatus.COMPLETED, VolumeStatus.COMPLETED]
+    assert manifest.volumes[0].datasets["gfp"].status is DatasetStatus.PARTIAL
+    assert writer.batches == [2, 2, 2]
+    diagnostic = json.loads((tmp_path / "data/run/diagnostics.json").read_text())
+    assert diagnostic["continue_on_error"] is True
+    assert len(diagnostic["errors"]) == 1
+    assert diagnostic["errors"][0]["volume_index"] == 0
+    assert diagnostic["errors"][0]["message"] == "simulated marker read failure"
+    assert instrument.activity.value.kind == "idle"
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+async def test_diagnostic_mode_does_not_continue_after_cleanup_failure(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    task = instrument.state.value.plan[0]
+    await instrument.update_task(
+        task.id,
+        TaskPatch(
+            scan=LineScan.model_validate(
+                {
+                    **task.scan.model_dump(),
+                    "y_stack": {"start": 0, "end": 100, "step": 100},
+                }
+            )
+        ),
+    )
+    teardown = instrument._teardown_capture
+
+    async def cleanup_failure(*args, **kwargs):
+        errors = await teardown(*args, **kwargs)
+        return [*errors, RuntimeError("simulated window reset failure")]
+
+    monkeypatch.setattr(instrument, "_teardown_capture", cleanup_failure)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE, continue_on_error=True))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.FAILED
+    assert [v.status for v in manifest.volumes] == [VolumeStatus.FAILED, VolumeStatus.SKIPPED]
+    assert writer.batches == [2]
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+async def test_diagnostic_mode_never_swallows_operator_cancellation(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    entering = asyncio.Event()
+
+    async def wait_for_cancel(*_args, **_kwargs):
+        entering.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(instrument, "_position_volume", wait_for_cancel)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE, continue_on_error=True))
+    await asyncio.wait_for(entering.wait(), timeout=5)
+    await instrument.stop_acquisition()
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.CANCELLED
+    assert writer.batches == []

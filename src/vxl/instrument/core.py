@@ -23,6 +23,7 @@ from vxl_records import (
     LocationStatus,
     PlannedVolume,
     StorageSpec,
+    VolumeStatus,
     VoxelRecords,
 )
 from vxlib.asyncio import settle
@@ -94,6 +95,7 @@ class _PassProgress:
     prepared: bool = False
     recording: bool = False
     moving: bool = False
+    moving_y: bool = False
     finished: bool = False
 
 
@@ -128,6 +130,7 @@ class AcquisitionRequest(BaseModel):
     storage: StorageSpec
     task_ids: list[str] | None = None
     operator: str | None = None
+    continue_on_error: bool | None = None
 
 
 class AcquisitionPhase(StrEnum):
@@ -246,6 +249,7 @@ class Instrument:
         self._lock = asyncio.Lock()  # Serializes the hardware-driving state machine(s)
         self._history = UndoHistory()
         self._acq_task: asyncio.Task[None] | None = None  # the in-flight acquisition run, if any
+        self._continue_on_error_next = False
         self.fov: ReactiveQuery[tuple[float, float]] = ReactiveQuery(fn=self._compute_current_fov)
         self.profile_fovs = Computed[dict[str, dict[str, Bounds]]](
             self._store,
@@ -730,6 +734,17 @@ class Instrument:
             self._ensure_not_busy("redo")
             await self._history.redo()
 
+    @property
+    def continue_on_error_next(self) -> bool:
+        """Whether the next accepted acquisition uses diagnostic best-effort execution."""
+        return self._continue_on_error_next
+
+    async def set_continue_on_error_next(self, enabled: bool) -> None:
+        async with self._lock:
+            self._ensure_not_busy("change next acquisition options")
+            self._continue_on_error_next = enabled
+            logger.warning("Next acquisition diagnostic continue-on-error: %s", enabled)
+
     async def start_acquisition(self, request: AcquisitionRequest) -> AcquisitionManifest:
         """Start a background acquisition and return its durable manifest.
 
@@ -744,6 +759,9 @@ class Instrument:
             if self._busy.value:
                 raise InstrumentBusyError("An acquisition is already in progress")
             state = self._store.value
+            continue_on_error = (
+                self._continue_on_error_next if request.continue_on_error is None else request.continue_on_error
+            )
             known = {task.id for task in state.plan}
             selected = None if request.task_ids is None else set(request.task_ids)
             if selected is not None and (unknown := selected - known):
@@ -780,6 +798,7 @@ class Instrument:
                 ),
                 created_at=datetime.datetime.now(tz=datetime.UTC),
                 storage=storage,
+                continue_on_error=continue_on_error,
                 state_snapshot=state.model_dump(mode="json"),
                 hardware_snapshot=self._hal.topology.model_dump(mode="json"),
                 volumes=volumes,
@@ -790,6 +809,7 @@ class Instrument:
             except Exception:
                 logger.exception("Failed to open the log window for acquisition %s", manifest.id)
             manifest = await self._records.acquisitions.start_acquisition(manifest.id)
+            self._continue_on_error_next = False
         except BaseException:
             await self._activity.set(IdleActivity())
             raise
@@ -1633,6 +1653,8 @@ class Instrument:
                 height=tile_height,
                 traversal=task.traversal,
             )
+            if task.scan is not None and task.scan.y_stack is not None:
+                positions = [Point2D(x=task.xy.points[0].x, y=y) for y in task.scan.y_stack.positions]
             resolved = [
                 (
                     point,
@@ -1693,9 +1715,34 @@ class Instrument:
 
     async def _execute_acquisition(self, manifest: AcquisitionManifest) -> None:
         """Execute every volume in a running manifest and finalize the acquisition."""
+        diagnostics: list[dict[str, Any]] = []
         try:
             for volume_index in range(len(manifest.volumes)):
-                manifest = await self._execute_volume(manifest, volume_index)
+                try:
+                    manifest = await self._execute_volume(manifest, volume_index)
+                except Exception as error:
+                    if not manifest.continue_on_error or self._cleanup_errors:
+                        raise
+                    manifest = await self._records.acquisitions.get(manifest.id)
+                    if manifest.volumes[volume_index].status is not VolumeStatus.FAILED:
+                        raise
+                    volume = manifest.volumes[volume_index]
+                    diagnostics.append(
+                        {
+                            "volume_index": volume_index,
+                            "task": volume.task,
+                            "profile": volume.profile,
+                            "kind": type(error).__name__,
+                            "message": str(error),
+                            "time": datetime.datetime.now(tz=datetime.UTC).isoformat(),
+                        }
+                    )
+                    target = self._system.resolve_storage(manifest.storage).target / "diagnostics.json"
+                    await asyncio.to_thread(_write_json, target, {"continue_on_error": True, "errors": diagnostics})
+                    logger.exception(
+                        "Diagnostic acquisition: strip %d failed; cleanup succeeded, continuing to the next strip",
+                        volume_index + 1,
+                    )
             manifest = await self._records.acquisitions.complete_acquisition(manifest.id)
             await self._update_acquisition(manifest)
             logger.info(
@@ -1754,6 +1801,7 @@ class Instrument:
             volume.profile,
         )
         frames_done = 0
+        capture_warnings: list[str] = []
         capture_error: BaseException | None = None
         progress = _PassProgress() if self._uses_continuous(volume) else None
         try:
@@ -1776,7 +1824,9 @@ class Instrument:
             await self._update_acquisition(manifest, phase=AcquisitionPhase.CAPTURING)
 
             if planned is not None and progress is not None:
-                await self._capture_continuous(manifest, volume, subpath, channels, planned, progress)
+                capture_warnings = await self._capture_continuous(
+                    manifest, volume, subpath, channels, planned, progress
+                )
                 frames_done = num_frames
                 await self._update_acquisition(manifest, frames_captured=num_frames)
             else:
@@ -1802,7 +1852,9 @@ class Instrument:
                 cleanup_errors = [error]
             self._cleanup_errors.extend(cleanup_errors)
         if capture_error is None and not cleanup_errors:
-            manifest = await self._records.acquisitions.complete_volume(manifest.id, volume_index=volume_index)
+            manifest = await self._records.acquisitions.complete_volume(
+                manifest.id, volume_index=volume_index, warnings=capture_warnings
+            )
             await self._update_acquisition(manifest)
             logger.info("Captured %d frames: task %s / profile %s", num_frames, volume.task, volume.profile)
             return manifest
@@ -1944,7 +1996,11 @@ class Instrument:
             if not self._uses_continuous(volume):
                 continue
             # Automatic timing must be queried after this volume's profile has been applied.
-            if volume.scan is not None and volume.scan.camera_rate_fraction is not None:
+            if (
+                volume.scan is not None
+                and volume.scan.target_frame_rate_hz is None
+                and volume.scan.camera_rate_fraction is not None
+            ):
                 scan = self._hal.topology.continuous_scan
                 if scan is None or scan.axis != volume.scan.axis:
                     found["X-Scan axis must match the configured encoder axis"] = None
@@ -1966,6 +2022,15 @@ class Instrument:
         if volume.scan is not None and planned is not None:
             if violations := await self._hold_violations(volume):
                 raise OperationRejectedError("; ".join(violations))
+            if volume.scan.y_stack is not None:
+                if abs(await self._hal.stage.y.get_position() - volume.y) > 1e-6:
+                    if progress is not None:
+                        progress.moving_y = True
+                    await self._hal.stage.y.move_abs(volume.y, wait=True)
+                    if progress is not None:
+                        progress.moving_y = False
+                if violations := await self._hold_violations(volume, positioned=True):
+                    raise OperationRejectedError("; ".join(violations))
             if progress is not None:
                 progress.moving = True
             await self._volume_scan_axis(volume).move_abs(planned.start, wait=True)
@@ -1985,7 +2050,7 @@ class Instrument:
     def _volume_scan_axis(self, volume: PlannedVolume) -> ContinuousAxisHandle:
         return getattr(self._hal.stage, volume.scan.axis if volume.scan else "z")
 
-    async def _hold_violations(self, volume: PlannedVolume) -> list[str]:
+    async def _hold_violations(self, volume: PlannedVolume, *, positioned: bool = False) -> list[str]:
         if volume.scan is None:
             return []
         violations = []
@@ -1994,7 +2059,8 @@ class Instrument:
                 continue
             axis = getattr(self._hal.stage, name)
             position = await axis.get_position()
-            if await axis.is_moving() or abs(position - target) > 1.0:
+            repositioned = name == "y" and volume.scan.y_stack is not None and not positioned
+            if await axis.is_moving() or (not repositioned and abs(position - target) > 1.0):
                 violations.append(f"held {name.upper()} must already be stationary at {target:g} µm (now {position:g})")
         return violations
 
@@ -2027,30 +2093,15 @@ class Instrument:
             return None, [f"the DAQ encoder is configured for {scan.axis.upper()}, not {volume.scan.axis.upper()}"]
         profile = self._store.value.imaging.profiles[volume.profile]
         violations = await self._hold_violations(volume)
-        camera_rate = None
-        if volume.scan is not None and volume.scan.camera_rate_fraction is not None:
+        camera_rate = volume.scan.target_frame_rate_hz if volume.scan is not None else None
+        if volume.scan is not None and camera_rate is None and volume.scan.camera_rate_fraction is not None:
             camera_rate, timing_errors = await self._camera_scan_rate(
                 profile, volume.scan.camera_rate_fraction, scan.speed_tolerance
             )
             violations.extend(timing_errors)
         if set(profile.sync) != {scan.generator}:
             violations.append(f"line scan profile must sync exactly generator '{scan.generator}'")
-        if volume.scan is not None:
-            stage_ids = {self._hal.topology.stage.x, self._hal.topology.stage.y, self._hal.topology.stage.z}
-            if any(stage_ids.intersection(signals.waveforms) for signals in profile.sync.values()):
-                violations.append("line scan profiles must not contain stage-step waveforms")
-        if volume.scan is not None and scan.generator in profile.sync:
-            signals = profile.sync[scan.generator]
-            fastest_period_ms = 1000 * (float(signals.duration) + float(signals.rest_time)) / (1 + scan.speed_tolerance)
-            for channel_id in profile.channels:
-                camera_id = self._store.value.imaging.channels[channel_id].detection
-                if camera_id not in signals.waveforms:
-                    violations.append(f"camera '{camera_id}' needs a trigger waveform")
-                exposure = profile.props.get(camera_id, {}).get("exposure_time_ms")
-                if exposure is None:
-                    exposure = await self._hal.cameras[camera_id].props.get_value("exposure_time_ms")
-                if camera_rate is None and float(exposure) >= fastest_period_ms:
-                    violations.append(f"camera '{camera_id}' exposure must be shorter than {fastest_period_ms:g} ms")
+        violations.extend(await self._scan_signal_violations(volume, profile, scan, camera_rate))
         if violations:
             return None, violations
         axis = self._volume_scan_axis(volume)
@@ -2071,6 +2122,35 @@ class Instrument:
             limits=(await axis.get_lower_limit(), await axis.get_upper_limit()),
         )
 
+    async def _scan_signal_violations(
+        self, volume: PlannedVolume, profile: ProfileConfig, scan: ContinuousScan, camera_rate: float | None
+    ) -> list[str]:
+        if volume.scan is None or (signals := profile.sync.get(scan.generator)) is None:
+            return []
+        violations: list[str] = []
+        stage_ids = {self._hal.topology.stage.x, self._hal.topology.stage.y, self._hal.topology.stage.z}
+        if stage_ids.intersection(signals.waveforms):
+            violations.append("line scan profiles must not contain stage-step waveforms")
+        period = float(signals.duration) + float(signals.rest_time)
+        if volume.scan.target_frame_rate_hz is not None:
+            period = max(
+                1 / volume.scan.target_frame_rate_hz,
+                (float(signals.duration) + scan.rearm_margin_s + 1 / float(signals.sample_rate))
+                * (1 + scan.speed_tolerance),
+            )
+        fastest_period_ms = 1000 * period / (1 + scan.speed_tolerance)
+        check_exposure = camera_rate is None or volume.scan.target_frame_rate_hz is not None
+        for channel_id in profile.channels:
+            camera_id = self._store.value.imaging.channels[channel_id].detection
+            if camera_id not in signals.waveforms:
+                violations.append(f"camera '{camera_id}' needs a trigger waveform")
+            exposure = profile.props.get(camera_id, {}).get("exposure_time_ms")
+            if exposure is None:
+                exposure = await self._hal.cameras[camera_id].props.get_value("exposure_time_ms")
+            if check_exposure and float(exposure) >= fastest_period_ms:
+                violations.append(f"camera '{camera_id}' exposure must be shorter than {fastest_period_ms:g} ms")
+        return violations
+
     def _continuous_scan(self) -> ContinuousScan:
         if (scan := self._hal.topology.continuous_scan) is None:
             raise RuntimeError("this instrument has no continuous scan configured")
@@ -2084,7 +2164,7 @@ class Instrument:
         channels: Mapping[str, Channel],
         planned: ContinuousPass,
         progress: "_PassProgress",
-    ) -> None:
+    ) -> list[str]:
         """Capture every frame of the volume in one constant-speed pass and record where each was taken.
 
         Recording and the cameras are armed before the generator, and the generator before motion, so the
@@ -2192,8 +2272,11 @@ class Instrument:
         }
         target = self._system.resolve_storage(manifest.storage, subpath).target / "scan.json"
         await asyncio.to_thread(_write_json, target, record)
-        if recorded.violations:
-            raise RuntimeError("Recorded pass is invalid: " + "; ".join(recorded.violations))
+        if recorded.errors:
+            raise RuntimeError("Recorded pass is invalid: " + "; ".join(recorded.errors))
+        if recorded.warnings:
+            logger.warning("Continuous scan completed with spatial warnings: %s", "; ".join(recorded.warnings))
+        return recorded.warnings
 
     async def _await_pass(
         self,
@@ -2288,6 +2371,11 @@ class Instrument:
         laser_results, errors = await _disable_lasers_and_halt(laser_chans, scanning_axis, halt=halt)
         errors[:0] = window_errors
         errors[:0] = _report("disable_laser_output", laser_chans, laser_results, collect=True)
+        if progress is not None and progress.moving_y:
+            try:
+                await self._hal.stage.y.halt()
+            except Exception as error:
+                errors.append(error)
         try:
             await self._stop_signal_generators()
         except Exception as error:
