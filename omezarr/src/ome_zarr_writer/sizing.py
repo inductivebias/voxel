@@ -48,18 +48,22 @@ def _voxels(shape: UIVec3D) -> int:
     return shape.z * shape.y * shape.x
 
 
-def per_slot_bytes(batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> int:
+def per_slot_bytes(batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype, *, use_gpu: bool = False) -> int:
     """Peak RAM one ring slot needs, in bytes.
 
-    A slot costs more than the shared memory it owns. While its worker flushes a batch it also holds
-    private buffers that never live in the ring:
+    A slot costs more than the shared memory it owns. While its worker flushes a batch on the CPU it
+    also holds private buffers that never live in the ring:
 
     - shared memory — L0 plus every pyramid level at ``dtype`` (``BatchSlot.__init__``)
     - worker heap — L1..Lmax as float32, all live at once (``pyramids_3d_numba`` returns them together)
     - worker heap — one ``.astype()`` copy per level, largest at L1 (``_worker_process_and_write``)
 
-    Counting only the shared memory under-counts by ~36% for uint16 and ~61% for uint8, which
+    Counting only the shared memory under-counts by ~36% for uint16 and ~61% for uint8 on CPU, which
     over-allocates slots and exhausts RAM mid-acquisition.
+
+    When ``use_gpu=True``, the worker executes pyramid reduction and dtype casting in GPU VRAM
+    (:class:`~ome_zarr_writer.pyramid_gpu.GpuPyramidWorkspace`), eliminating the CPU ``worker_pyramid``
+    and ``worker_cast`` heap allocations.
 
     The worker terms are charged to every slot, not just the flushing ones. In steady state one slot
     collects while the rest flush, so this over-reserves by at most one slot's transient — cheap next to
@@ -71,10 +75,18 @@ def per_slot_bytes(batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) ->
     for level in max_level.levels:
         voxels = _voxels(level.scale(batch_shape))
         shm += voxels * dtype.itemsize
-        if level != ScaleLevel.L0:
+        if not use_gpu and level != ScaleLevel.L0:
             worker_pyramid += voxels * _F32_ITEMSIZE
             worker_cast = max(worker_cast, voxels * dtype.itemsize)  # one level at a time; L1 is largest
     return shm + worker_pyramid + worker_cast
+
+
+def gpu_workspace_bytes(batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> int:
+    """Device VRAM allocated by one :class:`~ome_zarr_writer.pyramid_gpu.GpuPyramidWorkspace`."""
+    vram = sum(_voxels(level.scale(batch_shape)) * dtype.itemsize for level in max_level.levels)
+    if max_level != ScaleLevel.L0 and batch_shape.x >= 2:
+        vram += batch_shape.z * batch_shape.y * (batch_shape.x // 2) * _F32_ITEMSIZE
+    return vram
 
 
 def ring_shm_bytes(slots: int, batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> int:
@@ -94,6 +106,7 @@ def slots_for_budget(
     budget_bytes: int,
     available_bytes: int | None = None,
     label: str = "",
+    use_gpu: bool = False,
 ) -> int:
     """Deepest ring this geometry can fill within ``budget_bytes``, clamped to the ring-depth bounds.
 
@@ -113,7 +126,7 @@ def slots_for_budget(
             lands.
     """
     prefix = f"{label}: " if label else ""
-    slot_bytes = per_slot_bytes(batch_shape, max_level, dtype)
+    slot_bytes = per_slot_bytes(batch_shape, max_level, dtype, use_gpu=use_gpu)
     max_slots = budget_bytes // slot_bytes if slot_bytes else 0
     if max_slots < MIN_SLOTS:
         raise RingBudgetExceededError(

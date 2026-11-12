@@ -26,12 +26,15 @@ import multiprocessing as mp
 import os
 import signal
 import threading
+from collections.abc import Generator
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import IntEnum
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
+from typing import cast
 
 import numba
 import numba.core.config as numba_config
@@ -42,10 +45,20 @@ from pydantic import BaseModel, ConfigDict
 from vxlib.vector import UIVec3D
 
 from ome_zarr_writer.array import ArrayWriter
+from ome_zarr_writer.array.gpu import GPUArrayWriter, release_shared_encoder_shard_buffer
 from ome_zarr_writer.dataset import DownscaleType, Dtype, ScaleLevel
 from ome_zarr_writer.storage import S3Store
 
 from .pyramid import pyramids_3d_numba
+from .pyramid_gpu import (
+    GpuPyramidWorkspace,
+    flush_gpu_deallocations,
+    get_free_gpu_bytes,
+    is_gpu_available,
+    register_pinned_host_memory,
+    unregister_pinned_host_memory,
+    warmup_gpu_pyramid,
+)
 
 log = logging.getLogger(__name__)
 
@@ -61,6 +74,49 @@ _PREFAULT_MIN_BYTES = 1 << 28  # 256 MiB
 # Env-tunable (`VOXEL_NUMBA_THREADS`) so the in-pipeline optimum can be swept; clamped to the pool max.
 _NUMBA_POOL_MAX = int(getattr(numba_config, "NUMBA_NUM_THREADS", os.cpu_count() or 1))  # runtime-only attr
 _NUMBA_THREADS = max(1, min(int(os.environ.get("VOXEL_NUMBA_THREADS", "16")), _NUMBA_POOL_MAX))
+
+# Maximum number of worker processes allowed to allocate transient GPU pyramid/compression arenas
+# simultaneously across cameras. Keeps peak multi-process VRAM bounded (<= 2 workers * ~4.5 GB = ~9 GB).
+_GPU_CONCURRENT_WORKERS = max(1, int(os.environ.get("VOXEL_GPU_CONCURRENT_WORKERS", "2")))
+
+
+@contextmanager
+def _gpu_worker_slot() -> Generator[None]:
+    """Cross-process semaphore using POSIX flock so at most ``_GPU_CONCURRENT_WORKERS`` processes
+    hold transient GPU VRAM buffers at the same time."""
+    try:
+        import fcntl  # noqa: PLC0415
+    except ImportError:
+        yield
+        return
+
+    fd: int | None = None
+    try:
+        for idx in range(_GPU_CONCURRENT_WORKERS):
+            lock_path = f"/tmp/voxel_gpu_worker_{idx}.lock"  # noqa: S108
+            cand_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+            try:
+                fcntl.flock(cand_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fd = cand_fd
+                break
+            except BlockingIOError:
+                os.close(cand_fd)
+
+        if fd is None:
+            idx = os.getpid() % _GPU_CONCURRENT_WORKERS
+            lock_path = f"/tmp/voxel_gpu_worker_{idx}.lock"  # noqa: S108
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
+            fcntl.flock(fd, fcntl.LOCK_EX)
+
+        yield
+    finally:
+        if fd is not None:
+            try:
+                import fcntl  # noqa: PLC0415
+
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def _prefault_zero(arr: np.ndarray) -> None:
@@ -109,6 +165,7 @@ class OutputSetup(BaseModel):
     batch_z: int  # L0 depth per batch → maps batch_idx to its z-range
     volume_z: int  # total L0 depth → clamps the final partial batch
     reduction: DownscaleType = DownscaleType.MEAN  # pyramid downsample method (mirrors config.downscale_type)
+    use_gpu: bool = False  # dispatch flush to _worker_process_and_write_gpu when True
 
 
 @dataclass(frozen=True)
@@ -134,6 +191,9 @@ _WORKER_ARRAYS: dict[ScaleLevel, np.ndarray] = {}
 _WORKER_WRITERS: dict[ScaleLevel, ArrayWriter] = {}
 _WORKER_STATE: dict[str, OutputSetup] = {}  # holds the current "setup"; a dict to avoid a global rebind
 _LAYER_WARNED: list[bool] = []  # one-shot latch for the threading-layer warning (list mutated in place, no `global`)
+_WORKER_GPU_WS: dict[str, GpuPyramidWorkspace] = {}
+_WORKER_PINNED_L0: list[bool] = []
+_GPU_FALLBACK_WARNED: list[bool] = []
 
 
 def _worker_init(shm_layout: list[tuple[int, str, tuple[int, int, int]]], dtype_str: str) -> None:
@@ -167,12 +227,32 @@ def _worker_bind_output(setup: OutputSetup) -> None:
         _WORKER_WRITERS[level] = writer
     _WORKER_STATE["setup"] = setup
 
+    if (setup.use_gpu or setup.backend == ArrayWriter.Backend.GPU) and is_gpu_available():
+        l0_full = _WORKER_ARRAYS.get(ScaleLevel.L0)
+        if l0_full is not None and not _WORKER_PINNED_L0 and register_pinned_host_memory(l0_full):
+            _WORKER_PINNED_L0.append(True)
+        with _gpu_worker_slot():
+            if l0_full is not None:
+                warmup_gpu_pyramid(l0_full.dtype, setup.reduction)
+            for writer in _WORKER_WRITERS.values():
+                if isinstance(writer, GPUArrayWriter):
+                    writer.warmup()
+            release_shared_encoder_shard_buffer()
+            flush_gpu_deallocations()
+
 
 def _worker_close_output() -> None:
     """Close the per-level writers (drain pending writes, release handles)."""
     for writer in _WORKER_WRITERS.values():
         writer.close()
     _WORKER_WRITERS.clear()
+    for ws in _WORKER_GPU_WS.values():
+        ws.close()
+    _WORKER_GPU_WS.clear()
+    if _WORKER_PINNED_L0 and ScaleLevel.L0 in _WORKER_ARRAYS:
+        unregister_pinned_host_memory(_WORKER_ARRAYS[ScaleLevel.L0])
+        _WORKER_PINNED_L0.clear()
+    flush_gpu_deallocations()
 
 
 def _warn_if_slow_threading_layer() -> None:
@@ -230,6 +310,88 @@ def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: i
     )
 
 
+def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_idx: int) -> BatchResult:
+    """GPU-assisted batch worker run function.
+
+    Computes the 3D multiscale pyramid and target-dtype cast on the GPU via :class:`GpuPyramidWorkspace`.
+    When paired with :class:`GPUArrayWriter`, keeps all pyramid levels in GPU VRAM and encodes Zarr v3
+    shards directly on the GPU via ``nvcomp`` before writing shard files to disk. When paired with a CPU
+    :class:`ArrayWriter` (``TSArrayWriter`` / ``ZarrsArrayWriter``), copies the reduced levels back to
+    shared memory and delegates shard writing to the CPU backend.
+    """
+    setup = _WORKER_STATE.get("setup")
+    if setup is None:
+        raise RuntimeError("worker has no OutputSetup; call bind_output before flush")
+    if not is_gpu_available():
+        if not _GPU_FALLBACK_WARNED:
+            _GPU_FALLBACK_WARNED.append(True)
+            log.warning("GPU requested for BatchSlot worker, but CUDA is unavailable; falling back to CPU worker")
+        return _worker_process_and_write(max_level_value, filled_l0, batch_idx)
+
+    max_level = ScaleLevel(max_level_value)
+    l0_full = _WORKER_ARRAYS[ScaleLevel.L0]
+    if not _WORKER_PINNED_L0 and register_pinned_host_memory(l0_full):
+        _WORKER_PINNED_L0.append(True)
+
+    block = l0_full[:filled_l0]
+    z_start = batch_idx * setup.batch_z
+    z_end = min(z_start + setup.batch_z, setup.volume_z)
+    all_gpu_writers = all(isinstance(_WORKER_WRITERS[lvl], GPUArrayWriter) for lvl in setup.levels)
+
+    flushed = 0
+    with _gpu_worker_slot():
+        process_started = datetime.now(UTC)
+        ws = _WORKER_GPU_WS.get("ws")
+        shape_l0 = UIVec3D(z=l0_full.shape[0], y=l0_full.shape[1], x=l0_full.shape[2])
+        if ws is None or ws.shape_l0 != shape_l0 or ws.max_level != max_level or ws.dtype != l0_full.dtype:
+            if ws is not None:
+                ws.close()
+            ws = GpuPyramidWorkspace(shape_l0, max_level, l0_full.dtype)
+            _WORKER_GPU_WS["ws"] = ws
+
+        d_levels: dict[ScaleLevel, object] = {}
+        try:
+            d_levels = ws.compute_from_host(
+                block,
+                max_level,
+                reduction=setup.reduction,
+                copy_levels_to=None if all_gpu_writers else _WORKER_ARRAYS,
+                return_host_f32=False,
+            )
+            process_ended = datetime.now(UTC)
+            flush_started = process_ended
+
+            if all_gpu_writers:
+                for level in setup.levels:
+                    z0, z1 = z_start // level.factor, z_end // level.factor
+                    d_slab = d_levels[level][: z1 - z0]  # type: ignore[index]
+                    gpu_writer = cast("GPUArrayWriter", _WORKER_WRITERS[level])
+                    flushed += gpu_writer.write_slice_gpu(setup.channel, z0, d_slab)
+                    gpu_writer.release_device_buffers()
+                    d_slab = None
+        finally:
+            d_levels.clear()
+            # Keep the worker's device arena in Numba's per-process pool if >= 4 GiB of GPU VRAM remains
+            # free globally; otherwise release it back to the CUDA driver so other workers never OOM.
+            if get_free_gpu_bytes() < 4 * (1024**3):
+                ws.release_device_buffers()
+                release_shared_encoder_shard_buffer()
+                flush_gpu_deallocations()
+
+    if not all_gpu_writers:
+        for level in setup.levels:
+            z0, z1 = z_start // level.factor, z_end // level.factor
+            flushed += _WORKER_WRITERS[level].write_slice(setup.channel, z0, _WORKER_ARRAYS[level][: z1 - z0])
+
+    return BatchResult(
+        process_started=process_started,
+        process_ended=process_ended,
+        flush_started=flush_started,
+        flush_ended=datetime.now(UTC),
+        flushed_bytes=flushed,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Main-process slot
 # ---------------------------------------------------------------------------
@@ -251,6 +413,7 @@ class BatchSlot:
         self._active_readers = 0
         self._stage = SlotStage.IDLE  # explicit stage while no task is in flight (IDLE / COLLECTING)
         self._future: Future[BatchResult] | None = None  # set by flush(); stage derives from it
+        self._use_gpu = False
 
         # Allocate one shared-memory segment per level (L0 + pyramid), prefaulted off the capture path.
         self._shms: dict[ScaleLevel, SharedMemory] = {}
@@ -307,6 +470,7 @@ class BatchSlot:
     def bind_output(self, setup: OutputSetup) -> None:
         """Open the worker's per-level writers for a dataset. Call once per dataset before the first
         batch; blocks until the writers are open."""
+        self._use_gpu = setup.use_gpu or (setup.backend == ArrayWriter.Backend.GPU)
         self._executor.submit(_worker_bind_output, setup).result()
 
     def assign_batch(self, batch_idx: int) -> None:
@@ -371,17 +535,21 @@ class BatchSlot:
         with self._condition:
             self._condition.wait(timeout=timeout)
 
-    def flush(self) -> Future[BatchResult]:
+    def flush(self, *, use_gpu: bool | None = None) -> Future[BatchResult]:
         """Flush the collected batch to the store: kick off the worker's downsample-and-write and return
         its future. **Asynchronous** — the work runs in the worker; the returned future resolves (to a
         `BatchResult`) when the batch is durably written. The slot is not reusable until it settles, so
         the caller waits on it before reassigning."""
         if self.batch_idx is None:
             raise RuntimeError("cannot flush a slot with no batch assigned")
-        self._future = self._executor.submit(
-            _worker_process_and_write, self.max_level.value, self.filled_l0, self.batch_idx
-        )
+        run_gpu = self._use_gpu if use_gpu is None else use_gpu
+        worker_fn = _worker_process_and_write_gpu if run_gpu else _worker_process_and_write
+        self._future = self._executor.submit(worker_fn, self.max_level.value, self.filled_l0, self.batch_idx)
         return self._future
+
+    def flush_gpu(self) -> Future[BatchResult]:
+        """Explicitly flush the collected batch using the GPU worker run function."""
+        return self.flush(use_gpu=True)
 
     def close(self) -> None:
         """Close the worker's writers, shut the worker down, then unlink the shared memory."""

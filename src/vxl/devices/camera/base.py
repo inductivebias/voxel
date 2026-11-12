@@ -407,14 +407,16 @@ class CameraController(DeviceController["Camera"]):
             budget_bytes=budget,
             available_bytes=available,
             label=self.device.uid,
+            use_gpu=config.use_gpu,
         )
         log.info(
-            "Sizing ring for %s: %d slots (%.2f GB/slot peak, %.2f GB share, %.2f GB free)",
+            "Sizing ring for %s: %d slots (%.2f GB/slot peak, %.2f GB share, %.2f GB free, gpu=%s)",
             self.device.uid,
             slots,
-            per_slot_bytes(config.batch_shape, config.max_level, config.dtype) / 1e9,
+            per_slot_bytes(config.batch_shape, config.max_level, config.dtype, use_gpu=config.use_gpu) / 1e9,
             budget / 1e9,
             available / 1e9,
+            config.use_gpu,
         )
         return slots
 

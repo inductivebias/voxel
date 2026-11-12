@@ -61,6 +61,7 @@ from .deskew import (
     shear_factor_from_angle,
     shear_xz_from_angle,
 )
+from .pyramid_gpu import is_gpu_available, pyramids_3d_gpu
 from .storage import DirectS3, Local, S3Store, StagedS3, StagingConfig, Storage
 from .writer import BatchMetrics, FrameLease, OMEZarrWriter, WriterConfig, WriterSettings
 
@@ -95,6 +96,8 @@ __all__ = [
     "deskew_slice",
     "deskew_volume",
     "deskewed_width",
+    "is_gpu_available",
+    "pyramids_3d_gpu",
     "shear_factor_from_angle",
     "shear_xz_from_angle",
 ]

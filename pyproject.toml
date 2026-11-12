@@ -24,7 +24,7 @@ dependencies = [
     "msgpack>=1.1.0",
     "numpy>=2.3.4",
     "numcodecs>=0.16.5",
-    "ome-zarr-writer[ts,s3]",
+    "ome-zarr-writer[ts,s3,gpu]",
     "opencv-python-headless>=4.11.0.86",
     "psutil>=5.9",
     "pydantic>=2.11.9",

@@ -24,6 +24,7 @@ The module provides two objects:
 import json
 import logging
 import math
+import os
 import threading
 import time
 from collections.abc import Callable, Generator, Iterator
@@ -89,6 +90,10 @@ class WriterSettings(BaseModel):
     )
     target_shard_gb: float = 1.0
     io_timeout_s: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    use_gpu: bool = Field(
+        default_factory=lambda: os.environ.get("VOXEL_WRITER_GPU", "0").lower() in ("1", "true", "yes"),
+        description="Use GPU-accelerated pyramid generation and shard compression when available",
+    )
 
     @property
     def chunk_shape(self) -> UIVec3D:
@@ -405,6 +410,7 @@ class DatasetWriter:
                 batch_z=self._batch_z,
                 volume_z=self._volume_z,
                 reduction=config.downscale_type,
+                use_gpu=config.use_gpu or (backend == ArrayWriter.Backend.GPU),
             )
         )
 
@@ -786,7 +792,7 @@ class OMEZarrWriter:
     def __init__(
         self,
         *,
-        backend: ArrayWriter.Backend = ArrayWriter.Backend.TS,
+        backend: ArrayWriter.Backend | None = None,
         slots: int = 4,  # ring depth = max batches in flight (caller sizes from its RAM share)
     ) -> None:
         self._backend = backend
@@ -852,7 +858,12 @@ class OMEZarrWriter:
                 max_level=config.max_level,
                 dtype=config.dtype,
             )
-        self._active = DatasetWriter(config, storage, self._ring, backend=self._backend)
+        effective_backend = (
+            self._backend
+            if self._backend is not None
+            else (ArrayWriter.Backend.GPU if config.use_gpu else ArrayWriter.Backend.TS)
+        )
+        self._active = DatasetWriter(config, storage, self._ring, backend=effective_backend)
         return self._active
 
     @contextmanager

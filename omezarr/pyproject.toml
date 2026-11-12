@@ -11,9 +11,13 @@ dependencies = [
     "numba>=0.62.1",
     "tbb>=2021.0.0; sys_platform == 'linux'",
     "numpy>=2.5.2",
+    "google-crc32c>=1.5.0",
 ]
 
 [project.optional-dependencies]
+gpu = [
+    "nvidia-nvcomp-cu13>=6.0.0; sys_platform == 'linux'",
+]
 ts = [
     "tensorstore>=0.1.76",
     "pydantic-tensorstore",
