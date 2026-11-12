@@ -9,7 +9,6 @@ environment.
 reads 3D slices.
 """
 
-import os
 from pathlib import Path
 from typing import Any, assert_never
 
@@ -19,6 +18,8 @@ import tensorstore as ts
 from cloudpathlib import S3Path
 from vxlib.s3 import AnonymousCredentials, ChainCredentials, EnvCredentials, ProfileCredentials, S3Credentials, S3Store
 
+from ome_zarr_writer.concurrency import default_io_concurrency
+
 from .base import ArrayWriter
 
 # TensorStore's `data_copy_concurrency` and `file_io_concurrency` each default to the CPU count, and a
@@ -26,7 +27,7 @@ from .base import ArrayWriter
 # oversubscribes the machine (measured: at 6 slots the pipeline collapsed, process/flush ballooning ~10x
 # as the pyramid threads starved behind TS's thread storm). Bound it per worker; env-tunable like the
 # numba cap, clamped >= 1. Applied only to the writer — readers run one at a time in the main process.
-_TS_CONCURRENCY = max(1, int(os.environ.get("VOXEL_TS_CONCURRENCY", "16")))
+_TS_CONCURRENCY = default_io_concurrency("VOXEL_TS_CONCURRENCY")
 _TS_WRITER_CONTEXT = {
     "data_copy_concurrency": {"limit": _TS_CONCURRENCY},
     "file_io_concurrency": {"limit": _TS_CONCURRENCY},

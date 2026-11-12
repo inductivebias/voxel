@@ -7,12 +7,20 @@ control station's ``station.yaml`` is a superset of ``system.yaml`` and takes it
 when present; nodes and other non-control processes can use ``system.yaml`` or defaults.
 """
 
+import atexit
+import contextlib
+import json
 import logging
+import os
 import socket
+import stat
 import sys
+import threading
+import time
+from collections.abc import Iterator
 from hashlib import sha256
 from pathlib import Path, PurePosixPath
-from typing import ClassVar, Literal, Self
+from typing import Any, ClassVar, Literal, Self
 from uuid import UUID, uuid4
 
 import psutil
@@ -41,6 +49,15 @@ from vxl._utils.files import load_yaml, save_yaml
 
 log = logging.getLogger(__name__)
 
+_StatKey = tuple[int, int, int]
+_RemoteConsumers = dict[str, tuple[float, int]]
+_RemoteRegistryMap = dict[int, tuple[float, _RemoteConsumers]]
+
+_PID_CREATE_TIME_TOLERANCE_S = 0.1
+_LIVENESS_RECHECK_INTERVAL_S = 2.0
+_YAML_CACHE: dict[Path, tuple[_StatKey, dict[str, Any]]] = {}
+_YAML_CACHE_LOCK = threading.Lock()
+
 
 def _voxel_home() -> Path:
     """The fixed config/state home, ``~/.voxel`` -- holds machine config and ``instruments/``.
@@ -49,9 +66,182 @@ def _voxel_home() -> Path:
     return Path.home() / ".voxel"
 
 
+def _stat_key(path: Path) -> _StatKey | None:
+    """Return ``(st_mtime_ns, st_size, st_ino)`` for a regular file, or ``None`` if absent."""
+    try:
+        st = path.stat()
+    except OSError:
+        return None
+    if not stat.S_ISREG(st.st_mode):
+        return None
+    return (st.st_mtime_ns, st.st_size, st.st_ino)
+
+
+def _load_yaml_cached(path: Path, stat_key: _StatKey | None = None) -> dict[str, Any]:
+    """Read and cache a machine YAML dict keyed on file stat metadata."""
+    key = _stat_key(path) if stat_key is None else stat_key
+    if key is None:
+        with _YAML_CACHE_LOCK:
+            _YAML_CACHE.pop(path, None)
+        return {}
+    with _YAML_CACHE_LOCK:
+        cached = _YAML_CACHE.get(path)
+        if cached is not None and cached[0] == key:
+            return dict(cached[1])
+    loaded = load_yaml(path)
+    data: dict[str, Any] = loaded if isinstance(loaded, dict) else {}
+    with _YAML_CACHE_LOCK:
+        _YAML_CACHE[path] = (key, data)
+    return dict(data)
+
+
 def _yaml_source(settings_cls: type[BaseSettings], path: Path) -> InitSettingsSource:
     """Machine YAML as a settings source, read like every other Voxel YAML file; a missing file adds nothing."""
-    return InitSettingsSource(settings_cls, (load_yaml(path) if path.is_file() else None) or {})
+    return InitSettingsSource(settings_cls, _load_yaml_cached(path))
+
+
+if sys.platform == "win32":
+    import msvcrt
+
+    def _acquire_lock_fd(fd: int) -> None:
+        deadline = time.monotonic() + 10.0
+        while True:
+            try:
+                os.lseek(fd, 0, os.SEEK_SET)
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                return
+            except OSError:
+                if time.monotonic() >= deadline:
+                    raise
+                time.sleep(0.005)
+
+    def _release_lock_fd(fd: int) -> None:
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+
+else:
+    import fcntl
+
+    def _acquire_lock_fd(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+
+    def _release_lock_fd(fd: int) -> None:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _file_lock(lock_path: Path) -> Iterator[None]:
+    """Cross-platform exclusive file lock around host RAM registry mutations."""
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        _acquire_lock_fd(fd)
+        try:
+            yield
+        finally:
+            _release_lock_fd(fd)
+    finally:
+        os.close(fd)
+
+
+def _atomic_write_json(path: Path, data: dict[str, Any]) -> None:
+    """Write ``data`` to a sibling temp file and atomically replace ``path``."""
+    payload = json.dumps(data, separators=(",", ":")).encode("utf-8")
+    tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(payload)
+        if sys.platform == "win32":
+            for attempt in range(5):
+                try:
+                    tmp_path.replace(path)
+                    break
+                except PermissionError:
+                    if attempt == 4:
+                        raise
+                    time.sleep(0.005)
+        else:
+            tmp_path.replace(path)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _is_pid_alive(pid: int, expected_create_time: float) -> bool:
+    """Verify ``pid`` is alive, non-zombie, and matches ``expected_create_time`` within 0.1s."""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    try:
+        proc = psutil.Process(pid)
+        if abs(proc.create_time() - expected_create_time) > _PID_CREATE_TIME_TOLERANCE_S:
+            return False
+        return proc.status() != psutil.STATUS_ZOMBIE
+    except (psutil.Error, OSError, ValueError):
+        return False
+
+
+def _parse_live_remote_entries(
+    raw: object,
+    own_pid: int,
+) -> tuple[dict[str, dict[str, Any]], _RemoteRegistryMap]:
+    """Validate raw registry JSON and keep only live remote PIDs."""
+    cleaned_json: dict[str, dict[str, Any]] = {}
+    remote_map: _RemoteRegistryMap = {}
+    if not isinstance(raw, dict):
+        return cleaned_json, remote_map
+
+    for raw_entry in raw.values():
+        if not isinstance(raw_entry, dict):
+            continue
+        raw_pid = raw_entry.get("pid")
+        raw_ct = raw_entry.get("create_time")
+        raw_consumers = raw_entry.get("consumers")
+        if (
+            isinstance(raw_pid, bool)
+            or not isinstance(raw_pid, int)
+            or isinstance(raw_ct, bool)
+            or not isinstance(raw_ct, int | float)
+            or not isinstance(raw_consumers, dict)
+        ):
+            continue
+        if raw_pid == own_pid:
+            continue
+
+        parsed_json_consumers: dict[str, dict[str, float | int]] = {}
+        parsed_mem_consumers: _RemoteConsumers = {}
+        for cid, spec in raw_consumers.items():
+            if not isinstance(cid, str) or not isinstance(spec, dict):
+                continue
+            raw_w = spec.get("weight")
+            raw_c = spec.get("committed", 0)
+            if isinstance(raw_w, bool) or not isinstance(raw_w, int | float):
+                continue
+            if isinstance(raw_c, bool) or not isinstance(raw_c, int | float):
+                continue
+            weight = float(raw_w)
+            if weight <= 0.0:
+                continue
+            committed = max(0, int(raw_c))
+            parsed_json_consumers[cid] = {"weight": weight, "committed": committed}
+            parsed_mem_consumers[cid] = (weight, committed)
+
+        if not parsed_mem_consumers:
+            continue
+        create_time = float(raw_ct)
+        if not _is_pid_alive(raw_pid, create_time):
+            continue
+
+        cleaned_json[str(raw_pid)] = {
+            "pid": raw_pid,
+            "create_time": create_time,
+            "consumers": parsed_json_consumers,
+        }
+        remote_map[raw_pid] = (create_time, parsed_mem_consumers)
+
+    return cleaned_json, remote_map
 
 
 def load_voxel_env() -> None:
@@ -218,11 +408,187 @@ class System(BaseSettings):
         """Weighted RAM-budget mediation for consumers sharing this machine's memory.
 
         Holds a policy fraction of available RAM and divides it among registered
-        consumers in proportion to their weights. Consumers register via
-        ``reserve()`` / ``release()`` and read their allocation via ``reserved()``.
+        consumers across all live Voxel processes sharing ``_voxel_home()`` in
+        proportion to their weights. Consumers register via ``reserve()`` /
+        ``release()``, optionally report prefaulted allocations via
+        ``record_committed()``, and read their allocation via ``reserved()``.
         """
 
         _consumers: ClassVar[dict[str, float]] = {}
+        _committed: ClassVar[dict[str, int]] = {}
+        _lock: ClassVar[threading.RLock] = threading.RLock()
+        _active_registry_path: ClassVar[Path | None] = None
+        _touched_registries: ClassVar[set[Path]] = set()
+        _atexit_registered_pid: ClassVar[int | None] = None
+        _own_create_time: ClassVar[tuple[int, float] | None] = None
+        _fraction_cache: ClassVar[tuple[Path, _StatKey | None, float] | None] = None
+        _registry_cache: ClassVar[tuple[Path, _StatKey | None, _RemoteRegistryMap, float] | None] = None
+
+        @classmethod
+        def _max_ram_fraction(cls) -> float:
+            """Return ``max_ram_fraction`` without constructing ``System()`` or re-parsing unchanged YAML."""
+            raw_env = os.environ.get("VOXEL_MAX_RAM_FRACTION")
+            if raw_env is not None:
+                try:
+                    fraction = float(raw_env)
+                except ValueError:
+                    return System().max_ram_fraction
+                if 0.0 < fraction <= 1.0:
+                    return fraction
+                return System().max_ram_fraction
+
+            config_path = System.config_path()
+            stat_key = _stat_key(config_path)
+            with cls._lock:
+                cached = cls._fraction_cache
+                if cached is not None and cached[0] == config_path and cached[1] == stat_key:
+                    return cached[2]
+
+                if stat_key is None:
+                    cls._fraction_cache = (config_path, None, 0.75)
+                    return 0.75
+
+                data = _load_yaml_cached(config_path, stat_key)
+                if "max_ram_fraction" not in data:
+                    fraction = 0.75
+                else:
+                    raw_val = data["max_ram_fraction"]
+                    if isinstance(raw_val, bool) or not isinstance(raw_val, int | float | str):
+                        return System().max_ram_fraction
+                    try:
+                        fraction = float(raw_val)
+                    except ValueError:
+                        return System().max_ram_fraction
+                    if not (0.0 < fraction <= 1.0):
+                        return System().max_ram_fraction
+
+                cls._fraction_cache = (config_path, stat_key, fraction)
+                return fraction
+
+        @classmethod
+        def _registry_paths(cls) -> tuple[Path, Path]:
+            override = os.environ.get("VOXEL_RAM_REGISTRY")
+            if override:
+                reg_path = Path(override).expanduser()
+                lock_path = reg_path.with_suffix(".lock") if reg_path.suffix else Path(f"{reg_path}.lock")
+                return reg_path, lock_path
+            home = _voxel_home()
+            return home / ".ram_consumers.json", home / ".ram_consumers.lock"
+
+        @classmethod
+        def _sync_scope(cls, reg_path: Path) -> None:
+            if cls._active_registry_path is not None and cls._active_registry_path != reg_path:
+                cls._consumers.clear()
+                cls._committed.clear()
+            cls._active_registry_path = reg_path
+            if cls._committed:
+                for cid in list(cls._committed):
+                    if cid not in cls._consumers:
+                        del cls._committed[cid]
+
+        @classmethod
+        def _get_own_create_time(cls, pid: int) -> float:
+            cached = cls._own_create_time
+            if cached is not None and cached[0] == pid:
+                return cached[1]
+            try:
+                ct = psutil.Process(pid).create_time()
+            except (psutil.Error, OSError):
+                ct = 0.0
+            cls._own_create_time = (pid, ct)
+            return ct
+
+        @classmethod
+        def _ensure_atexit_registered(cls, pid: int) -> None:
+            if cls._atexit_registered_pid != pid:
+                atexit.register(cls._cleanup_current_process)
+                cls._atexit_registered_pid = pid
+
+        @classmethod
+        def _cleanup_current_process(cls) -> None:
+            pid = os.getpid()
+            pid_key = str(pid)
+            with cls._lock:
+                paths = set(cls._touched_registries)
+                cls._touched_registries.clear()
+                cls._consumers.clear()
+                cls._committed.clear()
+                cls._registry_cache = None
+            for reg_path in paths:
+                if not reg_path.exists():
+                    continue
+                lock_path = reg_path.with_suffix(".lock") if reg_path.suffix else Path(f"{reg_path}.lock")
+                with contextlib.suppress(OSError, json.JSONDecodeError), _file_lock(lock_path):
+                    raw = json.loads(reg_path.read_bytes()) if reg_path.is_file() else {}
+                    if isinstance(raw, dict) and pid_key in raw:
+                        cleaned, _ = _parse_live_remote_entries(raw, pid)
+                        _atomic_write_json(reg_path, cleaned)
+
+        @classmethod
+        def _sync_own_to_registry(cls, reg_path: Path, lock_path: Path) -> None:
+            pid = os.getpid()
+            cls._ensure_atexit_registered(pid)
+            if not cls._consumers and not reg_path.exists():
+                cls._registry_cache = (reg_path, None, {}, time.monotonic())
+                return
+            try:
+                with _file_lock(lock_path):
+                    raw: object = {}
+                    if reg_path.is_file():
+                        with contextlib.suppress(OSError, json.JSONDecodeError):
+                            raw = json.loads(reg_path.read_bytes())
+                    cleaned_json, remote_map = _parse_live_remote_entries(raw, pid)
+                    if cls._consumers:
+                        cleaned_json[str(pid)] = {
+                            "pid": pid,
+                            "create_time": cls._get_own_create_time(pid),
+                            "consumers": {
+                                cid: {
+                                    "weight": float(weight),
+                                    "committed": max(0, int(cls._committed.get(cid, 0))),
+                                }
+                                for cid, weight in cls._consumers.items()
+                            },
+                        }
+                    _atomic_write_json(reg_path, cleaned_json)
+                    cls._touched_registries.add(reg_path)
+                    cls._registry_cache = (reg_path, _stat_key(reg_path), remote_map, time.monotonic())
+            except OSError:
+                log.debug("RAM registry unavailable at %s; using process-local mediation", reg_path, exc_info=True)
+
+        @classmethod
+        def _read_remote_consumers(cls, reg_path: Path) -> _RemoteRegistryMap:
+            cls._sync_scope(reg_path)
+            stat_key = _stat_key(reg_path)
+            now = time.monotonic()
+            if stat_key is None:
+                cls._registry_cache = (reg_path, None, {}, now)
+                return {}
+
+            cached = cls._registry_cache
+            if cached is not None and cached[0] == reg_path and cached[1] == stat_key:
+                remote_map = cached[2]
+                last_check = cached[3]
+                if remote_map:
+                    if now - last_check >= _LIVENESS_RECHECK_INTERVAL_S:
+                        remote_map = {
+                            rpid: (ct, cons) for rpid, (ct, cons) in remote_map.items() if _is_pid_alive(rpid, ct)
+                        }
+                        cls._registry_cache = (reg_path, stat_key, remote_map, now)
+                    else:
+                        dead = [rpid for rpid in remote_map if not psutil.pid_exists(rpid)]
+                        if dead:
+                            remote_map = {rpid: val for rpid, val in remote_map.items() if rpid not in dead}
+                            cls._registry_cache = (reg_path, stat_key, remote_map, last_check)
+                return remote_map
+
+            try:
+                raw = json.loads(reg_path.read_bytes())
+            except (OSError, json.JSONDecodeError):
+                return {}
+            _, remote_map = _parse_live_remote_entries(raw, os.getpid())
+            cls._registry_cache = (reg_path, stat_key, remote_map, now)
+            return remote_map
 
         @classmethod
         def total_bytes(cls) -> int:
@@ -235,20 +601,61 @@ class System(BaseSettings):
         @classmethod
         def max_bytes(cls) -> int:
             """Live policy cap: available system RAM * VOXEL_MAX_RAM_FRACTION."""
-            return int(cls.available_bytes() * System().max_ram_fraction)
+            return int(cls.available_bytes() * cls._max_ram_fraction())
 
         @classmethod
         def reserve(cls, consumer_id: str, weight: float = 1.0) -> int:
             """Register ``consumer_id`` with ``weight``; return its share in bytes."""
             if weight <= 0:
                 raise ValueError(f"weight must be > 0, got {weight}")
-            cls._consumers[consumer_id] = weight
+            with cls._lock:
+                reg_path, lock_path = cls._registry_paths()
+                cls._sync_scope(reg_path)
+                cls._consumers[consumer_id] = float(weight)
+                cls._committed.setdefault(consumer_id, 0)
+                cls._sync_own_to_registry(reg_path, lock_path)
             return cls.reserved(consumer_id)
+
+        @classmethod
+        def record_committed(cls, consumer_id: str, committed_bytes: int) -> None:
+            """Record bytes already allocated/prefaulted by a registered consumer so sibling consumers
+            sizing their rings afterward divide the same pre-allocation available pool."""
+            with cls._lock:
+                reg_path, lock_path = cls._registry_paths()
+                cls._sync_scope(reg_path)
+                if consumer_id not in cls._consumers:
+                    return
+                cls._committed[consumer_id] = max(0, int(committed_bytes))
+                cls._sync_own_to_registry(reg_path, lock_path)
 
         @classmethod
         def release(cls, consumer_id: str) -> None:
             """Deregister ``consumer_id`` (no-op if not registered)."""
-            cls._consumers.pop(consumer_id, None)
+            with cls._lock:
+                reg_path, lock_path = cls._registry_paths()
+                cls._sync_scope(reg_path)
+                removed_weight = cls._consumers.pop(consumer_id, None)
+                cls._committed.pop(consumer_id, None)
+                if removed_weight is not None:
+                    cls._sync_own_to_registry(reg_path, lock_path)
+
+        @classmethod
+        def reset(cls) -> None:
+            """Clear all RAM consumer reservations in this process and the active host registry."""
+            with cls._lock:
+                reg_path, lock_path = cls._registry_paths()
+                cls._active_registry_path = reg_path
+                cls._consumers.clear()
+                cls._committed.clear()
+                cls._registry_cache = None
+                if not reg_path.exists() and not lock_path.exists():
+                    return
+                try:
+                    with _file_lock(lock_path):
+                        _atomic_write_json(reg_path, {})
+                        cls._registry_cache = (reg_path, _stat_key(reg_path), {}, time.monotonic())
+                except OSError:
+                    log.debug("Failed to reset RAM registry at %s", reg_path, exc_info=True)
 
         @classmethod
         def reserved(cls, consumer_id: str) -> int:
@@ -256,10 +663,37 @@ class System(BaseSettings):
 
             Raises KeyError if the consumer hasn't been registered via reserve().
             """
-            if consumer_id not in cls._consumers:
-                raise KeyError(consumer_id)
-            total_weight = sum(cls._consumers.values()) or 1.0
-            return int(cls.max_bytes() * cls._consumers[consumer_id] / total_weight)
+            with cls._lock:
+                reg_path, _ = cls._registry_paths()
+                remote_map = cls._read_remote_consumers(reg_path)
+
+                my_weight: float | None = cls._consumers.get(consumer_id)
+                if my_weight is None:
+                    for _ct, remote_cons in remote_map.values():
+                        if consumer_id in remote_cons:
+                            my_weight = remote_cons[consumer_id][0]
+                            break
+                if my_weight is None:
+                    raise KeyError(consumer_id)
+
+                total_weight = sum(cls._consumers.values())
+                total_committed = sum(cls._committed.get(cid, 0) for cid in cls._consumers)
+                for _ct, remote_cons in remote_map.values():
+                    for w, c in remote_cons.values():
+                        total_weight += w
+                        total_committed += c
+                if total_weight <= 0.0:
+                    total_weight = 1.0
+
+            fraction = cls._max_ram_fraction()
+            avail = cls.available_bytes()
+            if total_committed > 0:
+                total = cls.total_bytes()
+                effective_available = min(total, avail + total_committed) if avail <= total else avail + total_committed
+            else:
+                effective_available = avail
+            pool_bytes = int(effective_available * fraction)
+            return int(pool_bytes * my_weight / total_weight)
 
 
 class StationInfo(BaseModel):

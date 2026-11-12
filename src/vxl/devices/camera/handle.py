@@ -12,12 +12,14 @@ from vxlib.vector import IVec2D, Vec2D, Vec3D
 
 from rigup import DeviceHandle
 from vxl.devices.camera.base import (
+    WRITER_CLOSE_ERROR_PREFIX,
     Camera,
     CaptureState,
     SensorROI,
     StorageStatus,
     TriggerMode,
     TriggerPolarity,
+    WriterCloseError,
 )
 from vxl.preview import PreviewViewport
 
@@ -153,7 +155,14 @@ class CameraHandle(DeviceHandle[Camera]):
 
     async def capture_state(self) -> CaptureState:
         """Lifecycle of the most recent begin_batch/close_stack. Raises if the task failed."""
-        result = await self.call("capture_state")
+        try:
+            result = await self.call("capture_state")
+        except WriterCloseError:
+            raise
+        except RuntimeError as err:
+            if WRITER_CLOSE_ERROR_PREFIX in str(err):
+                raise WriterCloseError(str(err)) from err
+            raise
         return CaptureState(result)
 
     async def update_roi(self, roi: SensorROI) -> SensorROI:

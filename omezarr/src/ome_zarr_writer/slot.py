@@ -45,6 +45,7 @@ from ome_zarr_writer.array import ArrayWriter
 from ome_zarr_writer.dataset import DownscaleType, Dtype, ScaleLevel
 from ome_zarr_writer.storage import S3Store
 
+from .concurrency import default_numba_threads, downsample_gate, flush_gate
 from .pyramid import pyramids_3d_numba
 
 log = logging.getLogger(__name__)
@@ -60,7 +61,7 @@ _PREFAULT_MIN_BYTES = 1 << 28  # 256 MiB
 # whole machine, so with several slots downsampling at once the memory system is badly oversubscribed.
 # Env-tunable (`VOXEL_NUMBA_THREADS`) so the in-pipeline optimum can be swept; clamped to the pool max.
 _NUMBA_POOL_MAX = int(getattr(numba_config, "NUMBA_NUM_THREADS", os.cpu_count() or 1))  # runtime-only attr
-_NUMBA_THREADS = max(1, min(int(os.environ.get("VOXEL_NUMBA_THREADS", "16")), _NUMBA_POOL_MAX))
+_NUMBA_THREADS = default_numba_threads(_NUMBA_POOL_MAX)
 
 
 def _prefault_zero(arr: np.ndarray) -> None:
@@ -202,30 +203,35 @@ def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: i
         raise RuntimeError("worker has no OutputSetup; call bind_output before flush")
     max_level = ScaleLevel(max_level_value)
 
-    process_started = datetime.now(UTC)
-    block = _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0]
-    pyramid = pyramids_3d_numba(block, max_level, reduction=setup.reduction, parallel=True)
-    _warn_if_slow_threading_layer()
-    for level, vol in pyramid.items():
-        arr = _WORKER_ARRAYS[level]
-        z = min(arr.shape[0], vol.shape[0])
-        y = min(arr.shape[1], vol.shape[1])
-        x = min(arr.shape[2], vol.shape[2])
-        arr[:z, :y, :x] = vol[:z, :y, :x].astype(arr.dtype)
+    with downsample_gate():
+        process_started = datetime.now(UTC)
+        block = _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0]
+        pyramid = pyramids_3d_numba(block, max_level, reduction=setup.reduction, parallel=True)
+        _warn_if_slow_threading_layer()
+        for level, vol in pyramid.items():
+            arr = _WORKER_ARRAYS[level]
+            z = min(arr.shape[0], vol.shape[0])
+            y = min(arr.shape[1], vol.shape[1])
+            x = min(arr.shape[2], vol.shape[2])
+            arr[:z, :y, :x] = vol[:z, :y, :x].astype(arr.dtype)
+        del pyramid
+        process_ended = max(process_started, datetime.now(UTC))
 
-    process_ended = datetime.now(UTC)  # also the flush start — the write begins as soon as the pyramid is ready
     z_start = batch_idx * setup.batch_z
     z_end = min(z_start + setup.batch_z, setup.volume_z)
     flushed = 0
-    for level in setup.levels:
-        z0, z1 = z_start // level.factor, z_end // level.factor
-        flushed += _WORKER_WRITERS[level].write_slice(setup.channel, z0, _WORKER_ARRAYS[level][: z1 - z0])
+    with flush_gate():
+        flush_started = max(process_ended, datetime.now(UTC))
+        for level in setup.levels:
+            z0, z1 = z_start // level.factor, z_end // level.factor
+            flushed += _WORKER_WRITERS[level].write_slice(setup.channel, z0, _WORKER_ARRAYS[level][: z1 - z0])
+        flush_ended = max(flush_started, datetime.now(UTC))
 
     return BatchResult(
         process_started=process_started,
         process_ended=process_ended,
-        flush_started=process_ended,
-        flush_ended=datetime.now(UTC),
+        flush_started=flush_started,
+        flush_ended=flush_ended,
         flushed_bytes=flushed,
     )
 
