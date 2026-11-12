@@ -29,6 +29,7 @@ from cloudpathlib import S3Path
 from vxlib.s3 import AnonymousCredentials, ProfileCredentials
 from zarr.storage import LocalStore, ObjectStore
 
+from ome_zarr_writer.concurrency import default_io_concurrency
 from ome_zarr_writer.storage import S3Store
 
 from .base import ArrayWriter
@@ -37,6 +38,11 @@ from .base import ArrayWriter
 # isn't shared across store instances — benign for our per-shard write pattern; silence the per-write noise.
 warnings.filterwarnings("ignore", message="Successfully reconstructed a store", category=RuntimeWarning)
 
+# Threads for the per-shard write in `write_slice` (each shard write hits zarrs' fast single-shard codec
+# path; the default multi-shard write serializes inner-chunk encoding). Env-tunable so the S3 concurrency
+# can be swept without a code edit (higher may raise S3 upload throughput toward the endpoint ceiling).
+_SHARD_WRITE_WORKERS = default_io_concurrency("VOXEL_ZARRS_SHARD_WORKERS")
+
 zarr.config.set(
     {
         "threading.max_workers": None,
@@ -44,7 +50,7 @@ zarr.config.set(
         "codec_pipeline": {
             "path": "zarrs.ZarrsCodecPipeline",
             "validate_checksums": True,
-            "chunk_concurrent_maximum": None,
+            "chunk_concurrent_maximum": max(4, _SHARD_WRITE_WORKERS),
             "chunk_concurrent_minimum": 4,
             "direct_io": False,
             "batch_size": 1,  # consumed only by the pure-Python fallback pipeline; native path ignores it
@@ -55,11 +61,6 @@ zarr.config.set(
 # S3 connection keys this backend sets from the store; cleared on each open so a reused worker never
 # carries a previous store's endpoint/anon config forward. Credentials are handled separately below.
 _S3_CONN_ENV = ("AWS_ENDPOINT_URL", "AWS_ALLOW_HTTP", "AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "AWS_SKIP_SIGNATURE")
-
-# Threads for the per-shard write in `write_slice` (each shard write hits zarrs' fast single-shard codec
-# path; the default multi-shard write serializes inner-chunk encoding). Env-tunable so the S3 concurrency
-# can be swept without a code edit (higher may raise S3 upload throughput toward the endpoint ceiling).
-_SHARD_WRITE_WORKERS = int(os.environ.get("VOXEL_ZARRS_SHARD_WORKERS", "16"))
 
 
 def _apply_s3_env(store: S3Store) -> None:

@@ -10,14 +10,13 @@ from typing import Literal, cast
 
 import numpy as np
 from ome_zarr_writer import (
-    FrameLease,
     OMEZarrWriter,
     UIVec3D,
     UVec3D,
     WriterConfig,
     WriterSettings,
 )
-from ome_zarr_writer.sizing import per_slot_bytes, slots_for_budget
+from ome_zarr_writer.sizing import per_slot_bytes, ring_shm_bytes, slots_for_budget
 from ome_zarr_writer.writer import BatchMetrics
 from pydantic import BaseModel, ConfigDict
 from vxl_records import DatasetLocation, StorageSpec
@@ -134,6 +133,12 @@ PIXEL_FMT_TO_VALID_BITS: dict[PixelFormat, ValidBits] = {
 }
 
 BINNING_OPTIONS = [1, 2, 4, 8]
+ACQUISITION_PREVIEW_INTERVAL_S = 0.25
+WRITER_CLOSE_ERROR_PREFIX = "Writer close failed: "
+
+
+class WriterCloseError(RuntimeError):
+    """Raised when writer finalization fails after camera hardware has been reset to IDLE."""
 
 
 class CaptureState(StrEnum):
@@ -159,6 +164,7 @@ class CameraController(DeviceController["Camera"]):
         self._frame_idx = 0
         self._previewer = PreviewGenerator(sink=self._on_preview_frame, uid=device.uid)
         self._writer: OMEZarrWriter | None = None
+        self._ring_slots: int = 0
         self._task: asyncio.Task[None] | None = None
         self._task_kind: Literal["batch", "close"] | None = None
         self._publish_tasks: dict[PreviewLayer, asyncio.Task[None]] = {}
@@ -167,9 +173,11 @@ class CameraController(DeviceController["Camera"]):
 
     async def close(self) -> None:
         await self.stop_preview()
-        await self.close_stack()
-        if self._task is not None:
-            await asyncio.shield(self._task)
+        if self._mode is CameraMode.ACQUISITION or (self._task is not None and not self._task.done()):
+            await self.close_stack()
+            if self._task is not None:
+                with suppress(WriterCloseError):
+                    await asyncio.shield(self._task)
         self._previewer.close()
         for task in self._publish_tasks.values():
             task.cancel()
@@ -374,6 +382,11 @@ class CameraController(DeviceController["Camera"]):
             self._writer = OMEZarrWriter()
         _t = time.perf_counter()
         await self._run_sync(self._writer.begin_stack, cfg, dest, sizer=self._size_ring)
+        if hasattr(System.Ram, "record_committed") and self._ring_slots > 0:
+            System.Ram.record_committed(
+                self.device.uid,
+                ring_shm_bytes(self._ring_slots, cfg.batch_shape, cfg.max_level, cfg.dtype),
+            )
         log.info(
             "OMEZarrWriter begin_stack for %s took %.1fs",
             self.device.uid,
@@ -398,6 +411,9 @@ class CameraController(DeviceController["Camera"]):
         released — so the RAM share read here is not depressed by memory this camera is giving back.
         Refuses below ``MIN_SLOTS``: a single slot would serialize collect against flush.
         """
+        self._ring_slots = 0
+        if hasattr(System.Ram, "record_committed"):
+            System.Ram.record_committed(self.device.uid, 0)
         budget = self.ram_budget_bytes
         available = System.Ram.available_bytes()
         slots = slots_for_budget(
@@ -408,6 +424,7 @@ class CameraController(DeviceController["Camera"]):
             available_bytes=available,
             label=self.device.uid,
         )
+        self._ring_slots = slots
         log.info(
             "Sizing ring for %s: %d slots (%.2f GB/slot peak, %.2f GB share, %.2f GB free)",
             self.device.uid,
@@ -451,9 +468,13 @@ class CameraController(DeviceController["Camera"]):
         if self._mode is CameraMode.ACQUISITION:
             await self._run_sync(self.device.stop)
         self._previewer.cancel_pending()
+        self._previewer.clear_frame()
+        writer_error: Exception | None = None
         try:
-            if self._writer is not None:
+            if self._writer is not None and getattr(self._writer, "target", True) is not None:
                 await self._run_sync(self._writer.end_stack)  # drain the dataset; keep the ring for reuse
+        except Exception as exc:
+            writer_error = exc
         finally:
             await self._run_sync(self.device.free_buffer)
             self._mode = CameraMode.IDLE
@@ -473,6 +494,8 @@ class CameraController(DeviceController["Camera"]):
             pv.publish_sent,
             pv.publish_busy_drops,
         )
+        if self._mode is CameraMode.IDLE and writer_error is not None:
+            raise WriterCloseError(f"{WRITER_CLOSE_ERROR_PREFIX}{writer_error}") from writer_error
 
     @describe(label="Release Writer")
     async def release_writer(self) -> None:
@@ -488,8 +511,13 @@ class CameraController(DeviceController["Camera"]):
         if self._writer is not None:
             self._previewer.cancel_pending()
             self._previewer.clear_frame()
-            await self._run_sync(self._writer.close)
-            self._writer = None
+            try:
+                await self._run_sync(self._writer.close)
+            finally:
+                self._writer = None
+                self._ring_slots = 0
+                if hasattr(System.Ram, "record_committed"):
+                    System.Ram.record_committed(self.device.uid, 0)
             log.info("Writer ring released for %s", self.device.uid)
 
     @property
@@ -533,39 +561,43 @@ class CameraController(DeviceController["Camera"]):
 
     async def _collect_batch(self, num_frames: int, writer: OMEZarrWriter) -> None:
         """Grab ``num_frames`` frames into the writer, then stop the camera."""
+
+        def _read_valid_bits() -> ValidBits:
+            return PIXEL_FMT_TO_VALID_BITS[cast("PixelFormat", str(self.device.pixel_format))]
+
         try:
+            valid_bits = await self._run_sync(_read_valid_bits)
             for _ in range(num_frames):
-                frame = await self._capture_into_writer(writer)
-                try:
+                want_preview = self._previewer.can_accept_overview(min_interval_s=ACQUISITION_PREVIEW_INTERVAL_S)
+                preview_copy = await self._capture_into_writer(writer, copy_for_preview=want_preview)
+                if preview_copy is not None:
                     self._previewer.submit_frame(
-                        frame,
+                        preview_copy,
                         self._frame_idx,
-                        valid_bits=PIXEL_FMT_TO_VALID_BITS[cast("PixelFormat", str(self.device.pixel_format))],
+                        valid_bits=valid_bits,
+                        include_viewport=False,
+                        retain_source=False,
                     )
-                except Exception:
-                    frame.close()
-                    raise
                 self._frame_idx += 1
         finally:
             await self._run_sync(self.device.stop)
 
-    async def _capture_into_writer(self, writer: OMEZarrWriter) -> FrameLease:
+    async def _capture_into_writer(self, writer: OMEZarrWriter, *, copy_for_preview: bool = False) -> np.ndarray | None:
         """Fill and commit one writer frame as one serialized, cancellation-safe device transaction."""
 
-        def _grab() -> FrameLease:
+        def _grab() -> np.ndarray | None:
             with writer.new_frame() as frame:
                 self.device.grab_frame(out=frame)
-            return writer.latest_frame()
+                return frame.copy() if copy_for_preview else None
 
         task = asyncio.create_task(self._run_sync(_grab))
         try:
             return await asyncio.shield(task)
         except asyncio.CancelledError:
             # run_in_executor work cannot be stopped once running. Wait for the transaction to settle so
-            # its destination is not reused mid-write, then release a committed frame nobody will consume.
+            # its destination is not reused mid-write.
             with suppress(Exception):
-                frame = await task
-                frame.close()
+                await task
             raise
 
     @describe(label="Captured Frames")
@@ -585,6 +617,8 @@ class CameraController(DeviceController["Camera"]):
         if task.cancelled():
             raise RuntimeError("Capture task was cancelled before cleanup")
         if (exc := task.exception()) is not None:
+            if isinstance(exc, WriterCloseError):
+                raise WriterCloseError(str(exc)) from exc
             raise RuntimeError(f"Capture task failed: {exc}")
         return CaptureState.DONE if self._task_kind == "batch" else CaptureState.CLOSED
 

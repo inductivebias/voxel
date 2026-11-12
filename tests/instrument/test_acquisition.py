@@ -15,9 +15,10 @@ from vxl_records import (
     VolumeStatus,
 )
 
-from vxl.devices.camera import CaptureState
+from vxl.devices.camera import CaptureState, WriterCloseError
 from vxl.hal.topology import AcquisitionGeometry
 from vxl.instrument import (
+    AcquisitionPhase,
     AcquisitionRequest,
     AcquisitionTask,
     Activity,
@@ -34,10 +35,11 @@ from vxl.instrument.config import ProfilePatch, TaskPatch, WriterPatch
 
 
 class _Writer:
-    def __init__(self, root: Path, *, close_error: bool = False) -> None:
+    def __init__(self, root: Path, *, close_error: bool = False, hardware_close_error: bool = False) -> None:
         self.uid = "camera_1"
         self._root = root
         self._close_error = close_error
+        self._hardware_close_error = hardware_close_error
         self._closing = False
         self.released = False
         self.opened_kwargs: list[dict[str, object]] = []
@@ -60,11 +62,13 @@ class _Writer:
         return
 
     async def capture_state(self) -> CaptureState:
+        if self._closing and self._close_error:
+            raise WriterCloseError("Writer close failed: simulated flush error")
         return CaptureState.CLOSED if self._closing else CaptureState.DONE
 
     async def close_stack(self) -> None:
-        if self._close_error:
-            raise RuntimeError("writer close failed")
+        if self._hardware_close_error:
+            raise RuntimeError("camera RPC dead")
         self._closing = True
 
     async def release_writer(self) -> None:
@@ -148,7 +152,33 @@ async def test_writer_close_failure_marks_dataset_and_acquisition_failed(
     assert dataset.status is DatasetStatus.PARTIAL
     assert dataset.locations[0].status is LocationStatus.FAILED
     assert not writer.released
+    assert isinstance(instrument.activity.value, IdleActivity)
+
+    writer._close_error = False
+    retry = await instrument.start_acquisition(
+        AcquisitionRequest(storage=StorageSpec(path=PurePosixPath("run-retry")), operator="operator")
+    )
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=5)
+    assert (await catalog.get(retry.id)).status is AcquisitionStatus.COMPLETED
+    assert isinstance(instrument.activity.value, IdleActivity)
+
+
+async def test_hardware_close_failure_leaves_instrument_stopping(
+    opened_instrument: Instrument, records: SQLiteRecords, writer: _Writer
+) -> None:
+    instrument = opened_instrument
+    catalog = records.acquisitions
+    storage = StorageSpec(path=PurePosixPath("run"))
+    writer._hardware_close_error = True
+
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=storage, operator="operator"))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=5)
+
+    persisted = await catalog.get(started.id)
+    assert persisted.status is AcquisitionStatus.FAILED
     assert isinstance(instrument.activity.value, CaptureActivity)
+    assert instrument.activity.value.acquisition is not None
+    assert instrument.activity.value.acquisition.phase is AcquisitionPhase.STOPPING
     with pytest.raises(InstrumentBusyError, match="already in progress"):
         await instrument.start_acquisition(AcquisitionRequest(storage=storage))
 

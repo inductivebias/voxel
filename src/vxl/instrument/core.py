@@ -34,7 +34,7 @@ from vxlib.schema import FrozenModel
 
 from rigup import DeviceHandle, DeviceInterface, DeviceProps, PropResults, Result
 from vxl.devices.axes import ContinuousAxisHandle, StepMode, TTLStepperConfig
-from vxl.devices.camera import CameraHandle, CaptureState, SensorROI
+from vxl.devices.camera import CameraHandle, CaptureState, SensorROI, WriterCloseError
 from vxl.devices.daq.clocked import Signals
 from vxl.devices.daq.recording import RecorderArm
 from vxl.hal import HAL, ContinuousScan, HardwareTopology
@@ -1850,7 +1850,8 @@ class Instrument:
                 capture_error = capture_error or error
             except Exception as error:
                 cleanup_errors = [error]
-            self._cleanup_errors.extend(cleanup_errors)
+            hardware_cleanup_errors = [error for error in cleanup_errors if not isinstance(error, WriterCloseError)]
+            self._cleanup_errors.extend(hardware_cleanup_errors)
         if capture_error is None and not cleanup_errors:
             manifest = await self._records.acquisitions.complete_volume(
                 manifest.id, volume_index=volume_index, warnings=capture_warnings

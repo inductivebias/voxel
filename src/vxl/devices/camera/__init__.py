@@ -1,4 +1,4 @@
-from .base import Camera, CameraController, CameraMode, CaptureState, SensorROI, StorageStatus
+from .base import Camera, CameraController, CameraMode, CaptureState, SensorROI, StorageStatus, WriterCloseError
 from .handle import CameraHandle
 
 __all__ = [
@@ -9,4 +9,5 @@ __all__ = [
     "CaptureState",
     "SensorROI",
     "StorageStatus",
+    "WriterCloseError",
 ]
