@@ -1293,6 +1293,35 @@ class ZaberLinearAxis(ContinuousAxis):
     def peripheral_serial_number(self) -> int:
         return self._peripheral_serial_number
 
+    @describe(label="Get Setting", desc="Read a Zaber axis setting in native controller units.")
+    def get_setting(self, name: str) -> float:
+        setting = name.strip()
+        if not setting:
+            raise ValueError("setting name must not be empty")
+        with self.hub.lock:
+            return float(self._axis.settings.get(setting, Units.NATIVE))
+
+    @describe(label="Set Setting", desc="Write a Zaber axis setting in native units and return the readback.")
+    def set_setting(self, name: str, value: float) -> float:
+        setting = name.strip()
+        if not setting:
+            raise ValueError("setting name must not be empty")
+        if not math.isfinite(value):
+            raise ValueError(f"{setting} must be finite, got {value}")
+        with self.hub.lock:
+            self._settings.clear()
+            self._axis.settings.set(setting, value, Units.NATIVE)
+            return float(self._axis.settings.get(setting, Units.NATIVE))
+
+    @describe(label="Send Command", desc="Send a Zaber ASCII command to this axis and return the reply data.")
+    def command(self, cmd: str) -> str:
+        command = cmd.strip()
+        if not command:
+            raise ValueError("command must not be empty")
+        with self.hub.lock:
+            self._settings.clear()
+            return self._axis.generic_command(command).data
+
     def get_ttl_stepper(self) -> TTLStepper | None:
         return self._ttl_stepper
 
