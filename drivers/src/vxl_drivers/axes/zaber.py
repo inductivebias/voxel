@@ -192,6 +192,13 @@ def _check_channel(name: str, number: int, count: int) -> None:
         raise ValueError(f"{name} {number} is outside 1..{count} on this Zaber device")
 
 
+def _require_non_empty(value: str, label: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{label} must not be empty")
+    return stripped
+
+
 class ZaberTTLStepper(TTLStepper):
     """Repeat one queued relative move each time a Zaber digital input rises.
 
@@ -1292,6 +1299,29 @@ class ZaberLinearAxis(ContinuousAxis):
     @describe(label="Peripheral Serial")
     def peripheral_serial_number(self) -> int:
         return self._peripheral_serial_number
+
+    @describe(label="Get Setting", desc="Read a Zaber axis setting in native controller units.")
+    def get_setting(self, name: str) -> float:
+        setting = _require_non_empty(name, "setting name")
+        with self.hub.lock:
+            return float(self._axis.settings.get(setting, Units.NATIVE))
+
+    @describe(label="Set Setting", desc="Write a Zaber axis setting in native units and return the readback.")
+    def set_setting(self, name: str, value: float) -> float:
+        setting = _require_non_empty(name, "setting name")
+        if not math.isfinite(value):
+            raise ValueError(f"{setting} must be finite, got {value}")
+        with self.hub.lock:
+            self._settings.clear()
+            self._axis.settings.set(setting, value, Units.NATIVE)
+            return float(self._axis.settings.get(setting, Units.NATIVE))
+
+    @describe(label="Send Command", desc="Send a Zaber ASCII command to this axis and return the reply data.")
+    def command(self, cmd: str) -> str:
+        command = _require_non_empty(cmd, "command")
+        with self.hub.lock:
+            self._settings.clear()
+            return self._axis.generic_command(command).data
 
     def get_ttl_stepper(self) -> TTLStepper | None:
         return self._ttl_stepper

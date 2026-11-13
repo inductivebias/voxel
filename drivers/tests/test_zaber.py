@@ -1447,3 +1447,26 @@ def test_window_disarm_forces_off_even_if_one_trigger_disable_fails(controller, 
     assert not sdk.device.triggers.by_number[5].enabled
     sdk.device.triggers.by_number[3].fail_disable = False
     axis.close()
+
+
+def test_zaber_setting_and_command_accessors(controller):
+    hub, _, sdk, _ = controller
+    axis = zaber.ZaberLinearAxis(uid="x", hub=hub, device_serial=12345, axis_number=1)
+    sdk.settings.values["cloop.servo.p"] = 1234.0
+
+    assert axis.get_setting(" cloop.servo.p ") == 1234.0
+    assert axis.set_setting("cloop.servo.p", 1500.0) == 1500.0
+    assert sdk.settings.values["cloop.servo.p"] == 1500.0
+
+    with pytest.raises(ValueError, match="empty"):
+        axis.get_setting("   ")
+    with pytest.raises(ValueError, match="empty"):
+        axis.set_setting("", 1.0)
+    with pytest.raises(ValueError, match="finite"):
+        axis.set_setting("cloop.servo.p", float("nan"))
+    with pytest.raises(ValueError, match="empty"):
+        axis.command("  ")
+
+    assert axis.command("get pos") == "250000"
+    axis.close()
+    hub.close()
