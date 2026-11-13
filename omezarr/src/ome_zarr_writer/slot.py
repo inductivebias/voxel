@@ -25,7 +25,9 @@ import math
 import multiprocessing as mp
 import os
 import signal
+import tempfile
 import threading
+import time
 from collections.abc import Generator
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
 from contextlib import contextmanager
@@ -45,7 +47,11 @@ from pydantic import BaseModel, ConfigDict
 from vxlib.vector import UIVec3D
 
 from ome_zarr_writer.array import ArrayWriter
-from ome_zarr_writer.array.gpu import GPUArrayWriter, release_shared_encoder_shard_buffer
+from ome_zarr_writer.array.gpu import (
+    GPUArrayWriter,
+    release_shared_encoder_buffers,
+    release_shared_encoder_device_buffers,
+)
 from ome_zarr_writer.dataset import DownscaleType, Dtype, ScaleLevel
 from ome_zarr_writer.storage import S3Store
 
@@ -53,7 +59,6 @@ from .pyramid import pyramids_3d_numba
 from .pyramid_gpu import (
     GpuPyramidWorkspace,
     flush_gpu_deallocations,
-    get_free_gpu_bytes,
     is_gpu_available,
     register_pinned_host_memory,
     unregister_pinned_host_memory,
@@ -90,23 +95,26 @@ def _gpu_worker_slot() -> Generator[None]:
         yield
         return
 
+    uid = getattr(os, "getuid", lambda: 0)()
+    lock_dir = Path(tempfile.gettempdir()) / f"voxel_ozw_locks_{uid}"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    start_idx = os.getpid() % _GPU_CONCURRENT_WORKERS
+
     fd: int | None = None
     try:
-        for idx in range(_GPU_CONCURRENT_WORKERS):
-            lock_path = f"/tmp/voxel_gpu_worker_{idx}.lock"  # noqa: S108
-            cand_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-            try:
-                fcntl.flock(cand_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                fd = cand_fd
-                break
-            except BlockingIOError:
-                os.close(cand_fd)
-
-        if fd is None:
-            idx = os.getpid() % _GPU_CONCURRENT_WORKERS
-            lock_path = f"/tmp/voxel_gpu_worker_{idx}.lock"  # noqa: S108
-            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o666)
-            fcntl.flock(fd, fcntl.LOCK_EX)
+        while fd is None:
+            for offset in range(_GPU_CONCURRENT_WORKERS):
+                idx = (start_idx + offset) % _GPU_CONCURRENT_WORKERS
+                lock_path = lock_dir / f"gpu_worker_{idx}.lock"
+                cand_fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    fcntl.flock(cand_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fd = cand_fd
+                    break
+                except BlockingIOError:
+                    os.close(cand_fd)
+            if fd is None:
+                time.sleep(0.01)
 
         yield
     finally:
@@ -237,7 +245,7 @@ def _worker_bind_output(setup: OutputSetup) -> None:
             for writer in _WORKER_WRITERS.values():
                 if isinstance(writer, GPUArrayWriter):
                     writer.warmup()
-            release_shared_encoder_shard_buffer()
+            release_shared_encoder_device_buffers()
             flush_gpu_deallocations()
 
 
@@ -249,6 +257,7 @@ def _worker_close_output() -> None:
     for ws in _WORKER_GPU_WS.values():
         ws.close()
     _WORKER_GPU_WS.clear()
+    release_shared_encoder_buffers()
     if _WORKER_PINNED_L0 and ScaleLevel.L0 in _WORKER_ARRAYS:
         unregister_pinned_host_memory(_WORKER_ARRAYS[ScaleLevel.L0])
         _WORKER_PINNED_L0.clear()
@@ -371,12 +380,11 @@ def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_id
                     d_slab = None
         finally:
             d_levels.clear()
-            # Keep the worker's device arena in Numba's per-process pool if >= 4 GiB of GPU VRAM remains
-            # free globally; otherwise release it back to the CUDA driver so other workers never OOM.
-            if get_free_gpu_bytes() < 4 * (1024**3):
-                ws.release_device_buffers()
-                release_shared_encoder_shard_buffer()
-                flush_gpu_deallocations()
+            # Release transient GPU device buffers on slot exit so idle workers hold 0 VRAM
+            # and never starve or OOM other worker processes.
+            ws.release_device_buffers()
+            release_shared_encoder_device_buffers()
+            flush_gpu_deallocations()
 
     if not all_gpu_writers:
         for level in setup.levels:

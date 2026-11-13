@@ -52,7 +52,8 @@ from ome_zarr_writer.dataset import (
     Zarr3ArrayMeta,
     Zarr3GroupMeta,
 )
-from ome_zarr_writer.sizing import MIN_SLOTS, RingSizingError
+from ome_zarr_writer.pyramid_gpu import is_gpu_available
+from ome_zarr_writer.sizing import MIN_SLOTS, RingSizingError, per_slot_bytes
 from ome_zarr_writer.slot import BatchResult, BatchSlot, OutputSetup, SlotStage
 from ome_zarr_writer.storage import Local, S3Store, StagedS3, StagingConfig, Storage
 from ome_zarr_writer.transfer import TransferJob, run_s5cmd
@@ -798,6 +799,8 @@ class OMEZarrWriter:
         self._backend = backend
         self._slots = slots
         self._ring: Ring | None = None
+        self._ring_use_gpu: bool | None = None
+        self._ring_slot_bytes: int | None = None
         self._active: DatasetWriter | None = None
         self._ring_failed = False
 
@@ -842,10 +845,20 @@ class OMEZarrWriter:
         """
         if self._active is not None:
             raise RuntimeError("stack already open; call end_stack() first")
+        effective_use_gpu = (config.use_gpu or self._backend == ArrayWriter.Backend.GPU) and is_gpu_available()
+        slot_bytes = per_slot_bytes(
+            config.batch_shape,
+            config.max_level,
+            config.dtype,
+            use_gpu=effective_use_gpu,
+            shard_shape=config.shard_shape,
+        )
         if (
             self._ring is None
             or self._ring_failed
             or not self._ring.matches(config.batch_shape, config.max_level, config.dtype)
+            or self._ring_use_gpu != effective_use_gpu
+            or (self._ring_slot_bytes is not None and slot_bytes > self._ring_slot_bytes)
         ):
             self._drop_ring()
             slots = sizer(config) if sizer is not None else self._slots
@@ -858,10 +871,12 @@ class OMEZarrWriter:
                 max_level=config.max_level,
                 dtype=config.dtype,
             )
+            self._ring_use_gpu = effective_use_gpu
+            self._ring_slot_bytes = slot_bytes
         effective_backend = (
             self._backend
             if self._backend is not None
-            else (ArrayWriter.Backend.GPU if config.use_gpu else ArrayWriter.Backend.TS)
+            else (ArrayWriter.Backend.GPU if effective_use_gpu else ArrayWriter.Backend.TS)
         )
         self._active = DatasetWriter(config, storage, self._ring, backend=effective_backend)
         return self._active
@@ -907,5 +922,7 @@ class OMEZarrWriter:
         """Release the retained ring, if any."""
         ring, self._ring = self._ring, None
         self._ring_failed = False
+        self._ring_use_gpu = None
+        self._ring_slot_bytes = None
         if ring is not None:
             ring.close()

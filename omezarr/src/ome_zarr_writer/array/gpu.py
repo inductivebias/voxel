@@ -32,23 +32,30 @@ from numba.core.errors import NumbaPerformanceWarning
 
 from ome_zarr_writer.dataset import (
     BloscCodec,
+    BytesCodec,
+    CRC32CCodec,
     GzipCodec,
     ShardingIndexedCodec,
     Zarr3ArrayMeta,
     ZstdCodec,
 )
+from ome_zarr_writer.pyramid_gpu import flush_gpu_deallocations
 from ome_zarr_writer.storage import S3Store
 
 from .base import ArrayWriter
 from .ts import TSArrayWriter
 
-warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
-
 log = logging.getLogger(__name__)
 
 _TARGET_BLOSC_BLOCKSIZE = 262144  # 256 KiB sub-blocks saturate GPU SMs and fit CPU L2 on decode
 _MAX_ENCODE_BATCH_BYTES = 256 * 1024 * 1024  # 256 MiB mini-batch cap so d_sub_blocks + d_comp_out <= 520 MiB
+_MAX_ENCODE_BATCH_CHUNKS = 32768  # Safely below CUDA's gridDim.y <= 65535 hardware limit
 _EMPTY_ENTRY = (1 << 64) - 1
+
+
+def max_batch_chunks_for(chunk_nbytes: int, max_chunks: int) -> int:
+    """Return the mini-batch chunk count capped by VRAM budget and CUDA's gridDim.y limit."""
+    return max(1, min(max_chunks, _MAX_ENCODE_BATCH_CHUNKS, _MAX_ENCODE_BATCH_BYTES // max(1, chunk_nbytes)))
 
 
 def _has_nvcomp() -> bool:
@@ -238,6 +245,37 @@ class _ParsedShardSpec:
     shuffle_flag: int  # 0x01 (byte-shuffle) | 0x00
 
 
+def _parse_inner_codecs(codecs: list[Any], typesize: int) -> tuple[str, str, int, int]:
+    codec_kind = "none"
+    nvcomp_alg = ""
+    blosc_flag_fmt = 0
+    shuffle_flag = 0
+
+    for inner in codecs:
+        if isinstance(inner, BytesCodec):
+            if inner.configuration.endian not in ("little", None):
+                raise ValueError(f"Unsupported BytesCodec endianness for GPUArrayWriter: {inner.configuration.endian}")
+        elif isinstance(inner, ZstdCodec) and codec_kind == "none":
+            codec_kind, nvcomp_alg = "zstd", "zstd"
+        elif isinstance(inner, GzipCodec) and codec_kind == "none":
+            codec_kind, nvcomp_alg = "gzip", "gzip"
+        elif isinstance(inner, BloscCodec) and codec_kind == "none":
+            codec_kind = "blosc"
+            cname = inner.configuration.cname
+            if cname in ("lz4", "lz4hc"):
+                nvcomp_alg, blosc_flag_fmt = "lz4", 0x20
+            elif cname == "zstd":
+                nvcomp_alg, blosc_flag_fmt = "zstd", 0x80
+            else:
+                raise ValueError(f"Unsupported Blosc cname for GPUArrayWriter: {cname}")
+            if typesize > 1 and inner.configuration.shuffle != "noshuffle":
+                shuffle_flag = 0x01
+        else:
+            raise ValueError(f"Unsupported inner codec for GPUArrayWriter: {inner}")
+
+    return codec_kind, nvcomp_alg, blosc_flag_fmt, shuffle_flag
+
+
 def _parse_array_meta(meta: Zarr3ArrayMeta) -> _ParsedShardSpec:
     if len(meta.shape) != 4:
         raise ValueError(f"GPUArrayWriter requires 4D [C, Z, Y, X] arrays, got shape {meta.shape}")
@@ -251,34 +289,19 @@ def _parse_array_meta(meta: Zarr3ArrayMeta) -> _ParsedShardSpec:
         raise ValueError("GPUArrayWriter requires a sharding_indexed array")
     if sharding.configuration.index_location != "end":
         raise ValueError(f"Unsupported shard index_location: {sharding.configuration.index_location}")
+
+    idx_codecs = sharding.configuration.index_codecs
+    if (
+        len(idx_codecs) != 2
+        or not isinstance(idx_codecs[0], BytesCodec)
+        or idx_codecs[0].configuration.endian not in ("little", None)
+        or not isinstance(idx_codecs[1], CRC32CCodec)
+    ):
+        raise ValueError(f"Unsupported shard index_codecs for GPUArrayWriter: {idx_codecs}")
+
+    codec_kind, nvcomp_alg, blosc_flag_fmt, shuffle_flag = _parse_inner_codecs(sharding.configuration.codecs, typesize)
+
     cz, cy, cx = (int(x) for x in sharding.configuration.chunk_shape[1:])
-
-    codec_kind = "none"
-    nvcomp_alg = ""
-    blosc_flag_fmt = 0
-    shuffle_flag = 0
-
-    for inner in sharding.configuration.codecs:
-        if isinstance(inner, ZstdCodec):
-            codec_kind = "zstd"
-            nvcomp_alg = "zstd"
-        elif isinstance(inner, GzipCodec):
-            codec_kind = "gzip"
-            nvcomp_alg = "gzip"
-        elif isinstance(inner, BloscCodec):
-            codec_kind = "blosc"
-            cname = inner.configuration.cname
-            if cname in ("lz4", "lz4hc"):
-                nvcomp_alg = "lz4"
-                blosc_flag_fmt = 0x20
-            elif cname == "zstd":
-                nvcomp_alg = "zstd"
-                blosc_flag_fmt = 0x80
-            else:
-                raise ValueError(f"Unsupported Blosc cname for GPUArrayWriter: {cname}")
-            if typesize > 1 and inner.configuration.shuffle != "noshuffle":
-                shuffle_flag = 0x01
-
     return _ParsedShardSpec(
         volume_shape=(vz, vy, vx),
         shard_shape=(sz, sy, sx),
@@ -313,35 +336,68 @@ class _CudaSlice1D:
 
 # Process-wide reusable pair of pinned host buffers and shared device scratch buffers
 # so L0..L7 encoders in a worker share a single ~520 MiB nvcomp staging arena.
-_SHARED_PINNED_PAIR: list[Any] = []
-_SHARED_D_SUB_FLAT: list[Any] = []
-_SHARED_D_COMP_FLAT: list[Any] = []
-_SHARED_D_SHARD_FLAT: list[Any] = []
+_SHARED_PINNED_PAIR: list[Any] | None = None
+_SHARED_D_SUB_FLAT: Any = None
+_SHARED_D_COMP_FLAT: Any = None
+_SHARED_D_SHARD_FLAT: Any = None
+_SHARED_ENCODER: Any = None
 
 
 def _get_shared_pinned_pair(min_bytes: int) -> list[Any]:
-    if not _SHARED_PINNED_PAIR or int(_SHARED_PINNED_PAIR[0].nbytes) < min_bytes:
-        _SHARED_PINNED_PAIR.clear()
-        _SHARED_PINNED_PAIR.extend(
-            [
-                cuda.pinned_array(min_bytes, dtype=np.uint8),
-                cuda.pinned_array(min_bytes, dtype=np.uint8),
-            ]
-        )
+    global _SHARED_PINNED_PAIR  # noqa: PLW0603
+    if _SHARED_PINNED_PAIR is None or int(_SHARED_PINNED_PAIR[0].nbytes) < min_bytes:
+        _SHARED_PINNED_PAIR = [
+            cuda.pinned_array(min_bytes, dtype=np.uint8),
+            cuda.pinned_array(min_bytes, dtype=np.uint8),
+        ]
     return _SHARED_PINNED_PAIR
 
 
-def _get_shared_device_flat(holder: list[Any], min_bytes: int) -> Any:
-    if not holder or int(holder[0].nbytes) < min_bytes:
-        holder.clear()
-        holder.append(cuda.device_array(min_bytes, dtype=np.uint8))
-    return holder[0]
+def _get_shared_d_sub_flat(min_bytes: int) -> Any:
+    global _SHARED_D_SUB_FLAT  # noqa: PLW0603
+    if _SHARED_D_SUB_FLAT is None or int(_SHARED_D_SUB_FLAT.nbytes) < min_bytes:
+        _SHARED_D_SUB_FLAT = cuda.device_array(min_bytes, dtype=np.uint8)
+    return _SHARED_D_SUB_FLAT
+
+
+def _get_shared_d_comp_flat(min_bytes: int) -> Any:
+    global _SHARED_D_COMP_FLAT  # noqa: PLW0603
+    if _SHARED_D_COMP_FLAT is None or int(_SHARED_D_COMP_FLAT.nbytes) < min_bytes:
+        _SHARED_D_COMP_FLAT = cuda.device_array(min_bytes, dtype=np.uint8)
+    return _SHARED_D_COMP_FLAT
+
+
+def _get_shared_d_shard_flat(min_bytes: int) -> Any:
+    global _SHARED_D_SHARD_FLAT  # noqa: PLW0603
+    if _SHARED_D_SHARD_FLAT is None or int(_SHARED_D_SHARD_FLAT.nbytes) < min_bytes:
+        _SHARED_D_SHARD_FLAT = cuda.device_array(min_bytes, dtype=np.uint8)
+    return _SHARED_D_SHARD_FLAT
 
 
 def release_shared_encoder_shard_buffer() -> None:
     """Release the large contiguous shard packing buffer while keeping the small (~520 MiB) nvcomp batch
     buffers and ``as_arrays`` caches warm across batches."""
-    _SHARED_D_SHARD_FLAT.clear()
+    global _SHARED_D_SHARD_FLAT  # noqa: PLW0603
+    _SHARED_D_SHARD_FLAT = None
+
+
+def release_shared_encoder_device_buffers() -> None:
+    """Release all shared GPU device buffers used by the shard encoder and flush CUDA deallocations."""
+    global _SHARED_D_SUB_FLAT, _SHARED_D_COMP_FLAT, _SHARED_D_SHARD_FLAT  # noqa: PLW0603
+    _SHARED_D_SUB_FLAT = None
+    _SHARED_D_COMP_FLAT = None
+    _SHARED_D_SHARD_FLAT = None
+    flush_gpu_deallocations()
+
+
+def release_shared_encoder_buffers() -> None:
+    """Release all shared encoder device buffers, pinned host buffers, and any cached shared encoder."""
+    global _SHARED_PINNED_PAIR, _SHARED_ENCODER  # noqa: PLW0603
+    release_shared_encoder_device_buffers()
+    _SHARED_PINNED_PAIR = None
+    if _SHARED_ENCODER is not None:
+        _SHARED_ENCODER.close()
+        _SHARED_ENCODER = None
 
 
 class _GpuShardEncoder:
@@ -373,18 +429,12 @@ class _GpuShardEncoder:
             self.blocks_per_chunk = 1
 
         self.elems_per_block = self.blocksize // spec.typesize
-        self.max_batch_chunks = max(1, min(self.max_chunks, _MAX_ENCODE_BATCH_BYTES // max(1, self.chunk_nbytes)))
+        self.max_batch_chunks = max_batch_chunks_for(self.chunk_nbytes, self.max_chunks)
         self.max_subs = self.max_batch_chunks * self.blocks_per_chunk
 
         self.codec: Any = None
         if spec.codec_kind != "none":
             self.codec = nvcomp.Codec(algorithm=spec.nvcomp_alg, bitstream_kind=nvcomp.BitstreamKind.RAW)
-
-        self.max_shard_payload = self.max_chunks * (self.chunk_nbytes + 64 + 8 * self.blocks_per_chunk)
-        self.index_and_crc_bytes = self.max_chunks * 16 + 4
-        self._min_pinned_bytes = self.max_shard_payload + self.index_and_crc_bytes
-        self.h_pinned = _get_shared_pinned_pair(self._min_pinned_bytes)
-        self._slot_idx = 0
 
         self.d_sub_blocks: Any = None
         self.d_active_coords: Any = None
@@ -398,12 +448,23 @@ class _GpuShardEncoder:
         self._in_views_cache: dict[int, Any] = {}
         self._out_views_cache: dict[int, Any] = {}
         self._comp_cfg_cache: dict[int, Any] = {}
+
+        if self.spec.codec_kind != "none" and self.codec is not None:
+            self._ensure_sub_buffer()
+            self.max_comp_size = int(self.codec.get_max_comp_buffer_size(self._nvcomp.as_array(self._in_slices[0])))
+
+        per_chunk_max = max(self.chunk_nbytes + 64 + 8 * self.blocks_per_chunk, self.max_comp_size)
+        self.max_shard_payload = self.max_chunks * per_chunk_max
+        self.index_and_crc_bytes = self.max_chunks * 16 + 4
+        self._min_pinned_bytes = self.max_shard_payload + self.index_and_crc_bytes
+        self.h_pinned = _get_shared_pinned_pair(self._min_pinned_bytes)
+        self._slot_idx = 0
+
         self.ensure_device_buffers()
 
-    def ensure_device_buffers(self) -> None:
-        self.h_pinned = _get_shared_pinned_pair(self._min_pinned_bytes)
+    def _ensure_sub_buffer(self) -> None:
         sub_bytes = self.max_subs * self.blocksize
-        d_sub_flat = _get_shared_device_flat(_SHARED_D_SUB_FLAT, sub_bytes)
+        d_sub_flat = _get_shared_d_sub_flat(sub_bytes)
         in_ptr = int(d_sub_flat.__cuda_array_interface__["data"][0])
 
         if self.d_sub_blocks is None or in_ptr != self._sub_flat_ptr:
@@ -416,10 +477,14 @@ class _GpuShardEncoder:
             self._in_views_cache.clear()
             self._comp_cfg_cache.clear()
 
+    def ensure_device_buffers(self) -> None:
+        self.h_pinned = _get_shared_pinned_pair(self._min_pinned_bytes)
+        self._ensure_sub_buffer()
+
         if self.spec.codec_kind != "none" and self.codec is not None:
             self.max_comp_size = int(self.codec.get_max_comp_buffer_size(self._nvcomp.as_array(self._in_slices[0])))
             comp_bytes = self.max_subs * self.max_comp_size
-            d_comp_flat = _get_shared_device_flat(_SHARED_D_COMP_FLAT, comp_bytes)
+            d_comp_flat = _get_shared_d_comp_flat(comp_bytes)
             out_ptr = int(d_comp_flat.__cuda_array_interface__["data"][0])
             if self.d_comp_out is None or out_ptr != self._comp_flat_ptr:
                 self._comp_flat_ptr = out_ptr
@@ -430,11 +495,21 @@ class _GpuShardEncoder:
                 ]
                 self._out_views_cache.clear()
 
-        d_shard_flat = _get_shared_device_flat(_SHARED_D_SHARD_FLAT, self.max_shard_payload)
+        d_shard_flat = _get_shared_d_shard_flat(self.max_shard_payload)
         self.d_shard_out = d_shard_flat[: self.max_shard_payload]
 
     def release_device_buffers(self) -> None:
+        self.d_sub_blocks = None
+        self.d_active_coords = None
+        self.d_comp_out = None
         self.d_shard_out = None
+        self._sub_flat_ptr = 0
+        self._comp_flat_ptr = 0
+        self._in_slices.clear()
+        self._out_slices.clear()
+        self._in_views_cache.clear()
+        self._out_views_cache.clear()
+        self._comp_cfg_cache.clear()
 
     def warmup(self) -> None:
         """Pre-allocate pinned/shared buffers and JIT-compile the CUDA gather/pack kernels before capture."""
@@ -446,6 +521,7 @@ class _GpuShardEncoder:
         self.encode_shard_to_host(d_dummy, 0, 0, 0, 0, coords, ic)
         self._slot_idx = 0
         self.release_device_buffers()
+        release_shared_encoder_device_buffers()
 
     def _get_batch_views(self, n_subs: int) -> tuple[Any, Any, Any]:
         if n_subs not in self._in_views_cache:
@@ -476,114 +552,116 @@ class _GpuShardEncoder:
         host_buf = self.h_pinned[self._slot_idx]
         self._slot_idx ^= 1
 
-        if self.spec.codec_kind == "none":
-            for c0 in range(0, n_active, self.max_batch_chunks):
-                nb = min(self.max_batch_chunks, n_active - c0)
-                nb_subs = nb * self.blocks_per_chunk
-                self.d_active_coords[:nb].copy_to_device(active_coords[c0 : c0 + nb])
-                _gather_inner_chunks_kernel[(blocks_x, nb), threads](  # type: ignore[index]
-                    d_slab_u8,
-                    slab_z0,
-                    shard_z0,
-                    shard_y0,
-                    shard_x0,
-                    cz,
-                    cy,
-                    cx,
-                    self.d_active_coords[:nb],
-                    self.elems_per_block,
-                    self.blocks_per_chunk,
-                    self.spec.shuffle_flag,
-                    self.d_sub_blocks[:nb_subs],
-                )
-                b_start = c0 * self.chunk_nbytes
-                b_len = nb * self.chunk_nbytes
-                self.d_sub_blocks[:nb_subs].reshape(b_len).copy_to_host(host_buf[b_start : b_start + b_len])
-            cuda.synchronize()
-            total_payload = n_active * self.chunk_nbytes
-            chunk_lengths = np.full(n_active, self.chunk_nbytes, dtype=np.uint64)
-            offsets = np.arange(n_active, dtype=np.uint64) * np.uint64(self.chunk_nbytes)
-        else:
-            all_offsets = np.zeros(n_active, dtype=np.int64)
-            all_ctbytes = np.zeros(n_active, dtype=np.int64)
-            cur_offset = 0
-
-            for c0 in range(0, n_active, self.max_batch_chunks):
-                nb = min(self.max_batch_chunks, n_active - c0)
-                nb_subs = nb * self.blocks_per_chunk
-                self.d_active_coords[:nb].copy_to_device(active_coords[c0 : c0 + nb])
-                _gather_inner_chunks_kernel[(blocks_x, nb), threads](  # type: ignore[index]
-                    d_slab_u8,
-                    slab_z0,
-                    shard_z0,
-                    shard_y0,
-                    shard_x0,
-                    cz,
-                    cy,
-                    cx,
-                    self.d_active_coords[:nb],
-                    self.elems_per_block,
-                    self.blocks_per_chunk,
-                    self.spec.shuffle_flag,
-                    self.d_sub_blocks[:nb_subs],
-                )
-                in_views, out_views, comp_cfg = self._get_batch_views(nb_subs)
-                res = self.codec.encode(in_views, out=out_views, compression_config=comp_cfg)
-
-                if self.spec.codec_kind == "blosc":
-                    sizes = np.asarray(res.buffer_sizes, dtype=np.int32).reshape(nb, self.blocks_per_chunk)
-                    comp_ctbytes = 16 + 8 * self.blocks_per_chunk + sizes.sum(axis=1, dtype=np.int64)
-                    memcpy_ctbytes = 16 + self.chunk_nbytes
-                    incompressible = (sizes.max(axis=1) >= self.blocksize) | (comp_ctbytes >= memcpy_ctbytes)
-                    ctbytes = np.where(incompressible, memcpy_ctbytes, comp_ctbytes).astype(np.int64)
-                    offsets_i64 = np.full(nb, cur_offset, dtype=np.int64)
-                    if nb > 1:
-                        offsets_i64[1:] += np.cumsum(ctbytes[:-1])
-                    cur_offset = int(offsets_i64[-1] + ctbytes[-1])
-
-                    d_sizes = cuda.to_device(sizes)
-                    d_offsets = cuda.to_device(offsets_i64)
-                    d_ctbytes = cuda.to_device(ctbytes)
-                    d_comp_3d = self.d_comp_out[:nb_subs].reshape(nb, self.blocks_per_chunk, self.max_comp_size)
-                    _pack_blosc_shard_kernel[(self.blocks_per_chunk, nb), 256](  # type: ignore[index]
-                        d_comp_3d,
-                        d_sizes,
-                        self.d_sub_blocks[:nb_subs],
-                        d_offsets,
-                        d_ctbytes,
-                        self.spec.blosc_flag_fmt,
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", NumbaPerformanceWarning)
+            if self.spec.codec_kind == "none":
+                for c0 in range(0, n_active, self.max_batch_chunks):
+                    nb = min(self.max_batch_chunks, n_active - c0)
+                    nb_subs = nb * self.blocks_per_chunk
+                    self.d_active_coords[:nb].copy_to_device(active_coords[c0 : c0 + nb])
+                    _gather_inner_chunks_kernel[(blocks_x, nb), threads](  # type: ignore[index]
+                        d_slab_u8,
+                        slab_z0,
+                        shard_z0,
+                        shard_y0,
+                        shard_x0,
+                        cz,
+                        cy,
+                        cx,
+                        self.d_active_coords[:nb],
+                        self.elems_per_block,
+                        self.blocks_per_chunk,
                         self.spec.shuffle_flag,
-                        self.spec.typesize,
-                        self.chunk_nbytes,
-                        self.blocksize,
-                        self.d_shard_out,
+                        self.d_sub_blocks[:nb_subs],
                     )
-                else:
-                    sizes_1d = np.asarray(res.buffer_sizes, dtype=np.int32)
-                    ctbytes = sizes_1d.astype(np.int64)
-                    offsets_i64 = np.full(nb, cur_offset, dtype=np.int64)
-                    if nb > 1:
-                        offsets_i64[1:] += np.cumsum(ctbytes[:-1])
-                    cur_offset = int(offsets_i64[-1] + ctbytes[-1])
+                    b_start = c0 * self.chunk_nbytes
+                    b_len = nb * self.chunk_nbytes
+                    self.d_sub_blocks[:nb_subs].reshape(b_len).copy_to_host(host_buf[b_start : b_start + b_len])
+                cuda.synchronize()
+                total_payload = n_active * self.chunk_nbytes
+                chunk_lengths = np.full(n_active, self.chunk_nbytes, dtype=np.uint64)
+                offsets = np.arange(n_active, dtype=np.uint64) * np.uint64(self.chunk_nbytes)
+            else:
+                all_offsets = np.zeros(n_active, dtype=np.int64)
+                all_ctbytes = np.zeros(n_active, dtype=np.int64)
+                cur_offset = 0
 
-                    d_sizes = cuda.to_device(sizes_1d)
-                    d_offsets = cuda.to_device(offsets_i64)
-                    pack_blocks_x = min(64, max(1, math.ceil(int(sizes_1d.max()) / 256)))
-                    _pack_raw_shard_kernel[(pack_blocks_x, nb), 256](  # type: ignore[index]
-                        self.d_comp_out[:nb],
-                        d_sizes,
-                        d_offsets,
-                        self.d_shard_out,
+                for c0 in range(0, n_active, self.max_batch_chunks):
+                    nb = min(self.max_batch_chunks, n_active - c0)
+                    nb_subs = nb * self.blocks_per_chunk
+                    self.d_active_coords[:nb].copy_to_device(active_coords[c0 : c0 + nb])
+                    _gather_inner_chunks_kernel[(blocks_x, nb), threads](  # type: ignore[index]
+                        d_slab_u8,
+                        slab_z0,
+                        shard_z0,
+                        shard_y0,
+                        shard_x0,
+                        cz,
+                        cy,
+                        cx,
+                        self.d_active_coords[:nb],
+                        self.elems_per_block,
+                        self.blocks_per_chunk,
+                        self.spec.shuffle_flag,
+                        self.d_sub_blocks[:nb_subs],
                     )
+                    in_views, out_views, comp_cfg = self._get_batch_views(nb_subs)
+                    res = self.codec.encode(in_views, out=out_views, compression_config=comp_cfg)
 
-                all_offsets[c0 : c0 + nb] = offsets_i64
-                all_ctbytes[c0 : c0 + nb] = ctbytes
+                    if self.spec.codec_kind == "blosc":
+                        sizes = np.asarray(res.buffer_sizes, dtype=np.int32).reshape(nb, self.blocks_per_chunk)
+                        comp_ctbytes = 16 + 8 * self.blocks_per_chunk + sizes.sum(axis=1, dtype=np.int64)
+                        memcpy_ctbytes = 16 + self.chunk_nbytes
+                        incompressible = (sizes.max(axis=1) >= self.blocksize) | (comp_ctbytes >= memcpy_ctbytes)
+                        ctbytes = np.where(incompressible, memcpy_ctbytes, comp_ctbytes).astype(np.int64)
+                        offsets_i64 = np.full(nb, cur_offset, dtype=np.int64)
+                        if nb > 1:
+                            offsets_i64[1:] += np.cumsum(ctbytes[:-1])
+                        cur_offset = int(offsets_i64[-1] + ctbytes[-1])
 
-            total_payload = cur_offset
-            self.d_shard_out[:total_payload].copy_to_host(host_buf[:total_payload])
-            cuda.synchronize()
-            chunk_lengths = all_ctbytes.astype(np.uint64)
-            offsets = all_offsets.astype(np.uint64)
+                        d_sizes = cuda.to_device(sizes)
+                        d_offsets = cuda.to_device(offsets_i64)
+                        d_ctbytes = cuda.to_device(ctbytes)
+                        d_comp_3d = self.d_comp_out[:nb_subs].reshape(nb, self.blocks_per_chunk, self.max_comp_size)
+                        _pack_blosc_shard_kernel[(self.blocks_per_chunk, nb), 256](  # type: ignore[index]
+                            d_comp_3d,
+                            d_sizes,
+                            self.d_sub_blocks[:nb_subs],
+                            d_offsets,
+                            d_ctbytes,
+                            self.spec.blosc_flag_fmt,
+                            self.spec.shuffle_flag,
+                            self.spec.typesize,
+                            self.chunk_nbytes,
+                            self.blocksize,
+                            self.d_shard_out,
+                        )
+                    else:
+                        sizes_1d = np.asarray(res.buffer_sizes, dtype=np.int32)
+                        ctbytes = sizes_1d.astype(np.int64)
+                        offsets_i64 = np.full(nb, cur_offset, dtype=np.int64)
+                        if nb > 1:
+                            offsets_i64[1:] += np.cumsum(ctbytes[:-1])
+                        cur_offset = int(offsets_i64[-1] + ctbytes[-1])
+
+                        d_sizes = cuda.to_device(sizes_1d)
+                        d_offsets = cuda.to_device(offsets_i64)
+                        pack_blocks_x = min(64, max(1, math.ceil(int(sizes_1d.max()) / 256)))
+                        _pack_raw_shard_kernel[(pack_blocks_x, nb), 256](  # type: ignore[index]
+                            self.d_comp_out[:nb],
+                            d_sizes,
+                            d_offsets,
+                            self.d_shard_out,
+                        )
+
+                    all_offsets[c0 : c0 + nb] = offsets_i64
+                    all_ctbytes[c0 : c0 + nb] = ctbytes
+
+                total_payload = cur_offset
+                self.d_shard_out[:total_payload].copy_to_host(host_buf[:total_payload])
+                cuda.synchronize()
+                chunk_lengths = all_ctbytes.astype(np.uint64)
+                offsets = all_offsets.astype(np.uint64)
 
         # Append the Zarr v3 shard index ((offset, nbytes) uint64 pairs) + 4-byte CRC32C checksum
         index_table = np.full((self.max_chunks, 2), _EMPTY_ENTRY, dtype="<u8")
@@ -660,8 +738,9 @@ class GPUArrayWriter(ArrayWriter):
         self.close()
         self._target = target
         if isinstance(target, S3Path) or not _has_nvcomp():
-            self._fallback = TSArrayWriter()
-            self._fallback.open(target, store)
+            fallback = TSArrayWriter()
+            fallback.open(target, store)
+            self._fallback = fallback
             return
         try:
             meta_path = target.expanduser().resolve() / "zarr.json"
@@ -672,15 +751,18 @@ class GPUArrayWriter(ArrayWriter):
         except Exception:
             log.warning("GPUArrayWriter falling back to TSArrayWriter for %s", target, exc_info=True)
             self._spec = None
-            self._fallback = TSArrayWriter()
-            self._fallback.open(target, store)
+            fallback = TSArrayWriter()
+            fallback.open(target, store)
+            self._fallback = fallback
 
     def _ensure_fallback(self) -> TSArrayWriter:
         if self._fallback is None:
             if self._target is None:
                 raise RuntimeError("write_slice called before open")
-            self._fallback = TSArrayWriter()
-            self._fallback.open(self._target, None)
+            fallback = TSArrayWriter()
+            fallback.open(self._target, None)
+            self._fallback = fallback
+            return fallback
         return self._fallback
 
     def write_slice(self, c: int, z_offset: int, arr: np.ndarray) -> int:

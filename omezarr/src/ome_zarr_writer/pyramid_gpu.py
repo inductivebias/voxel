@@ -26,9 +26,6 @@ from ome_zarr_writer.dataset import DownscaleType, Dtype, ScaleLevel
 
 log = logging.getLogger(__name__)
 
-# Higher pyramid levels (L5..L7) have small grids (e.g., 2x25x25); silence Numba's low-occupancy notice.
-warnings.filterwarnings("ignore", category=NumbaPerformanceWarning)
-
 _SUPPORTED_REDUCTIONS = frozenset({DownscaleType.MEAN, DownscaleType.MAX, DownscaleType.MIN, DownscaleType.GAUSSIAN})
 _THREADS_3D = (32, 8, 1)
 
@@ -225,9 +222,9 @@ def _cuda_gauss_z_cast(xy_in: Any, out_f32: Any, out_cast: Any) -> None:
     z3 = z_in - 1 if cz + 2 >= z_in else cz + 2
 
     three = np.float32(3.0)
-    val = (
-        xy_in[z0, yo, xo] + three * xy_in[cz, yo, xo] + three * xy_in[z2, yo, xo] + xy_in[z3, yo, xo]
-    ) * np.float32(1.0 / 512.0)
+    val = (xy_in[z0, yo, xo] + three * xy_in[cz, yo, xo] + three * xy_in[z2, yo, xo] + xy_in[z3, yo, xo]) * np.float32(
+        1.0 / 512.0
+    )
     out_f32[zo, yo, xo] = val
     out_cast[zo, yo, xo] = val
 
@@ -246,19 +243,21 @@ def _run_step_gpu(
 ) -> None:
     """Execute one 2x 3D reduction step on the GPU."""
     zo, yo, xo = d_out_f32.shape
-    if reduction == DownscaleType.GAUSSIAN:
-        z_in = d_vol.shape[0]
-        d_xy_view = d_xy_scratch[:z_in, :yo, :xo]
-        _cuda_gauss_xy[_grid_3d(z_in, yo, xo), _THREADS_3D](d_vol, d_xy_view)  # type: ignore[index]
-        _cuda_gauss_z_cast[_grid_3d(zo, yo, xo), _THREADS_3D](d_xy_view, d_out_f32, d_out_cast)  # type: ignore[index]
-    elif reduction == DownscaleType.MEAN:
-        _cuda_kernel_mean_cast[_grid_3d(zo, yo, xo), _THREADS_3D](d_vol, d_out_f32, d_out_cast)  # type: ignore[index]
-    elif reduction == DownscaleType.MAX:
-        _cuda_kernel_max_cast[_grid_3d(zo, yo, xo), _THREADS_3D](d_vol, d_out_f32, d_out_cast)  # type: ignore[index]
-    elif reduction == DownscaleType.MIN:
-        _cuda_kernel_min_cast[_grid_3d(zo, yo, xo), _THREADS_3D](d_vol, d_out_f32, d_out_cast)  # type: ignore[index]
-    else:
-        raise ValueError(f"Unsupported downscale type: {reduction}")
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", NumbaPerformanceWarning)
+        if reduction == DownscaleType.GAUSSIAN:
+            z_in = d_vol.shape[0]
+            d_xy_view = d_xy_scratch[:z_in, :yo, :xo]
+            _cuda_gauss_xy[_grid_3d(z_in, yo, xo), _THREADS_3D](d_vol, d_xy_view)  # type: ignore[index]
+            _cuda_gauss_z_cast[_grid_3d(zo, yo, xo), _THREADS_3D](d_xy_view, d_out_f32, d_out_cast)  # type: ignore[index]
+        elif reduction == DownscaleType.MEAN:
+            _cuda_kernel_mean_cast[_grid_3d(zo, yo, xo), _THREADS_3D](d_vol, d_out_f32, d_out_cast)  # type: ignore[index]
+        elif reduction == DownscaleType.MAX:
+            _cuda_kernel_max_cast[_grid_3d(zo, yo, xo), _THREADS_3D](d_vol, d_out_f32, d_out_cast)  # type: ignore[index]
+        elif reduction == DownscaleType.MIN:
+            _cuda_kernel_min_cast[_grid_3d(zo, yo, xo), _THREADS_3D](d_vol, d_out_f32, d_out_cast)  # type: ignore[index]
+        else:
+            raise ValueError(f"Unsupported downscale type: {reduction}")
 
 
 # ---------------------------------------------------------------------------
