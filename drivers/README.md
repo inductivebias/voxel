@@ -139,6 +139,11 @@ See the [driver module](src/vxl_drivers/power_meters/thorlabs.py) for setup note
 moving or un-homing any stage, and tests whether a `WV` (Voltage Out of Range) warning is a stale
 latched flag or actively re-asserted while idle.
 
+`ZaberLinearAxis` also exposes `get_setting(name)`, `set_setting(name, value)`, and `command(cmd)`
+as `rigup` device commands (in native controller units under the hub lock) so closed-loop servo and
+feedforward parameters (for example `ictrl.pidff.*` and `ictrl.ff.*`) can be read and tuned
+programmatically while `vxl` is running.
+
 ## Install vendor support
 
 Install only the optional dependency needed by the hardware being configured. From the Voxel workspace, for example:

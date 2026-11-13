@@ -258,3 +258,28 @@ uv run vxl-zaber-diagnose --host <controller-host>
      terminal block, tighten its screw terminals, power back up, and re-run `vxl-zaber-diagnose`.
    - **`persistent_out_of_range`**: `WV` re-asserts while idle and `system.voltage` is outside the
      rated `24–48 V DC` supply window.
+
+## Zaber servo / velocity-ripple tuning
+
+`ZaberLinearAxis` exposes `get_setting(name)`, `set_setting(name, value)`, and `command(cmd)` as
+Voxel device commands (in native controller units under the hub lock), allowing live programmatic
+inspection and tuning of closed-loop servo (`ictrl.pidff.*`) and feedforward (`ictrl.ff.*`) gains.
+
+[`scripts/tune_zaber_scan.py`](scripts/tune_zaber_scan.py) uses those commands over the `vxl serve`
+REST API to run a bounded coordinate search that minimizes continuous-scan `dt_ms` velocity ripple:
+
+```bash
+# Analyze an existing scan.json or scan_failure.json
+python3 scripts/tune_zaber_scan.py --analyze /path/to/scan.json
+
+# Snapshot / restore Zaber gains
+python3 scripts/tune_zaber_scan.py --station-id <STATION_UUID> --snapshot zaber_backup.json
+python3 scripts/tune_zaber_scan.py --station-id <STATION_UUID> --restore zaber_backup.json
+
+# Run bounded tuning against a short test scan task (add --apply-best to keep tuned gains)
+python3 scripts/tune_zaber_scan.py \
+  --station-id <STATION_UUID> \
+  --task-id <TASK_ID> \
+  --data-root /data/users/cfxuser \
+  --apply-best
+```
