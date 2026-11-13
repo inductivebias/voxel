@@ -9,6 +9,7 @@
     type AcquisitionStatus,
     type AcquisitionTask,
     type Compression,
+    type CompressionShuffle,
     createAreaTask,
     createLineTask,
     createPositionTask,
@@ -46,6 +47,9 @@
   const TASK_ROUTE = '/stations/[stationId]/instruments/[instrumentId]/(open)/run/[taskId]';
   const LOCAL_STORE = '__local__';
   const COMPRESSIONS: Compression[] = ['blosc.lz4', 'blosc.zstd', 'zstd', 'lz4', 'gzip', 'none'];
+  const COMPRESSION_LEVELS = ['default', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'] as const;
+  const SHUFFLE_MODES: readonly ('default' | CompressionShuffle)[] = ['default', 'bitshuffle', 'shuffle', 'noshuffle'];
+  const KEEP_BITS_OPTIONS = ['all', ...Array.from({ length: 16 }, (_, i) => String(16 - i))] as const;
   const DOWNSCALE_TYPES: DownscaleType[] = ['gaussian', 'mean', 'min', 'max'];
   const PYRAMID_LEVELS: ScaleLevel[] = [0, 1, 2, 3, 4, 5, 6, 7];
   const TASK_TYPES: Record<XYDefinition['mode'], string> = {
@@ -637,6 +641,49 @@
                 decimals={2}
                 suffix="GB"
                 size="sm"
+              />
+            </Field>
+            <Field label="Compression level">
+              <Select
+                value={output.compression_level == null ? 'default' : String(output.compression_level)}
+                options={[...COMPRESSION_LEVELS]}
+                formatLabel={(v) => (v === 'default' ? 'Default (3)' : v)}
+                onChange={(v) =>
+                  reportFailure(instrument.updateOutput({ compression_level: v === 'default' ? null : Number(v) }))}
+              />
+            </Field>
+            <Field label="Shuffle">
+              <Select
+                value={output.compression_shuffle ?? 'default'}
+                options={[...SHUFFLE_MODES]}
+                formatLabel={(v) => (v === 'default' ? 'Default (bitshuffle)' : v)}
+                onChange={(v) =>
+                  reportFailure(instrument.updateOutput({ compression_shuffle: v === 'default' ? null : v }))}
+              />
+            </Field>
+            <Field label="Keep bits">
+              <Select
+                value={output.keep_bits == null ? 'all' : String(output.keep_bits)}
+                options={[...KEEP_BITS_OPTIONS]}
+                formatLabel={(v) => (v === 'all' ? 'All (lossless)' : `${v} bits`)}
+                onChange={(v) => reportFailure(instrument.updateOutput({ keep_bits: v === 'all' ? null : Number(v) }))}
+              />
+            </Field>
+            <Field label="Dark floor">
+              <SpinBox
+                value={output.dark_floor}
+                onChange={(value) => instrument.updateOutput({ dark_floor: value })}
+                onEditStart={() => instrument.edits.hold()}
+                min={0}
+                step={1}
+                bigStep={10}
+                size="sm"
+              />
+            </Field>
+            <Field label="Skip empty chunks">
+              <Checkbox
+                value={output.skip_empty_chunks}
+                onChange={(skip_empty_chunks) => reportFailure(instrument.updateOutput({ skip_empty_chunks }))}
               />
             </Field>
           </fieldset>
