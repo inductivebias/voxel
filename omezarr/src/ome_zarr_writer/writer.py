@@ -34,7 +34,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Self, cast
+from typing import Any, Literal, Self, cast
 
 import numpy as np
 from cloudpathlib import S3Path
@@ -85,6 +85,27 @@ class WriterSettings(BaseModel):
     batch_z_shards: int = 1
     # coherence (uniform for a consistent dataset; camera conforms)
     compression: Compression = Field(default=Compression.BLOSC_LZ4, description="Compression codec for zarr chunks")
+    compression_level: int | None = Field(
+        default=None, ge=0, le=9, description="Codec compression level (defaults to 3)"
+    )
+    compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = Field(
+        default=None, description="Blosc shuffle mode (defaults to 'bitshuffle')"
+    )
+    keep_bits: int | None = Field(
+        default=None,
+        ge=1,
+        le=16,
+        description="Keep only the top N significant bits (round away lower noise bits before compression)",
+    )
+    dark_floor: int = Field(
+        default=0,
+        ge=0,
+        description="Clamp pixel values <= dark_floor to 0 before compression (0 disables)",
+    )
+    skip_empty_chunks: bool = Field(
+        default=False,
+        description="Omit all-fill_value chunks from Zarr v3 shard index and skip empty shards",
+    )
     downscale_type: DownscaleType = Field(
         default=DownscaleType.GAUSSIAN,
         description="Pyramid downsample method. Gaussian (anti-aliased) is the default for display-quality",
@@ -171,6 +192,8 @@ class WriterConfig(WriterSettings):
                 chunk_shape=[1, sc.z, sc.y, sc.x],
                 dtype=self.dtype,
                 compression=self.compression,
+                compression_level=self.compression_level,
+                compression_shuffle=self.compression_shuffle,
                 dimension_names=["c", "z", "y", "x"],
             )
 
@@ -412,6 +435,9 @@ class DatasetWriter:
                 volume_z=self._volume_z,
                 reduction=config.downscale_type,
                 use_gpu=config.use_gpu or (backend == ArrayWriter.Backend.GPU),
+                keep_bits=config.keep_bits,
+                dark_floor=config.dark_floor,
+                skip_empty_chunks=config.skip_empty_chunks,
             )
         )
 

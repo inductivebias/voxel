@@ -60,6 +60,7 @@ from .pyramid_gpu import (
     GpuPyramidWorkspace,
     flush_gpu_deallocations,
     is_gpu_available,
+    preprocess_volume,
     register_pinned_host_memory,
     unregister_pinned_host_memory,
     warmup_gpu_pyramid,
@@ -174,6 +175,9 @@ class OutputSetup(BaseModel):
     volume_z: int  # total L0 depth → clamps the final partial batch
     reduction: DownscaleType = DownscaleType.MEAN  # pyramid downsample method (mirrors config.downscale_type)
     use_gpu: bool = False  # dispatch flush to _worker_process_and_write_gpu when True
+    keep_bits: int | None = None  # optional LSB bit-rounding before downsampling/compression
+    dark_floor: int = 0  # optional dark-floor clamp (<= dark_floor -> 0) before compression
+    skip_empty_chunks: bool = False  # omit all-fill_value chunks from Zarr v3 shard index
 
 
 @dataclass(frozen=True)
@@ -232,6 +236,8 @@ def _worker_bind_output(setup: OutputSetup) -> None:
     for level in setup.levels:
         writer = setup.backend()
         writer.open(setup.author_root / str(level.value), setup.store)
+        if isinstance(writer, GPUArrayWriter):
+            writer.skip_empty_chunks = setup.skip_empty_chunks
         _WORKER_WRITERS[level] = writer
     _WORKER_STATE["setup"] = setup
 
@@ -293,9 +299,13 @@ def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: i
 
     process_started = datetime.now(UTC)
     block = _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0]
+    if setup.dark_floor > 0 or setup.keep_bits is not None:
+        block = preprocess_volume(block, keep_bits=setup.keep_bits, dark_floor=setup.dark_floor)
     pyramid = pyramids_3d_numba(block, max_level, reduction=setup.reduction, parallel=True)
     _warn_if_slow_threading_layer()
     for level, vol in pyramid.items():
+        if level == ScaleLevel.L0:
+            continue
         arr = _WORKER_ARRAYS[level]
         z = min(arr.shape[0], vol.shape[0])
         y = min(arr.shape[1], vol.shape[1])
@@ -308,7 +318,8 @@ def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: i
     flushed = 0
     for level in setup.levels:
         z0, z1 = z_start // level.factor, z_end // level.factor
-        flushed += _WORKER_WRITERS[level].write_slice(setup.channel, z0, _WORKER_ARRAYS[level][: z1 - z0])
+        src = block[: z1 - z0] if level == ScaleLevel.L0 else _WORKER_ARRAYS[level][: z1 - z0]
+        flushed += _WORKER_WRITERS[level].write_slice(setup.channel, z0, src)
 
     return BatchResult(
         process_started=process_started,
@@ -366,6 +377,8 @@ def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_id
                 reduction=setup.reduction,
                 copy_levels_to=None if all_gpu_writers else _WORKER_ARRAYS,
                 return_host_f32=False,
+                keep_bits=setup.keep_bits,
+                dark_floor=setup.dark_floor,
             )
             process_ended = datetime.now(UTC)
             flush_started = process_ended

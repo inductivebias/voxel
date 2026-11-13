@@ -23,7 +23,7 @@ from ome_zarr_writer import (
     pyramids_3d_gpu,
 )
 from ome_zarr_writer.array import ArrayWriter, GPUArrayWriter
-from ome_zarr_writer.array.gpu import _parse_array_meta, max_batch_chunks_for
+from ome_zarr_writer.array.gpu import _has_nvcomp, _parse_array_meta, max_batch_chunks_for
 from ome_zarr_writer.array.ts import TSArrayReader
 from ome_zarr_writer.dataset import (
     BloscCodec,
@@ -33,7 +33,7 @@ from ome_zarr_writer.dataset import (
     Zarr3ArrayMeta,
 )
 from ome_zarr_writer.pyramid import pyramids_3d_numba
-from ome_zarr_writer.pyramid_gpu import clear_gpu_workspace_cache
+from ome_zarr_writer.pyramid_gpu import clear_gpu_workspace_cache, preprocess_volume
 from ome_zarr_writer.sizing import (
     gpu_workspace_bytes,
     per_slot_bytes,
@@ -553,6 +553,114 @@ def test_batchslot_flush_cpu_and_flush_gpu_toggle(tmp_path: Path) -> None:
         assert res_gpu.flushed_bytes > 0
     finally:
         slot.close()
+
+    read_l0 = TSArrayReader(root / "0").read_3d(z0=0, n=z)
+    np.testing.assert_array_equal(read_l0, vol)
+
+
+def test_preprocess_volume_bitround_and_dark_floor() -> None:
+    arr = np.array([[[0, 50, 100, 101, 1024, 65535]]], dtype=np.uint16)
+    # No-op returns exact same array object
+    assert preprocess_volume(arr) is arr
+
+    # Dark floor <= 100 -> 0, keep_bits=12 -> shift=4, mask=0xFFF0, half=8
+    out = preprocess_volume(arr, keep_bits=12, dark_floor=100)
+    assert out.dtype == np.uint16
+    assert out[0, 0, 0] == 0
+    assert out[0, 0, 1] == 0
+    assert out[0, 0, 2] == 0
+    assert out[0, 0, 3] == 96  # (101 + 8) & 0xFFF0 (nearest multiple of 16)
+    assert out[0, 0, 4] == 1024
+    assert out[0, 0, 5] == 65520  # saturated instead of wrapping to 0
+
+
+def test_writer_config_custom_compression_level_and_shuffle() -> None:
+    cfg = WriterConfig(
+        volume_shape=UIVec3D(z=64, y=64, x=64),
+        voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
+        max_level=ScaleLevel.L1,
+        dtype=Dtype.UINT16,
+        compression=Compression.BLOSC_ZSTD,
+        compression_level=1,
+        compression_shuffle="shuffle",
+    )
+    meta = cfg.dataset.arrays[ScaleLevel.L0]
+    sharding = meta.codecs[0]
+    assert isinstance(sharding, ShardingIndexedCodec)
+    blosc = sharding.configuration.codecs[1]
+    assert isinstance(blosc, BloscCodec)
+    assert blosc.configuration.cname == "zstd"
+    assert blosc.configuration.clevel == 1
+    assert blosc.configuration.shuffle == "shuffle"
+
+    spec = _parse_array_meta(meta)
+    assert spec.codec_kind == "blosc"
+    assert spec.nvcomp_alg == "zstd"
+    assert spec.shuffle_flag == 1  # byte-shuffle
+
+
+def test_omezarr_writer_preprocess_and_skip_empty_chunks_cpu(tmp_path: Path) -> None:
+    cfg = WriterConfig(
+        volume_shape=UIVec3D(z=64, y=64, x=64),
+        voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
+        max_level=ScaleLevel.L1,
+        dtype=Dtype.UINT16,
+        compression=Compression.BLOSC_LZ4,
+        compression_level=1,
+        compression_shuffle="shuffle",
+        keep_bits=12,
+        dark_floor=50,
+        skip_empty_chunks=True,
+        use_gpu=False,
+    )
+    vol = np.zeros((64, 64, 64), dtype=np.uint16)
+    vol[:, :32, :32] = 40  # below dark_floor -> clamped to 0
+    vol[0, 40, 40] = 1000  # above dark_floor -> retained
+
+    out_dir = tmp_path / "combined_cpu.ome.zarr"
+    writer = OMEZarrWriter(slots=2)
+    try:
+        writer.begin_stack(cfg, Local(target=out_dir))
+        for z_idx in range(64):
+            with writer.new_frame() as frame:
+                frame[...] = vol[z_idx]
+        writer.end_stack()
+    finally:
+        writer.close()
+
+    read_l0 = TSArrayReader(out_dir / "0").read_3d(z0=0, n=64)
+    assert int(read_l0[:, :32, :32].max()) == 0
+    assert int(read_l0[0, 40, 40]) == 1008  # (1000 + 8) & 0xFFF0
+
+
+@_requires_gpu
+def test_gpu_array_writer_skip_empty_chunks(tmp_path: Path) -> None:
+    if not _has_nvcomp():
+        pytest.skip("nvidia-nvcomp not available")
+
+    z, y, x = 64, 128, 128
+    cfg = WriterConfig(
+        volume_shape=UIVec3D(z=z, y=y, x=x),
+        voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
+        max_level=ScaleLevel.L1,
+        dtype=Dtype.UINT16,
+        compression=Compression.BLOSC_LZ4,
+        target_shard_gb=0.0001,
+        skip_empty_chunks=True,
+    )
+    root = tmp_path / "gpu_sparse.ome.zarr"
+    cfg.dataset.write_metadata(root)
+
+    vol = np.zeros((z, y, x), dtype=np.uint16)
+    vol[0:16, 0:16, 0:16] = 1234  # only first chunk non-empty
+
+    w = GPUArrayWriter()
+    w.skip_empty_chunks = True
+    w.open(root / "0")
+    try:
+        w.write_slice(0, 0, vol)
+    finally:
+        w.close()
 
     read_l0 = TSArrayReader(root / "0").read_3d(z0=0, n=z)
     np.testing.assert_array_equal(read_l0, vol)

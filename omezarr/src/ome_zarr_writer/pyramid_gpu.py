@@ -95,9 +95,62 @@ def unregister_pinned_host_memory(arr: np.ndarray) -> None:
         log.debug("cudaHostUnregister failed", exc_info=True)
 
 
+def preprocess_volume(
+    arr: np.ndarray,
+    *,
+    keep_bits: int | None = None,
+    dark_floor: int = 0,
+) -> np.ndarray:
+    """Apply dark-floor clamping and/or bit-rounding to an unsigned integer volume on the host."""
+    if dark_floor <= 0 and keep_bits is None:
+        return arr
+    if arr.dtype.kind != "u" or arr.dtype.itemsize not in (1, 2):
+        return arr
+
+    bits = arr.dtype.itemsize * 8
+    max_val = (1 << bits) - 1
+    shift = min(bits, max(0, bits - keep_bits)) if keep_bits is not None else 0
+    if dark_floor <= 0 and shift == 0:
+        return arr
+
+    if shift > 0:
+        half = 1 << (shift - 1)
+        mask = max_val ^ ((1 << shift) - 1)
+        rounded = np.minimum(max_val, arr.astype(np.uint32) + half) & mask
+        if dark_floor > 0:
+            rounded = np.where(arr <= dark_floor, np.uint32(0), rounded)
+        return rounded.astype(arr.dtype)
+
+    return np.where(arr <= dark_floor, arr.dtype.type(0), arr)
+
+
 # ---------------------------------------------------------------------------
-# CUDA Kernels (MEAN, MAX, MIN, and 2-pass separable [1, 3, 3, 1] GAUSSIAN)
+# CUDA Kernels (Preprocess, MEAN, MAX, MIN, and 2-pass separable [1, 3, 3, 1] GAUSSIAN)
 # ---------------------------------------------------------------------------
+
+
+@cuda.jit
+def _cuda_preprocess_uint_kernel(
+    arr: Any,
+    dark_floor: int,
+    shift: int,
+    half: int,
+    mask: int,
+    max_val: int,
+) -> None:
+    x, y, z = cuda.grid(3)  # type: ignore[misc]
+    z_dim, y_dim, x_dim = arr.shape
+    if z >= z_dim or y >= y_dim or x >= x_dim:
+        return
+    val = np.int32(arr[z, y, x])
+    if dark_floor > 0 and val <= dark_floor:
+        arr[z, y, x] = 0
+        return
+    if shift > 0:
+        rounded = val + half
+        if rounded > max_val:  # noqa: PLR1730 - Python min() unsupported in Numba @cuda.jit
+            rounded = max_val
+        arr[z, y, x] = rounded & mask
 
 
 @cuda.jit(fastmath=True)
@@ -315,6 +368,8 @@ class GpuPyramidWorkspace:
         *,
         copy_levels_to: dict[ScaleLevel, np.ndarray] | None = None,
         return_host_f32: bool = False,
+        keep_bits: int | None = None,
+        dark_floor: int = 0,
     ) -> dict[ScaleLevel, Any]:
         """Transfer ``block`` (L0) to GPU, compute all pyramid levels up to ``max_level``, and optionally
         copy reduced levels back to host arrays.
@@ -328,6 +383,8 @@ class GpuPyramidWorkspace:
             return_host_f32: If True, returns host ``float32`` arrays for ``L1..max_level`` (matching
                 :func:`pyramids_3d_numba`). If False, returns device arrays at ``self.dtype`` for
                 ``L0..max_level`` (for zero-copy consumption by :class:`GPUArrayWriter`).
+            keep_bits: Optional number of most-significant bits to retain on unsigned 8/16-bit L0.
+            dark_floor: Clamp unsigned 8/16-bit L0 values ``<= dark_floor`` to ``0`` before reduction.
         """
         if reduction not in _SUPPORTED_REDUCTIONS:
             raise ValueError(f"Unsupported downscale type: {reduction}")
@@ -336,6 +393,24 @@ class GpuPyramidWorkspace:
         z0, y0, x0 = block.shape
         d_l0 = self.d_levels[ScaleLevel.L0][:z0, :y0, :x0]
         d_l0.copy_to_device(np.ascontiguousarray(block))
+
+        if (dark_floor > 0 or keep_bits is not None) and self.dtype.kind == "u" and self.dtype.itemsize in (1, 2):
+            bits = self.dtype.itemsize * 8
+            max_val = (1 << bits) - 1
+            shift = min(bits, max(0, bits - keep_bits)) if keep_bits is not None else 0
+            if dark_floor > 0 or shift > 0:
+                half = (1 << (shift - 1)) if shift > 0 else 0
+                mask = max_val ^ ((1 << shift) - 1) if shift > 0 else max_val
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", NumbaPerformanceWarning)
+                    _cuda_preprocess_uint_kernel[_grid_3d(z0, y0, x0), _THREADS_3D](  # type: ignore[index]
+                        d_l0,
+                        dark_floor,
+                        shift,
+                        half,
+                        mask,
+                        max_val,
+                    )
 
         levels = [lvl for lvl in max_level.levels if lvl != ScaleLevel.L0]
         sorted_levels = sorted(levels, key=lambda lvl: lvl.factor)
@@ -449,6 +524,9 @@ def pyramids_3d_gpu(
     block: np.ndarray,
     max_level: ScaleLevel,
     reduction: DownscaleType = DownscaleType.MEAN,
+    *,
+    keep_bits: int | None = None,
+    dark_floor: int = 0,
 ) -> dict[ScaleLevel, np.ndarray]:
     """Compute a 3D multi-scale pyramid on the GPU via chained 2x2x2 reductions.
 
@@ -467,4 +545,11 @@ def pyramids_3d_gpu(
             clear_gpu_workspace_cache()
         ws = GpuPyramidWorkspace(UIVec3D(z=z, y=y, x=x), max_level, block.dtype)
         _WORKSPACE_CACHE[key] = ws
-    return ws.compute_from_host(block, max_level, reduction=reduction, return_host_f32=True)
+    return ws.compute_from_host(
+        block,
+        max_level,
+        reduction=reduction,
+        return_host_f32=True,
+        keep_bits=keep_bits,
+        dark_floor=dark_floor,
+    )

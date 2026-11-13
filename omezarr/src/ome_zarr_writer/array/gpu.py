@@ -73,6 +73,52 @@ def _has_nvcomp() -> bool:
 
 
 @cuda.jit
+def _find_nonempty_chunks_kernel(
+    d_slab_u8: Any,  # (slab_z, vy, vx, typesize) uint8
+    slab_z0: int,
+    shard_z0: int,
+    shard_y0: int,
+    shard_x0: int,
+    cz: int,
+    cy: int,
+    cx: int,
+    active_coords: Any,  # (nb, 3) int32
+    out_nonempty: Any,  # (nb,) uint8
+) -> None:
+    """Set ``out_nonempty[c] = 1`` for any active inner chunk containing at least one non-zero byte."""
+    c = cuda.blockIdx.x  # type: ignore[attr-defined]
+    if c >= active_coords.shape[0]:
+        return
+
+    iz = active_coords[c, 0]
+    iy = active_coords[c, 1]
+    ix = active_coords[c, 2]
+
+    slab_z, vy, vx, typesize = d_slab_u8.shape
+    cx_t = cx * typesize
+    cy_cx_t = cy * cx_t
+    chunk_nbytes = cz * cy_cx_t
+
+    tid = cuda.threadIdx.x  # type: ignore[attr-defined]
+    stride = cuda.blockDim.x  # type: ignore[attr-defined]
+    for idx in range(tid, chunk_nbytes, stride):
+        dz = idx // cy_cx_t
+        rem = idx - dz * cy_cx_t
+        dy = rem // cx_t
+        rem2 = rem - dy * cx_t
+        dx = rem2 // typesize
+        k = rem2 - dx * typesize
+
+        gz = shard_z0 + iz * cz + dz - slab_z0
+        gy = shard_y0 + iy * cy + dy
+        gx = shard_x0 + ix * cx + dx
+
+        if (0 <= gz < slab_z) and (0 <= gy < vy) and (0 <= gx < vx) and d_slab_u8[gz, gy, gx, k] != 0:
+            out_nonempty[c] = np.uint8(1)
+            return
+
+
+@cuda.jit
 def _gather_inner_chunks_kernel(
     d_slab_u8: Any,  # (slab_z, vy, vx, typesize) uint8
     slab_z0: int,
@@ -531,7 +577,7 @@ class _GpuShardEncoder:
             self._comp_cfg_cache[n_subs] = self.codec.compression_config([self.blocksize] * n_subs)
         return self._in_views_cache[n_subs], self._out_views_cache[n_subs], self._comp_cfg_cache[n_subs]
 
-    def encode_shard_to_host(
+    def _filter_nonempty_chunks(
         self,
         d_slab_u8: Any,
         slab_z0: int,
@@ -540,11 +586,59 @@ class _GpuShardEncoder:
         shard_x0: int,
         active_coords: np.ndarray,
         active_ic: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        n_active = int(active_coords.shape[0])
+        if n_active == 0:
+            return active_coords, active_ic
+        cz, cy, cx = self.spec.chunk_shape
+        nonempty = np.zeros(n_active, dtype=np.uint8)
+        d_nonempty = cuda.device_array(min(n_active, self.max_batch_chunks), dtype=np.uint8)
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", NumbaPerformanceWarning)
+            for c0 in range(0, n_active, self.max_batch_chunks):
+                nb = min(self.max_batch_chunks, n_active - c0)
+                self.d_active_coords[:nb].copy_to_device(active_coords[c0 : c0 + nb])
+                d_nonempty[:nb].copy_to_device(nonempty[c0 : c0 + nb])
+                _find_nonempty_chunks_kernel[nb, 256](  # type: ignore[index]
+                    d_slab_u8,
+                    slab_z0,
+                    shard_z0,
+                    shard_y0,
+                    shard_x0,
+                    cz,
+                    cy,
+                    cx,
+                    self.d_active_coords[:nb],
+                    d_nonempty[:nb],
+                )
+                d_nonempty[:nb].copy_to_host(nonempty[c0 : c0 + nb])
+        cuda.synchronize()
+        keep_mask = nonempty != 0
+        return active_coords[keep_mask], active_ic[keep_mask]
+
+    def encode_shard_to_host(  # noqa: PLR0915
+        self,
+        d_slab_u8: Any,
+        slab_z0: int,
+        shard_z0: int,
+        shard_y0: int,
+        shard_x0: int,
+        active_coords: np.ndarray,
+        active_ic: np.ndarray,
+        *,
+        skip_empty_chunks: bool = False,
     ) -> memoryview:
         """Encode one shard on GPU in <=256 MiB mini-batches, transfer to the next pinned host buffer,
         append index + CRC32C, and return a memoryview of the complete Zarr v3 shard file bytes."""
         self.ensure_device_buffers()
+        if skip_empty_chunks:
+            active_coords, active_ic = self._filter_nonempty_chunks(
+                d_slab_u8, slab_z0, shard_z0, shard_y0, shard_x0, active_coords, active_ic
+            )
         n_active = int(active_coords.shape[0])
+        if n_active == 0:
+            return memoryview(b"")
+
         cz, cy, cx = self.spec.chunk_shape
         threads = 256
         blocks_x = math.ceil(self.chunk_elems / threads)
@@ -733,6 +827,7 @@ class GPUArrayWriter(ArrayWriter):
         self._encoder: _GpuShardEncoder | None = None
         self._fallback: TSArrayWriter | None = None
         self._io_pool: ThreadPoolExecutor | None = None
+        self.skip_empty_chunks: bool = False
 
     def open(self, target: Path | S3Path, store: S3Store | None = None) -> None:
         self.close()
@@ -837,7 +932,10 @@ class GPUArrayWriter(ArrayWriter):
                             shard_x0,
                             active_coords,
                             active_ic,
+                            skip_empty_chunks=self.skip_empty_chunks,
                         )
+                        if len(shard_view) == 0:
+                            continue
                         shard_path = self._target / "c" / str(c) / str(sz_idx) / str(sy_idx) / str(sx_idx)
                         if pending_write is not None:
                             pending_write.result()

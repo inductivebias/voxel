@@ -187,6 +187,8 @@ class Zarr3ArrayMeta(SparseModel):
         chunk_shape: list[int],
         dtype: Dtype,
         compression: Compression,
+        compression_level: int | None = None,
+        compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = None,
         dimension_names: list[str | None] | None = None,
     ) -> "Zarr3ArrayMeta":
         """A sharded array meta — outer (shard) chunk grid wrapping an inner
@@ -204,7 +206,12 @@ class Zarr3ArrayMeta(SparseModel):
                 ShardingIndexedCodec(
                     configuration=_ShardingConfig(
                         chunk_shape=chunk_shape,
-                        codecs=inner_codecs_for(compression, dtype.itemsize),
+                        codecs=inner_codecs_for(
+                            compression,
+                            dtype.itemsize,
+                            level=compression_level,
+                            shuffle=compression_shuffle,
+                        ),
                     )
                 )
             ],
@@ -212,23 +219,45 @@ class Zarr3ArrayMeta(SparseModel):
         )
 
 
-def inner_codecs_for(compression: Compression, typesize: int) -> list[InnerCodec]:
+def inner_codecs_for(
+    compression: Compression,
+    typesize: int,
+    *,
+    level: int | None = None,
+    shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = None,
+) -> list[InnerCodec]:
     """Inner codec chain (applied to each inner chunk inside a shard) for one of
     our supported `Compression` presets. Encodes our level/shuffle policy."""
+    clevel = 3 if level is None else level
+    blosc_shuffle = "bitshuffle" if shuffle is None else shuffle
     codecs: list[InnerCodec] = [BytesCodec()]
     if compression == Compression.NONE:
         return codecs
     if compression == Compression.GZIP:
-        codecs.append(GzipCodec(configuration=_GzipConfig(level=3)))
+        codecs.append(GzipCodec(configuration=_GzipConfig(level=clevel)))
     elif compression == Compression.ZSTD:
-        codecs.append(ZstdCodec(configuration=_ZstdConfig(level=3)))
+        codecs.append(ZstdCodec(configuration=_ZstdConfig(level=clevel)))
     elif compression in (Compression.LZ4, Compression.BLOSC_LZ4):
         codecs.append(
-            BloscCodec(configuration=_BloscConfig(cname="lz4", clevel=3, shuffle="bitshuffle", typesize=typesize))
+            BloscCodec(
+                configuration=_BloscConfig(
+                    cname="lz4",
+                    clevel=clevel,
+                    shuffle=blosc_shuffle,
+                    typesize=typesize,
+                )
+            )
         )
     elif compression == Compression.BLOSC_ZSTD:
         codecs.append(
-            BloscCodec(configuration=_BloscConfig(cname="zstd", clevel=3, shuffle="bitshuffle", typesize=typesize))
+            BloscCodec(
+                configuration=_BloscConfig(
+                    cname="zstd",
+                    clevel=clevel,
+                    shuffle=blosc_shuffle,
+                    typesize=typesize,
+                )
+            )
         )
     else:
         raise ValueError(f"Unsupported compression: {compression}")
