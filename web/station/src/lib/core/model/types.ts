@@ -295,6 +295,7 @@ export type TileOrder =
 
 export type ScaleLevel = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
 export type Compression = 'none' | 'gzip' | 'zstd' | 'lz4' | 'blosc.lz4' | 'blosc.zstd';
+export type CompressionShuffle = 'noshuffle' | 'shuffle' | 'bitshuffle';
 export type DownscaleType = 'gaussian' | 'mean' | 'min' | 'max';
 
 /** OME-Zarr writer settings. */
@@ -303,6 +304,11 @@ export interface WriterSettings {
   shard_z_chunks: number;
   batch_z_shards: number;
   compression: Compression;
+  compression_level: number | null;
+  compression_shuffle: CompressionShuffle | null;
+  keep_bits: number | null;
+  dark_floor: number;
+  skip_empty_chunks: boolean;
   downscale_type: DownscaleType;
   target_shard_gb: number;
 }
@@ -365,6 +371,11 @@ export interface WriterPatch {
   shard_z_chunks?: number | null;
   batch_z_shards?: number | null;
   compression?: Compression | null;
+  compression_level?: number | null;
+  compression_shuffle?: CompressionShuffle | null;
+  keep_bits?: number | null;
+  dark_floor?: number | null;
+  skip_empty_chunks?: boolean | null;
   downscale_type?: DownscaleType | null;
   target_shard_gb?: number | null;
 }
@@ -671,6 +682,8 @@ export interface ActiveAcquisition {
   volume_index: number;
   phase: AcquisitionPhase;
   frames_captured: number;
+  raw_gb_s?: number | null;
+  compressed_gb_s?: number | null;
 }
 
 /** A command parameter's introspected signature. */

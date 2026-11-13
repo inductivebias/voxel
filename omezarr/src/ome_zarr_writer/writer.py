@@ -24,6 +24,7 @@ The module provides two objects:
 import json
 import logging
 import math
+import os
 import threading
 import time
 from collections.abc import Callable, Generator, Iterator
@@ -33,7 +34,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Self, cast
+from typing import Any, Literal, Self, cast
 
 import numpy as np
 from cloudpathlib import S3Path
@@ -51,7 +52,8 @@ from ome_zarr_writer.dataset import (
     Zarr3ArrayMeta,
     Zarr3GroupMeta,
 )
-from ome_zarr_writer.sizing import MIN_SLOTS, RingSizingError
+from ome_zarr_writer.pyramid_gpu import is_gpu_available
+from ome_zarr_writer.sizing import MIN_SLOTS, RingSizingError, per_slot_bytes
 from ome_zarr_writer.slot import BatchResult, BatchSlot, OutputSetup, SlotStage
 from ome_zarr_writer.storage import Local, S3Store, StagedS3, StagingConfig, Storage
 from ome_zarr_writer.transfer import TransferJob, run_s5cmd
@@ -83,12 +85,37 @@ class WriterSettings(BaseModel):
     batch_z_shards: int = 1
     # coherence (uniform for a consistent dataset; camera conforms)
     compression: Compression = Field(default=Compression.BLOSC_LZ4, description="Compression codec for zarr chunks")
+    compression_level: int | None = Field(
+        default=None, ge=0, le=9, description="Codec compression level (defaults to 3)"
+    )
+    compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = Field(
+        default=None, description="Blosc shuffle mode (defaults to 'bitshuffle')"
+    )
+    keep_bits: int | None = Field(
+        default=None,
+        ge=1,
+        le=16,
+        description="Keep only the top N significant bits (round away lower noise bits before compression)",
+    )
+    dark_floor: int = Field(
+        default=0,
+        ge=0,
+        description="Clamp pixel values <= dark_floor to 0 before compression (0 disables)",
+    )
+    skip_empty_chunks: bool = Field(
+        default=False,
+        description="Omit all-fill_value chunks from Zarr v3 shard index and skip empty shards",
+    )
     downscale_type: DownscaleType = Field(
         default=DownscaleType.GAUSSIAN,
         description="Pyramid downsample method. Gaussian (anti-aliased) is the default for display-quality",
     )
     target_shard_gb: float = 1.0
     io_timeout_s: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    use_gpu: bool = Field(
+        default_factory=lambda: os.environ.get("VOXEL_WRITER_GPU", "0").lower() in ("1", "true", "yes"),
+        description="Use GPU-accelerated pyramid generation and shard compression when available",
+    )
 
     @property
     def chunk_shape(self) -> UIVec3D:
@@ -165,6 +192,8 @@ class WriterConfig(WriterSettings):
                 chunk_shape=[1, sc.z, sc.y, sc.x],
                 dtype=self.dtype,
                 compression=self.compression,
+                compression_level=self.compression_level,
+                compression_shuffle=self.compression_shuffle,
                 dimension_names=["c", "z", "y", "x"],
             )
 
@@ -236,6 +265,7 @@ class BatchMetrics(BaseModel):
     expected_frames: int
     collected_frames: int = 0
     flushed_bytes: int = 0
+    written_bytes: int | None = None
     transfered_bytes: int = 0
     collecting: Timing = Field(default_factory=Timing)
     processing: Timing = Field(default_factory=Timing)
@@ -405,6 +435,10 @@ class DatasetWriter:
                 batch_z=self._batch_z,
                 volume_z=self._volume_z,
                 reduction=config.downscale_type,
+                use_gpu=config.use_gpu or (backend == ArrayWriter.Backend.GPU),
+                keep_bits=config.keep_bits,
+                dark_floor=config.dark_floor,
+                skip_empty_chunks=config.skip_empty_chunks,
             )
         )
 
@@ -465,6 +499,23 @@ class DatasetWriter:
     def batches(self) -> list[BatchMetrics]:
         """The per-batch metrics records for this dataset, indexed by batch."""
         return self._batches
+
+    def live_throughput_gb_s(self) -> tuple[float, float | None] | None:
+        """Return ``(raw_gb_s, compressed_gb_s)`` across completed batches, or ``None`` if none yet."""
+        completed = [
+            b for b in list(self._batches) if b.flushing.ended is not None and b.collecting.started is not None
+        ]
+        if not completed:
+            return None
+        t0 = min(b.collecting.started for b in completed if b.collecting.started is not None)
+        t1 = max(b.flushing.ended for b in completed if b.flushing.ended is not None)
+        elapsed = (t1 - t0).total_seconds()
+        if elapsed <= 0:
+            return None
+        raw_gb_s = sum(b.flushed_bytes for b in completed) / 1e9 / elapsed
+        written = [b.written_bytes for b in completed if b.written_bytes is not None]
+        comp_gb_s = (sum(written) / 1e9 / elapsed) if len(written) == len(completed) else None
+        return (raw_gb_s, comp_gb_s)
 
     @contextmanager
     def new_frame(self) -> Generator[np.ndarray]:
@@ -665,6 +716,7 @@ class DatasetWriter:
         batch.processing.started, batch.processing.ended = result.process_started, result.process_ended
         batch.flushing.started, batch.flushing.ended = result.flush_started, result.flush_ended
         batch.flushed_bytes = result.flushed_bytes
+        batch.written_bytes = result.written_bytes
 
     def _queue_upload(self, batch_idx: int) -> None:
         """Queue the s5cmd upload of a written batch's shards (staged only). Blocks if max_pending uploads
@@ -786,14 +838,17 @@ class OMEZarrWriter:
     def __init__(
         self,
         *,
-        backend: ArrayWriter.Backend = ArrayWriter.Backend.TS,
+        backend: ArrayWriter.Backend | None = None,
         slots: int = 4,  # ring depth = max batches in flight (caller sizes from its RAM share)
     ) -> None:
         self._backend = backend
         self._slots = slots
         self._ring: Ring | None = None
+        self._ring_use_gpu: bool | None = None
+        self._ring_slot_bytes: int | None = None
         self._active: DatasetWriter | None = None
         self._ring_failed = False
+        self._last_throughput: tuple[float, float | None] | None = None
 
     @property
     def ready_for_batch(self) -> bool:
@@ -817,6 +872,14 @@ class OMEZarrWriter:
         """The location of the open dataset, or None when none is open."""
         return self._active.target if self._active is not None else None
 
+    def live_throughput_gb_s(self) -> tuple[float, float | None] | None:
+        """Return ``(raw_gb_s, compressed_gb_s)`` for the active stack, or the last completed stack."""
+        if self._active is not None:
+            stats = self._active.live_throughput_gb_s()
+            if stats is not None:
+                return stats
+        return self._last_throughput
+
     def begin_stack(
         self,
         config: WriterConfig,
@@ -836,10 +899,20 @@ class OMEZarrWriter:
         """
         if self._active is not None:
             raise RuntimeError("stack already open; call end_stack() first")
+        effective_use_gpu = (config.use_gpu or self._backend == ArrayWriter.Backend.GPU) and is_gpu_available()
+        slot_bytes = per_slot_bytes(
+            config.batch_shape,
+            config.max_level,
+            config.dtype,
+            use_gpu=effective_use_gpu,
+            shard_shape=config.shard_shape,
+        )
         if (
             self._ring is None
             or self._ring_failed
             or not self._ring.matches(config.batch_shape, config.max_level, config.dtype)
+            or self._ring_use_gpu != effective_use_gpu
+            or (self._ring_slot_bytes is not None and slot_bytes > self._ring_slot_bytes)
         ):
             self._drop_ring()
             slots = sizer(config) if sizer is not None else self._slots
@@ -852,7 +925,14 @@ class OMEZarrWriter:
                 max_level=config.max_level,
                 dtype=config.dtype,
             )
-        self._active = DatasetWriter(config, storage, self._ring, backend=self._backend)
+            self._ring_use_gpu = effective_use_gpu
+            self._ring_slot_bytes = slot_bytes
+        effective_backend = (
+            self._backend
+            if self._backend is not None
+            else (ArrayWriter.Backend.GPU if effective_use_gpu else ArrayWriter.Backend.TS)
+        )
+        self._active = DatasetWriter(config, storage, self._ring, backend=effective_backend)
         return self._active
 
     @contextmanager
@@ -881,6 +961,7 @@ class OMEZarrWriter:
             self._ring_failed = True
             raise
         finally:
+            self._last_throughput = self._active.live_throughput_gb_s() or self._last_throughput
             self._active = None
 
     def close(self) -> None:
@@ -890,11 +971,14 @@ class OMEZarrWriter:
                 self._active.close()
         finally:
             self._active = None
+            self._last_throughput = None
             self._drop_ring()
 
     def _drop_ring(self) -> None:
         """Release the retained ring, if any."""
         ring, self._ring = self._ring, None
         self._ring_failed = False
+        self._ring_use_gpu = None
+        self._ring_slot_bytes = None
         if ring is not None:
             ring.close()

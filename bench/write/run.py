@@ -63,7 +63,11 @@ from bench.write.constants import (
 from vxl.system import load_voxel_env
 
 MODE_KEYS = ("local", "direct", "staged")
-BACKEND_KEYS = {"ts": ArrayWriter.Backend.TS, "zarrs": ArrayWriter.Backend.ZARRS}
+BACKEND_KEYS = {
+    "ts": ArrayWriter.Backend.TS,
+    "zarrs": ArrayWriter.Backend.ZARRS,
+    "gpu": ArrayWriter.Backend.GPU,
+}
 _STAGES = ("collecting", "processing", "flushing", "transferring")
 
 console = Console()
@@ -130,6 +134,7 @@ class BenchConfig:
     backends: tuple[ArrayWriter.Backend, ...]
     modes: tuple[str, ...]
     keep: bool
+    use_gpu: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -475,7 +480,7 @@ def main(cfg: BenchConfig) -> None:
     load_voxel_env()
     clear_artifacts("pre-run")  # self-heal any residue a prior killed run left before writing fresh data
     blocks = load_blocks(cfg.samples)
-    wconfig = build_wconfig(blocks, cfg.batches, cfg.downscale)
+    wconfig = build_wconfig(blocks, cfg.batches, cfg.downscale, use_gpu=cfg.use_gpu)
 
     caps = _concurrency()
     run_id = new_run_id()
@@ -533,11 +538,12 @@ def _parse_args() -> BenchConfig:
         default=DownscaleType.GAUSSIAN,
         help="pyramid downsample method (default gaussian)",
     )
-    p.add_argument("--backends", default="ts", help="comma-separated backends: ts,zarrs (default ts)")
+    p.add_argument("--backends", default="ts", help="comma-separated backends: ts,zarrs,gpu (default ts)")
     p.add_argument("--modes", default=",".join(MODE_KEYS), help="storage modes: local,direct,staged (default all)")
     p.add_argument("--slots", type=int, default=4, help="ring depth / batches in flight (default 4; ~batch_z RAM each)")
     p.add_argument("--batches", type=int, default=5, help="batches written back-to-back (default 5)")
     p.add_argument("--samples", type=int, default=2, help=f"samples to rotate through, 1..{len(CATALOG)} (default 2)")
+    p.add_argument("--use-gpu", action="store_true", help="enable GPU pyramid + shard compression in workers")
     p.add_argument("--keep", action="store_true", help="keep local + VAST artifacts after the run (default: clear)")
     a = p.parse_args()
 
@@ -563,6 +569,7 @@ def _parse_args() -> BenchConfig:
         backends=backends,
         modes=modes,
         keep=a.keep,
+        use_gpu=a.use_gpu,
     )
 
 

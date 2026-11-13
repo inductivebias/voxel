@@ -31,6 +31,7 @@ class ArrayWriter(ABC):
         TS = "tensorstore"
         AQZ = "acquire"
         ZARRS = "zarrs"
+        GPU = "gpu"
 
         def __call__(self) -> "ArrayWriter":
             if self is ArrayWriter.Backend.TS:
@@ -41,6 +42,10 @@ class ArrayWriter(ABC):
                 from .zarrs import ZarrsArrayWriter  # noqa: PLC0415
 
                 return ZarrsArrayWriter()
+            if self is ArrayWriter.Backend.GPU:
+                from .gpu import GPUArrayWriter  # noqa: PLC0415
+
+                return GPUArrayWriter()
             raise ValueError(f"Unsupported ArrayWriter.Backend: {self}")
 
     @abstractmethod
