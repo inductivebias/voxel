@@ -664,3 +664,78 @@ def test_gpu_array_writer_skip_empty_chunks(tmp_path: Path) -> None:
 
     read_l0 = TSArrayReader(root / "0").read_3d(z0=0, n=z)
     np.testing.assert_array_equal(read_l0, vol)
+
+
+def test_live_throughput_cpu_fallback(tmp_path: Path) -> None:
+    """DatasetWriter/OMEZarrWriter live_throughput_gb_s returns (raw > 0, None) on CPU and retains after end_stack."""
+    z, y, x = 64, 64, 64
+    vol, dtype = _make_bitdepth_volume((z, y, x), bit_depth=16)
+    cfg = WriterConfig(
+        volume_shape=UIVec3D(z=z, y=y, x=x),
+        voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
+        max_level=ScaleLevel.L1,
+        dtype=dtype,
+        compression=Compression.BLOSC_LZ4,
+        downscale_type=DownscaleType.MEAN,
+        use_gpu=False,
+    )
+    writer = OMEZarrWriter(slots=2)
+    try:
+        assert writer.live_throughput_gb_s() is None
+        ds = writer.begin_stack(cfg, Local(target=tmp_path / "cpu_tp"))
+        assert ds.live_throughput_gb_s() is None
+        for k in range(z):
+            with writer.new_frame() as frame:
+                frame[...] = vol[k]
+        writer.end_stack()
+
+        assert ds.batches
+        assert all(b.flushed_bytes > 0 for b in ds.batches if b.expected_frames > 0)
+        assert all(b.written_bytes is None for b in ds.batches)
+        ds_tp = ds.live_throughput_gb_s()
+        assert ds_tp is not None
+        raw_gb_s, comp_gb_s = ds_tp
+        assert raw_gb_s > 0
+        assert comp_gb_s is None
+
+        retained = writer.live_throughput_gb_s()
+        assert retained == ds_tp
+    finally:
+        writer.close()
+
+    assert writer.live_throughput_gb_s() is None
+
+
+@_requires_gpu
+def test_gpu_array_writer_last_written_bytes(tmp_path: Path) -> None:
+    """GPUArrayWriter.last_written_bytes tracks actual compressed bytes and 0 when empty shards are skipped."""
+    if not _has_nvcomp():
+        pytest.skip("nvidia-nvcomp not available")
+
+    z, y, x = 64, 128, 128
+    vol, dtype = _make_bitdepth_volume((z, y, x), bit_depth=16)
+    cfg = WriterConfig(
+        volume_shape=UIVec3D(z=z, y=y, x=x),
+        voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
+        max_level=ScaleLevel.L1,
+        dtype=dtype,
+        compression=Compression.BLOSC_LZ4,
+        skip_empty_chunks=True,
+    )
+    root = tmp_path / "gpu_written_bytes.ome.zarr"
+    cfg.dataset.write_metadata(root)
+
+    w = GPUArrayWriter()
+    w.skip_empty_chunks = True
+    w.open(root / "0")
+    try:
+        raw_bytes = w.write_slice(0, 0, vol)
+        assert raw_bytes == vol.nbytes
+        assert 0 < w.last_written_bytes < raw_bytes
+
+        zeros = np.zeros_like(vol)
+        raw_zero = w.write_slice(0, 0, zeros)
+        assert raw_zero == vol.nbytes
+        assert w.last_written_bytes == 0
+    finally:
+        w.close()

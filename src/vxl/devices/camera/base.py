@@ -6,7 +6,10 @@ from abc import abstractmethod
 from contextlib import suppress
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Literal, cast
+from typing import TYPE_CHECKING, Literal, cast
+
+if TYPE_CHECKING:
+    from collections.abc import Callable
 
 import numpy as np
 from ome_zarr_writer import (
@@ -204,6 +207,17 @@ class CameraController(DeviceController["Camera"]):
                 if len(recent) == 64:
                     break
         return list(reversed(recent))
+
+    @describe(label="Writer Throughput")
+    def writer_throughput_gb_s(self) -> tuple[float, float | None] | None:
+        """Current live writer throughput ``(raw_gb_s, compressed_gb_s)``, or ``None`` if inactive."""
+        if self._writer is None:
+            return None
+        fn = cast(
+            "Callable[[], tuple[float, float | None] | None] | None",
+            getattr(self._writer, "live_throughput_gb_s", None),
+        )
+        return fn() if fn is not None else None
 
     def _on_preview_frame(self, frame: PreviewFrame) -> None:
         task = self._publish_tasks.get(frame.header.layer)

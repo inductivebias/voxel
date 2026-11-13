@@ -669,6 +669,17 @@
             <dd>{taskAndProfile(manifest, volume)}</dd>
             <dt>Frames</dt>
             <dd class="font-mono tabular-nums">{active.frames_captured} / {framesTotal}</dd>
+            {#if active.raw_gb_s != null}
+              <dt>Throughput</dt>
+              <dd class="font-mono tabular-nums">
+                {#if active.compressed_gb_s != null}
+                  {active.raw_gb_s.toFixed(2)} → {active.compressed_gb_s.toFixed(2)} GB/s{#if active.compressed_gb_s > 0}
+                    {' '}({(active.raw_gb_s / active.compressed_gb_s).toFixed(1)}×){/if}
+                {:else}
+                  {active.raw_gb_s.toFixed(2)} GB/s raw
+                {/if}
+              </dd>
+            {/if}
             <dt>Position</dt>
             <dd class="font-mono tabular-nums">
               {stage.qualifiedLabel('x')}

@@ -151,6 +151,8 @@ class ActiveAcquisition(FrozenModel):
     volume_index: int = Field(ge=0)
     phase: AcquisitionPhase
     frames_captured: int = Field(default=0, ge=0)
+    raw_gb_s: float | None = Field(default=None, ge=0)
+    compressed_gb_s: float | None = Field(default=None, ge=0)
 
 
 class IdleActivity(FrozenModel):
@@ -1683,6 +1685,28 @@ class Instrument:
             )
         return planned_volumes
 
+    async def _writer_throughput_gb_s(self) -> tuple[float, float | None] | None:
+        if not self._hal.cameras:
+            return None
+        results = await asyncio.gather(
+            *(cam.call("writer_throughput_gb_s") for cam in self._hal.cameras.values()),
+            return_exceptions=True,
+        )
+        stats: list[tuple[float, float | None]] = []
+        for res in results:
+            if isinstance(res, (list, tuple)) and len(res) == 2:
+                raw_val, comp_val = res[0], res[1]
+                raw = float(raw_val)
+                comp = float(comp_val) if comp_val is not None else None
+                stats.append((raw, comp))
+        if not stats:
+            return None
+        raw_gb_s = round(sum(r for r, _ in stats), 3)
+        compressed_gb_s = (
+            round(sum(c for _, c in stats if c is not None), 3) if all(c is not None for _, c in stats) else None
+        )
+        return raw_gb_s, compressed_gb_s
+
     async def _update_acquisition(
         self,
         manifest: AcquisitionManifest,
@@ -1697,12 +1721,22 @@ class Instrument:
             raise RuntimeError("cannot update acquisition state when no run is active")
         if current.id != manifest.id:
             raise RuntimeError("active acquisition does not match the running manifest")
+        if frames_captured == 0:
+            raw_gb_s, compressed_gb_s = None, None
+        else:
+            throughput = await self._writer_throughput_gb_s()
+            if throughput is not None:
+                raw_gb_s, compressed_gb_s = throughput
+            else:
+                raw_gb_s, compressed_gb_s = current.raw_gb_s, current.compressed_gb_s
         updated = ActiveAcquisition(
             id=current.id,
             manifest_revision=manifest.revision,
             volume_index=current.volume_index if volume_index is None else volume_index,
             phase=current.phase if phase is None else phase,
             frames_captured=current.frames_captured if frames_captured is None else frames_captured,
+            raw_gb_s=raw_gb_s,
+            compressed_gb_s=compressed_gb_s,
         )
         await self._activity.set(capture.model_copy(update={"acquisition": updated}))
         return updated

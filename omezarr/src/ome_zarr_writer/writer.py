@@ -265,6 +265,7 @@ class BatchMetrics(BaseModel):
     expected_frames: int
     collected_frames: int = 0
     flushed_bytes: int = 0
+    written_bytes: int | None = None
     transfered_bytes: int = 0
     collecting: Timing = Field(default_factory=Timing)
     processing: Timing = Field(default_factory=Timing)
@@ -499,6 +500,23 @@ class DatasetWriter:
         """The per-batch metrics records for this dataset, indexed by batch."""
         return self._batches
 
+    def live_throughput_gb_s(self) -> tuple[float, float | None] | None:
+        """Return ``(raw_gb_s, compressed_gb_s)`` across completed batches, or ``None`` if none yet."""
+        completed = [
+            b for b in list(self._batches) if b.flushing.ended is not None and b.collecting.started is not None
+        ]
+        if not completed:
+            return None
+        t0 = min(b.collecting.started for b in completed if b.collecting.started is not None)
+        t1 = max(b.flushing.ended for b in completed if b.flushing.ended is not None)
+        elapsed = (t1 - t0).total_seconds()
+        if elapsed <= 0:
+            return None
+        raw_gb_s = sum(b.flushed_bytes for b in completed) / 1e9 / elapsed
+        written = [b.written_bytes for b in completed if b.written_bytes is not None]
+        comp_gb_s = (sum(written) / 1e9 / elapsed) if len(written) == len(completed) else None
+        return (raw_gb_s, comp_gb_s)
+
     @contextmanager
     def new_frame(self) -> Generator[np.ndarray]:
         """Yield the next writable destination, committing on clean exit and aborting if the block raises."""
@@ -698,6 +716,7 @@ class DatasetWriter:
         batch.processing.started, batch.processing.ended = result.process_started, result.process_ended
         batch.flushing.started, batch.flushing.ended = result.flush_started, result.flush_ended
         batch.flushed_bytes = result.flushed_bytes
+        batch.written_bytes = result.written_bytes
 
     def _queue_upload(self, batch_idx: int) -> None:
         """Queue the s5cmd upload of a written batch's shards (staged only). Blocks if max_pending uploads
@@ -829,6 +848,7 @@ class OMEZarrWriter:
         self._ring_slot_bytes: int | None = None
         self._active: DatasetWriter | None = None
         self._ring_failed = False
+        self._last_throughput: tuple[float, float | None] | None = None
 
     @property
     def ready_for_batch(self) -> bool:
@@ -851,6 +871,14 @@ class OMEZarrWriter:
     def target(self) -> Path | S3Path | None:
         """The location of the open dataset, or None when none is open."""
         return self._active.target if self._active is not None else None
+
+    def live_throughput_gb_s(self) -> tuple[float, float | None] | None:
+        """Return ``(raw_gb_s, compressed_gb_s)`` for the active stack, or the last completed stack."""
+        if self._active is not None:
+            stats = self._active.live_throughput_gb_s()
+            if stats is not None:
+                return stats
+        return self._last_throughput
 
     def begin_stack(
         self,
@@ -933,6 +961,7 @@ class OMEZarrWriter:
             self._ring_failed = True
             raise
         finally:
+            self._last_throughput = self._active.live_throughput_gb_s() or self._last_throughput
             self._active = None
 
     def close(self) -> None:
@@ -942,6 +971,7 @@ class OMEZarrWriter:
                 self._active.close()
         finally:
             self._active = None
+            self._last_throughput = None
             self._drop_ring()
 
     def _drop_ring(self) -> None:

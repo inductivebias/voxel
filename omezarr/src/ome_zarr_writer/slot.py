@@ -191,6 +191,7 @@ class BatchResult:
     flush_started: datetime
     flush_ended: datetime
     flushed_bytes: int
+    written_bytes: int | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +360,7 @@ def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_id
     all_gpu_writers = all(isinstance(_WORKER_WRITERS[lvl], GPUArrayWriter) for lvl in setup.levels)
 
     flushed = 0
+    written_bytes: int | None = None
     with _gpu_worker_slot():
         process_started = datetime.now(UTC)
         ws = _WORKER_GPU_WS.get("ws")
@@ -384,11 +386,13 @@ def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_id
             flush_started = process_ended
 
             if all_gpu_writers:
+                written_bytes = 0
                 for level in setup.levels:
                     z0, z1 = z_start // level.factor, z_end // level.factor
                     d_slab = d_levels[level][: z1 - z0]  # type: ignore[index]
                     gpu_writer = cast("GPUArrayWriter", _WORKER_WRITERS[level])
                     flushed += gpu_writer.write_slice_gpu(setup.channel, z0, d_slab)
+                    written_bytes += gpu_writer.last_written_bytes
                     gpu_writer.release_device_buffers()
                     d_slab = None
         finally:
@@ -410,6 +414,7 @@ def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_id
         flush_started=flush_started,
         flush_ended=datetime.now(UTC),
         flushed_bytes=flushed,
+        written_bytes=written_bytes,
     )
 
 

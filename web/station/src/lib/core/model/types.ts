@@ -671,6 +671,8 @@ export interface ActiveAcquisition {
   volume_index: number;
   phase: AcquisitionPhase;
   frames_captured: number;
+  raw_gb_s?: number | null;
+  compressed_gb_s?: number | null;
 }
 
 /** A command parameter's introspected signature. */

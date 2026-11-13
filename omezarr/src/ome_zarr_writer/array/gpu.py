@@ -828,6 +828,7 @@ class GPUArrayWriter(ArrayWriter):
         self._fallback: TSArrayWriter | None = None
         self._io_pool: ThreadPoolExecutor | None = None
         self.skip_empty_chunks: bool = False
+        self.last_written_bytes: int = 0
 
     def open(self, target: Path | S3Path, store: S3Store | None = None) -> None:
         self.close()
@@ -861,6 +862,7 @@ class GPUArrayWriter(ArrayWriter):
         return self._fallback
 
     def write_slice(self, c: int, z_offset: int, arr: np.ndarray) -> int:
+        self.last_written_bytes = 0
         if self._target is None:
             raise RuntimeError("write_slice called before open")
         if self._fallback is not None or self._spec is None or not isinstance(self._target, Path):
@@ -879,6 +881,7 @@ class GPUArrayWriter(ArrayWriter):
         host_fallback: np.ndarray | None = None,
     ) -> int:
         """Write a GPU-resident 3D slab ``d_slab`` (shape ``(slab_z, vy, vx)``) at channel ``c`` and ``z_offset``."""
+        self.last_written_bytes = 0
         if self._target is None:
             raise RuntimeError("write_slice_gpu called before open")
         if self._fallback is not None or self._spec is None or not isinstance(self._target, Path):
@@ -936,6 +939,7 @@ class GPUArrayWriter(ArrayWriter):
                         )
                         if len(shard_view) == 0:
                             continue
+                        self.last_written_bytes += len(shard_view)
                         shard_path = self._target / "c" / str(c) / str(sz_idx) / str(sy_idx) / str(sx_idx)
                         if pending_write is not None:
                             pending_write.result()
