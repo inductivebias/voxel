@@ -34,7 +34,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
@@ -263,13 +263,14 @@ def coordinate_tune(
             f"Best ripple: dt_ms=[{best_metrics.min_dt_ms:.3f}..{best_metrics.max_dt_ms:.3f}] "
             f"span={best_metrics.dt_span_ms:.3f}ms std={best_metrics.dt_std_ms:.4f}ms"
         )
-    finally:
-        if apply_best:
-            print("\nApplying best gains...")
-            client.restore_settings(best_gains)
-        else:
-            print("\nRestoring original baseline gains (pass --apply-best to keep tuned gains)...")
-            client.restore_settings(originals)
+    except BaseException:
+        print("\nInterrupted or failed; restoring original baseline gains...")
+        client.restore_settings(originals)
+        raise
+
+    if not apply_best:
+        print("\nRestoring original baseline gains (pass --apply-best to keep tuned gains)...")
+        client.restore_settings(originals)
 
 
 def main() -> int:
@@ -293,8 +294,7 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.analyze is not None:
-        m = analyze_scan_file(args.analyze)
-        print(json.dumps(m.__dict__, indent=2))
+        print(json.dumps(asdict(analyze_scan_file(args.analyze)), indent=2))
         return 0
 
     if not args.station_id:

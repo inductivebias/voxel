@@ -192,6 +192,13 @@ def _check_channel(name: str, number: int, count: int) -> None:
         raise ValueError(f"{name} {number} is outside 1..{count} on this Zaber device")
 
 
+def _require_non_empty(value: str, label: str) -> str:
+    stripped = value.strip()
+    if not stripped:
+        raise ValueError(f"{label} must not be empty")
+    return stripped
+
+
 class ZaberTTLStepper(TTLStepper):
     """Repeat one queued relative move each time a Zaber digital input rises.
 
@@ -1295,17 +1302,13 @@ class ZaberLinearAxis(ContinuousAxis):
 
     @describe(label="Get Setting", desc="Read a Zaber axis setting in native controller units.")
     def get_setting(self, name: str) -> float:
-        setting = name.strip()
-        if not setting:
-            raise ValueError("setting name must not be empty")
+        setting = _require_non_empty(name, "setting name")
         with self.hub.lock:
             return float(self._axis.settings.get(setting, Units.NATIVE))
 
     @describe(label="Set Setting", desc="Write a Zaber axis setting in native units and return the readback.")
     def set_setting(self, name: str, value: float) -> float:
-        setting = name.strip()
-        if not setting:
-            raise ValueError("setting name must not be empty")
+        setting = _require_non_empty(name, "setting name")
         if not math.isfinite(value):
             raise ValueError(f"{setting} must be finite, got {value}")
         with self.hub.lock:
@@ -1315,9 +1318,7 @@ class ZaberLinearAxis(ContinuousAxis):
 
     @describe(label="Send Command", desc="Send a Zaber ASCII command to this axis and return the reply data.")
     def command(self, cmd: str) -> str:
-        command = cmd.strip()
-        if not command:
-            raise ValueError("command must not be empty")
+        command = _require_non_empty(cmd, "command")
         with self.hub.lock:
             self._settings.clear()
             return self._axis.generic_command(command).data
