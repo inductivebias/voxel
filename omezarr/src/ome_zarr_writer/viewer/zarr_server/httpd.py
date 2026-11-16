@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import ClassVar
 from urllib.parse import unquote
 
-from .base import ZarrServer, get_host_ip
+from .base import ZarrServer, get_host_ip, neuroglancer_compatible_zarr_json
 
 log = logging.getLogger(__name__)
 
@@ -122,9 +122,11 @@ class CORSRequestHandler(SimpleHTTPRequestHandler):
 
         try:
             fs = os.fstat(f.fileno())
+            payload = neuroglancer_compatible_zarr_json(file_path)
+            content_len = len(payload) if payload is not None else fs[6]
             self.send_response(200)
             self.send_header("Content-type", self.guess_type(str(file_path)))
-            self.send_header("Content-Length", str(fs[6]))
+            self.send_header("Content-Length", str(content_len))
             self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
             self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
@@ -141,7 +143,8 @@ class CORSRequestHandler(SimpleHTTPRequestHandler):
 
         try:
             fs = os.fstat(f.fileno())
-            file_size = fs[6]
+            payload = neuroglancer_compatible_zarr_json(file_path)
+            file_size = len(payload) if payload is not None else fs[6]
 
             # Check for range request
             range_header = self.headers.get("Range")
@@ -167,9 +170,12 @@ class CORSRequestHandler(SimpleHTTPRequestHandler):
                     self.end_headers()
 
                     # Send the requested range
-                    f.seek(start)
-                    bytes_to_send = end - start + 1
-                    self.wfile.write(f.read(bytes_to_send))
+                    if payload is not None:
+                        self.wfile.write(payload[start : end + 1])
+                    else:
+                        f.seek(start)
+                        bytes_to_send = end - start + 1
+                        self.wfile.write(f.read(bytes_to_send))
                 except (ValueError, IndexError):
                     self.send_error(400, "Bad Range Header")
                     return
@@ -183,7 +189,10 @@ class CORSRequestHandler(SimpleHTTPRequestHandler):
                 self.end_headers()
 
                 # Send the file
-                self.wfile.write(f.read())
+                if payload is not None:
+                    self.wfile.write(payload)
+                else:
+                    self.wfile.write(f.read())
         finally:
             f.close()
 

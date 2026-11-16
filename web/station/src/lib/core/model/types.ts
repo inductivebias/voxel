@@ -261,6 +261,11 @@ export interface XYDefinition {
 /** Whether a task iterates positions or profiles in its outer loop. */
 export type IterationOrder = 'position_major' | 'profile_major';
 
+export interface CameraSamplingYZ {
+  y: number;
+  z: number;
+}
+
 export interface LineScan {
   axis: 'x' | 'y' | 'z';
   start: number;
@@ -270,6 +275,7 @@ export interface LineScan {
   camera_rate_fraction?: number | null;
   target_frame_rate_hz?: number | null;
   y_stack?: { start: number; end: number; step: number } | null;
+  camera_sampling_yz?: Record<string, CameraSamplingYZ>;
 }
 
 /** Persisted acquisition intent expanded into concrete volumes by the instrument. */
@@ -673,7 +679,7 @@ export interface InstrumentStatus {
   history: HistoryState;
 }
 
-export type AcquisitionPhase = 'positioning' | 'configuring' | 'capturing' | 'finalizing' | 'stopping';
+export type AcquisitionPhase = 'positioning' | 'configuring' | 'capturing' | 'finalizing' | 'paused' | 'stopping';
 
 /** Transient execution progress linked to a durable acquisition manifest. */
 export interface ActiveAcquisition {
@@ -681,6 +687,7 @@ export interface ActiveAcquisition {
   manifest_revision: number;
   volume_index: number;
   phase: AcquisitionPhase;
+  pause_requested?: boolean;
   frames_captured: number;
   raw_gb_s?: number | null;
   compressed_gb_s?: number | null;

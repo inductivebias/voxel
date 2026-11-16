@@ -15,9 +15,9 @@
   const unit = $derived(getSpatialUnit(prefs.spatialUnit.get()));
   // The step of each stage axis box, in µm, whatever unit shows.
   const AXIS_SPINS = [
-    ['x', 10],
-    ['y', 10],
-    ['z', 10]
+    ['x', 100],
+    ['y', 100],
+    ['z', 100]
   ] as const;
 </script>
 

@@ -182,7 +182,9 @@ class WriterConfig(WriterSettings):
     def dataset(self) -> OmeZarrDataset:
         """Resolve into the OME-Zarr v3 on-disk dataset description."""
         arrays: dict[ScaleLevel, Zarr3ArrayMeta] = {}
+        unit = self.voxel_unit.value
         for level in self.max_level.levels:
+            f = level.factor
             sv = level.scale(self.volume_shape)
             ss = level.scale(self.shard_shape)
             sc = level.scale(self.chunk_shape)
@@ -195,6 +197,14 @@ class WriterConfig(WriterSettings):
                 compression_level=self.compression_level,
                 compression_shuffle=self.compression_shuffle,
                 dimension_names=["c", "z", "y", "x"],
+                attributes={
+                    "dimension_units": [
+                        None,
+                        f"{self.voxel_size.z * f:g} {unit}",
+                        f"{self.voxel_size.y * f:g} {unit}",
+                        f"{self.voxel_size.x * f:g} {unit}",
+                    ]
+                },
             )
 
         group = Zarr3GroupMeta.multiscale(

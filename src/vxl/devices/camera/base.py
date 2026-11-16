@@ -333,6 +333,7 @@ class CameraController(DeviceController["Camera"]):
         storage: StorageSpec,
         subpath: PurePosixPath,
         settings: WriterSettings,
+        voxel_size_yx: tuple[float, float] | None = None,
         origin: Vec3D | None = None,
         shear_xz: float = 0.0,
         shear_yz: float = 0.0,
@@ -345,9 +346,10 @@ class CameraController(DeviceController["Camera"]):
         under it (e.g. ``task/profile/channel``); the node resolves it against its :class:`System` and
         the writer names it ``<subpath>.ome.zarr``. ``num_frames``/``z_step`` are the volume's
         geometry; ``magnification`` converts the sensor-space ``effective_pixel_size_um`` into the
-        sample-space lateral voxel size. ``settings`` are the broadcast output-format knobs. The
-        returned location describes the destination while it is being written; OME-Zarr metadata is
-        authoritative for dataset geometry. The trigger is configured per-batch in ``begin_batch``.
+        sample-space lateral voxel size unless overridden by ``voxel_size_yx`` ``(y, x)`` in µm.
+        ``settings`` are the broadcast output-format knobs. The returned location describes the
+        destination while it is being written; OME-Zarr metadata is authoritative for dataset geometry.
+        The trigger is configured per-batch in ``begin_batch``.
         """
         if self._mode != CameraMode.IDLE:  # a stack already open (or previewing) → mode is not IDLE
             raise RuntimeError(f"Cannot open stack: camera in {self._mode} mode")
@@ -365,15 +367,15 @@ class CameraController(DeviceController["Camera"]):
 
         # Resolve the logical StorageSpec to a concrete omezarr Storage, then build the writer config:
         # the broadcast `settings` (knobs) + this camera's geometry (frame size, voxel size from
-        # z_step + magnification) + dtype from the device's pixel format. Where/how to write lives on
-        # the Storage; the config is purely the dataset spec.
+        # z_step + magnification or explicit voxel_size_yx) + dtype from the device's pixel format.
         dest = self._system.resolve_storage(storage, subpath)
         frame = self.device.frame_size_px
         eff_px = self.device.effective_pixel_size_um(magnification)
+        vy, vx = voxel_size_yx if voxel_size_yx is not None else (eff_px.y, eff_px.x)
         cfg = WriterConfig(
             **settings.model_dump(),
             volume_shape=UIVec3D(z=num_frames, y=frame.y, x=frame.x),
-            voxel_size=UVec3D(z=z_step, y=eff_px.y, x=eff_px.x),
+            voxel_size=UVec3D(z=z_step, y=vy, x=vx),
             dtype=self.device.pixel_type,
             origin=origin,
             shear_xz=shear_xz,

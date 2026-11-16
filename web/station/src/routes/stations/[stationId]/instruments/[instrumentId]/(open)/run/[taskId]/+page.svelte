@@ -4,7 +4,9 @@
   import { page } from '$app/state';
   import { getPageInstrument } from '$lib/context.svelte';
   import {
+    type CameraSamplingYZ,
     convexHull,
+    defaultCameraSamplingYZ,
     type EditContext,
     type IterationOrder,
     type LineScan,
@@ -119,6 +121,25 @@
 
   function updateRows(patch: Partial<NonNullable<LineScan['y_stack']>>, context: EditContext = {}): void {
     if (task?.scan?.y_stack) updateScan({ y_stack: { ...task.scan.y_stack, ...patch } }, context);
+  }
+
+  function cameraSampling(cameraId: string, index: number): CameraSamplingYZ {
+    return task?.scan?.camera_sampling_yz?.[cameraId] ?? defaultCameraSamplingYZ(cameraId, index);
+  }
+
+  function updateCameraSampling(
+    cameraId: string,
+    index: number,
+    patch: Partial<CameraSamplingYZ>,
+    context: EditContext = {}
+  ): void {
+    if (!task?.scan || !instrument) return;
+    const next: Record<string, CameraSamplingYZ> = {};
+    Object.keys(instrument.hal.detection).forEach((id, idx) => {
+      next[id] = { ...cameraSampling(id, idx) };
+    });
+    next[cameraId] = { ...cameraSampling(cameraId, index), ...patch };
+    updateScan({ camera_sampling_yz: next }, context);
   }
 
   const sweepCount = $derived(
@@ -368,6 +389,35 @@
               {disabled}
             />
           </FieldRow>
+          {#each Object.keys(instrument.hal.detection) as cameraId, camIndex (cameraId)}
+            {@const sampling = cameraSampling(cameraId, camIndex)}
+            <FieldRow label={`${displayName(cameraId)} YZ`}>
+              <NumberBox
+                value={sampling.y}
+                min={0.001}
+                step={0.001}
+                bigStep={0.01}
+                prefix="Y"
+                suffix="µm"
+                aria-label={`${displayName(cameraId)} Y sampling in micrometres`}
+                onEditStart={() => instrument.edits.hold()}
+                onChange={(y, edit) => updateCameraSampling(cameraId, camIndex, { y }, edit)}
+                {disabled}
+              />
+              <NumberBox
+                value={sampling.z}
+                min={0.001}
+                step={0.001}
+                bigStep={0.01}
+                prefix="Z"
+                suffix="µm"
+                aria-label={`${displayName(cameraId)} Z sampling in micrometres`}
+                onEditStart={() => instrument.edits.hold()}
+                onChange={(z, edit) => updateCameraSampling(cameraId, camIndex, { z }, edit)}
+                {disabled}
+              />
+            </FieldRow>
+          {/each}
           <FieldRow label="Targeted framerate">
             <NumberBox
               value={task.scan.target_frame_rate_hz ??

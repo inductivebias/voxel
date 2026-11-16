@@ -190,6 +190,7 @@ class Zarr3ArrayMeta(SparseModel):
         compression_level: int | None = None,
         compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = None,
         dimension_names: list[str | None] | None = None,
+        attributes: dict[str, Any] | None = None,
     ) -> "Zarr3ArrayMeta":
         """A sharded array meta — outer (shard) chunk grid wrapping an inner
         chunk shape inside a `sharding_indexed` codec.
@@ -216,6 +217,7 @@ class Zarr3ArrayMeta(SparseModel):
                 )
             ],
             dimension_names=dimension_names,
+            attributes=attributes or {},
         )
 
 

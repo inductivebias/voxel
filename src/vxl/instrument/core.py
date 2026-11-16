@@ -140,6 +140,7 @@ class AcquisitionPhase(StrEnum):
     CONFIGURING = "configuring"
     CAPTURING = "capturing"
     FINALIZING = "finalizing"
+    PAUSED = "paused"
     STOPPING = "stopping"
 
 
@@ -150,6 +151,7 @@ class ActiveAcquisition(FrozenModel):
     manifest_revision: int = Field(ge=1)
     volume_index: int = Field(ge=0)
     phase: AcquisitionPhase
+    pause_requested: bool = False
     frames_captured: int = Field(default=0, ge=0)
     raw_gb_s: float | None = Field(default=None, ge=0)
     compressed_gb_s: float | None = Field(default=None, ge=0)
@@ -251,6 +253,9 @@ class Instrument:
         self._lock = asyncio.Lock()  # Serializes the hardware-driving state machine(s)
         self._history = UndoHistory()
         self._acq_task: asyncio.Task[None] | None = None  # the in-flight acquisition run, if any
+        self._pause_requested = False
+        self._resume_event = asyncio.Event()
+        self._resume_event.set()
         self._continue_on_error_next = False
         self.fov: ReactiveQuery[tuple[float, float]] = ReactiveQuery(fn=self._compute_current_fov)
         self.profile_fovs = Computed[dict[str, dict[str, Bounds]]](
@@ -822,20 +827,59 @@ class Instrument:
             volume_index=0,
             phase=AcquisitionPhase.CONFIGURING,
         )
+        self._pause_requested = False
+        self._resume_event = asyncio.Event()
+        self._resume_event.set()
         await self._activity.set(CaptureActivity(acquisition=acquisition))
         self._acq_task = asyncio.create_task(self._execute_acquisition(manifest))
         return manifest
 
+    async def pause_acquisition(self) -> None:
+        """Request the active acquisition to pause after the current volume (x-strip) completes."""
+        if (task := self._acq_task) is None or task.done():
+            raise OperationRejectedError("No acquisition is running")
+        activity = self._activity.value
+        if (
+            not isinstance(activity, CaptureActivity)
+            or (acquisition := activity.acquisition) is None
+            or acquisition.phase in (AcquisitionPhase.STOPPING, AcquisitionPhase.PAUSED)
+        ):
+            raise OperationRejectedError("Acquisition cannot be paused in its current state")
+        self._pause_requested = True
+        self._resume_event.clear()
+        if not acquisition.pause_requested:
+            updated = acquisition.model_copy(update={"pause_requested": True})
+            await self._activity.set(activity.model_copy(update={"acquisition": updated}))
+
+    async def resume_acquisition(self) -> None:
+        """Resume a paused acquisition or cancel a pending pause request."""
+        if (task := self._acq_task) is None or task.done():
+            raise OperationRejectedError("No acquisition is running")
+        activity = self._activity.value
+        if (
+            not isinstance(activity, CaptureActivity)
+            or (acquisition := activity.acquisition) is None
+            or acquisition.phase is AcquisitionPhase.STOPPING
+            or (acquisition.phase is not AcquisitionPhase.PAUSED and not acquisition.pause_requested)
+        ):
+            raise OperationRejectedError("Acquisition is not paused")
+        self._pause_requested = False
+        self._resume_event.set()
+        if acquisition.pause_requested:
+            updated = acquisition.model_copy(update={"pause_requested": False})
+            await self._activity.set(activity.model_copy(update={"acquisition": updated}))
+
     async def stop_acquisition(self) -> None:
         """Cancel the active acquisition and await its cleanup."""
         if (task := self._acq_task) is not None and not task.done():
+            self._pause_requested = False
             activity = self._activity.value
             if (
                 isinstance(activity, CaptureActivity)
                 and (acquisition := activity.acquisition) is not None
                 and acquisition.phase is not AcquisitionPhase.STOPPING
             ):
-                stopping = acquisition.model_copy(update={"phase": AcquisitionPhase.STOPPING})
+                stopping = acquisition.model_copy(update={"phase": AcquisitionPhase.STOPPING, "pause_requested": False})
                 await self._activity.set(activity.model_copy(update={"acquisition": stopping}))
                 task.cancel()
             with suppress(asyncio.CancelledError):
@@ -1713,6 +1757,7 @@ class Instrument:
         *,
         volume_index: int | None = None,
         phase: AcquisitionPhase | None = None,
+        pause_requested: bool | None = None,
         frames_captured: int | None = None,
     ) -> ActiveAcquisition:
         capture = self._capture_activity()
@@ -1734,6 +1779,7 @@ class Instrument:
             manifest_revision=manifest.revision,
             volume_index=current.volume_index if volume_index is None else volume_index,
             phase=current.phase if phase is None else phase,
+            pause_requested=current.pause_requested if pause_requested is None else pause_requested,
             frames_captured=current.frames_captured if frames_captured is None else frames_captured,
             raw_gb_s=raw_gb_s,
             compressed_gb_s=compressed_gb_s,
@@ -1777,6 +1823,27 @@ class Instrument:
                         "Diagnostic acquisition: strip %d failed; cleanup succeeded, continuing to the next strip",
                         volume_index + 1,
                     )
+                if self._pause_requested and volume_index + 1 < len(manifest.volumes):
+                    if self._uses_continuous(manifest.volumes[volume_index]):
+                        with suppress(Exception):
+                            await self._volume_scan_axis(manifest.volumes[volume_index]).reset_continuous_scan()
+                    self._pause_requested = False
+                    await self._update_acquisition(
+                        manifest,
+                        phase=AcquisitionPhase.PAUSED,
+                        pause_requested=False,
+                    )
+                    logger.info(
+                        "Acquisition paused after strip %d of %d",
+                        volume_index + 1,
+                        len(manifest.volumes),
+                    )
+                    await self._resume_event.wait()
+                    logger.info(
+                        "Acquisition resumed at strip %d of %d",
+                        volume_index + 2,
+                        len(manifest.volumes),
+                    )
             manifest = await self._records.acquisitions.complete_acquisition(manifest.id)
             await self._update_acquisition(manifest)
             logger.info(
@@ -1804,7 +1871,9 @@ class Instrument:
             if not self._cleanup_errors:
                 await self._activity.set(IdleActivity())
             else:
-                await self._update_acquisition(manifest, phase=AcquisitionPhase.STOPPING)
+                await self._update_acquisition(manifest, phase=AcquisitionPhase.STOPPING, pause_requested=False)
+            self._pause_requested = False
+            self._resume_event.set()
             self._acq_task = None
             try:
                 await self._records.logs.close_acquisition_window(manifest.id)
@@ -1967,6 +2036,7 @@ class Instrument:
         """Open every channel's dataset for the volume and register where each is written."""
         volume = manifest.volumes[volume_index]
         settings = self._store.value.output
+        detection_ids = list(self._hal.topology.detection)
 
         def geometry_kwargs(ch_id: str) -> dict[str, Any]:
             channel = self._channel_config(ch_id)
@@ -1975,6 +2045,10 @@ class Instrument:
                 "channel_label": channel.label or ch_id,
                 "channel_color": "FFFFFF" if channel.colormap == "white" else channel.colormap.lstrip("#").upper(),
             }
+            if volume.scan is not None:
+                cam_idx = detection_ids.index(channel.detection) if channel.detection in detection_ids else 0
+                sampling = volume.scan.resolve_camera_sampling_yz(channel.detection, cam_idx)
+                kwargs["voxel_size_yx"] = (sampling.z, sampling.y)
             if geometry is not None:
                 scan_axis = volume.scan.axis if volume.scan else "z"
                 if geometry.stage_axes[0] != scan_axis:
@@ -2283,11 +2357,24 @@ class Instrument:
         progress.recording = False
         final = await axis.finish_continuous_scan(planned.end)
         progress.finished = True
+        resolved_sampling_yz = (
+            {
+                cam_id: volume.scan.resolve_camera_sampling_yz(cam_id, idx).model_dump()
+                for idx, cam_id in enumerate(self._hal.topology.detection)
+            }
+            if volume.scan is not None
+            else {}
+        )
+        line_scan_dump = (
+            {**volume.scan.model_dump(), "camera_sampling_yz": resolved_sampling_yz}
+            if volume.scan is not None
+            else None
+        )
         record = {
             "task": volume.task,
             "profile": volume.profile,
             "axis": getattr(self._hal.topology.stage, volume.scan.axis if volume.scan else "z"),
-            "line_scan": volume.scan.model_dump() if volume.scan else None,
+            "line_scan": line_scan_dump,
             "plan": {
                 "window": planned.window,
                 "z_start": volume.z_start,

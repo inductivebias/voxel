@@ -484,6 +484,14 @@ export class Instrument {
     return manifest;
   }
 
+  pauseAcquisition(): Promise<void> {
+    return this.#client.post(`${this.#base}/acquisition/pause`);
+  }
+
+  resumeAcquisition(): Promise<void> {
+    return this.#client.post(`${this.#base}/acquisition/resume`);
+  }
+
   stopAcquisition(): Promise<void> {
     return this.#client.post(`${this.#base}/acquisition/stop`);
   }

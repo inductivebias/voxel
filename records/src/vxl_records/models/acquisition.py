@@ -103,6 +103,30 @@ class YScanRows(RecordModel):
         return [self.start + i * self.step for i in range(count)]
 
 
+class CameraSamplingYZ(RecordModel):
+    """Per-camera specimen-space (y, z) sampling in micrometres for line-scan volumes."""
+
+    y: float = Field(gt=0, allow_inf_nan=False)
+    z: float = Field(gt=0, allow_inf_nan=False)
+
+
+DEFAULT_CAMERA_SAMPLING_YZ: dict[str, CameraSamplingYZ] = {
+    "camera_1": CameraSamplingYZ(y=0.195, z=0.169),
+    "cam1": CameraSamplingYZ(y=0.195, z=0.169),
+    "camera_2": CameraSamplingYZ(y=0.293, z=0.254),
+    "cam2": CameraSamplingYZ(y=0.293, z=0.254),
+}
+
+
+def default_camera_sampling_yz(camera_id: str, index: int = 0) -> CameraSamplingYZ:
+    """Return the default (y, z) sampling in µm for a camera."""
+    if camera_id in DEFAULT_CAMERA_SAMPLING_YZ:
+        return DEFAULT_CAMERA_SAMPLING_YZ[camera_id]
+    if camera_id.endswith(("1", "_0")) or index == 0:
+        return CameraSamplingYZ(y=0.195, z=0.169)
+    return CameraSamplingYZ(y=0.293, z=0.254)
+
+
 class LineScan(RecordModel):
     """Positive, encoder-paced sweep in micrometres; the acquisition end is exclusive."""
 
@@ -110,10 +134,17 @@ class LineScan(RecordModel):
     start: float = Field(allow_inf_nan=False)
     end: float = Field(allow_inf_nan=False)
     spacing: float = Field(gt=0, allow_inf_nan=False)
+    camera_sampling_yz: dict[str, CameraSamplingYZ] = Field(default_factory=dict)
     runway_s: float = Field(default=1, gt=0, allow_inf_nan=False)
     camera_rate_fraction: float | None = Field(default=0.95, gt=0, lt=1, allow_inf_nan=False)
     target_frame_rate_hz: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     y_stack: YScanRows | None = None
+
+    def resolve_camera_sampling_yz(self, camera_id: str, index: int = 0) -> CameraSamplingYZ:
+        """Return the configured or default (y, z) sampling in µm for ``camera_id``."""
+        if camera_id in self.camera_sampling_yz:
+            return self.camera_sampling_yz[camera_id]
+        return default_camera_sampling_yz(camera_id, index)
 
     @model_validator(mode="after")
     def _check_window(self) -> Self:

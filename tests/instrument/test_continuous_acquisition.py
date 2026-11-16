@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 from vxl_records import (
     AcquisitionStatus,
+    CameraSamplingYZ,
     DatasetStatus,
     LineScan,
     LocalLocation,
@@ -72,12 +73,14 @@ class _Writer:
         self._root = root
         self._closing = False
         self.batches: list[int] = []
+        self.open_kwargs: list[dict[str, object]] = []
 
     async def check_writable(self, _storage: StorageSpec) -> None:
         return
 
-    async def open_stack(self, *, storage: StorageSpec, subpath: PurePosixPath, **_kwargs: object) -> LocalLocation:
+    async def open_stack(self, *, storage: StorageSpec, subpath: PurePosixPath, **kwargs: object) -> LocalLocation:
         self._closing = False
+        self.open_kwargs.append(kwargs)
         target = self._root / storage.path.as_posix() / f"{subpath.as_posix()}.ome.zarr"
         return LocalLocation(role=LocationRole.DESTINATION, status=LocationStatus.WRITING, host="h", path=str(target))
 
@@ -809,3 +812,190 @@ async def test_diagnostic_mode_never_swallows_operator_cancellation(
     manifest = await records.acquisitions.get(started.id)
     assert manifest.status is AcquisitionStatus.CANCELLED
     assert writer.batches == []
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+async def test_xy_scan_pause_after_completed_strip_and_resume_to_completion(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    task = instrument.state.value.plan[0]
+    await instrument.update_task(
+        task.id,
+        TaskPatch(
+            scan=LineScan.model_validate(
+                {
+                    **task.scan.model_dump(),
+                    "y_stack": {"start": 0, "end": 200, "step": 100},
+                }
+            )
+        ),
+    )
+
+    strip0_capturing = asyncio.Event()
+    allow_strip0_finish = asyncio.Event()
+    original_capture = instrument._capture_continuous
+    strip_calls = 0
+
+    async def gated_capture(*args, **kwargs):
+        nonlocal strip_calls
+        strip_calls += 1
+        if strip_calls == 1:
+            strip0_capturing.set()
+            await allow_strip0_finish.wait()
+        return await original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(instrument, "_capture_continuous", gated_capture)
+
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(strip0_capturing.wait(), timeout=5)
+
+    # Request pause while strip 0 is actively capturing
+    await instrument.pause_acquisition()
+    act = instrument.activity.value
+    assert act.kind == "capture"
+    assert act.acquisition is not None
+    assert act.acquisition.pause_requested is True
+    assert act.acquisition.phase.value == "capturing"
+
+    # Let strip 0 complete and wait until the acquisition enters PAUSED phase
+    allow_strip0_finish.set()
+    for _ in range(100):
+        act = instrument.activity.value
+        if act.kind == "capture" and act.acquisition is not None and act.acquisition.phase.value == "paused":
+            break
+        await asyncio.sleep(0.02)
+
+    act = instrument.activity.value
+    assert act.kind == "capture"
+    assert act.acquisition is not None
+    assert act.acquisition.phase.value == "paused"
+    assert act.acquisition.pause_requested is False
+    assert act.acquisition.volume_index == 0
+
+    # Strip 0 must be completely finished and persisted while strips 1 and 2 have not started
+    manifest_paused = await records.acquisitions.get(started.id)
+    assert [v.status for v in manifest_paused.volumes] == [
+        VolumeStatus.COMPLETED,
+        VolumeStatus.PENDING,
+        VolumeStatus.PENDING,
+    ]
+    assert writer.batches == [2]
+
+    # Resume scanning and verify the remaining strips complete normally
+    await instrument.resume_acquisition()
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+
+    manifest_done = await records.acquisitions.get(started.id)
+    assert manifest_done.status is AcquisitionStatus.COMPLETED, manifest_done.failure
+    assert [v.status for v in manifest_done.volumes] == [
+        VolumeStatus.COMPLETED,
+        VolumeStatus.COMPLETED,
+        VolumeStatus.COMPLETED,
+    ]
+    assert writer.batches == [2, 2, 2]
+    assert instrument.activity.value.kind == "idle"
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+async def test_xy_scan_stop_while_paused_cancels_cleanly(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    task = instrument.state.value.plan[0]
+    await instrument.update_task(
+        task.id,
+        TaskPatch(
+            scan=LineScan.model_validate(
+                {
+                    **task.scan.model_dump(),
+                    "y_stack": {"start": 0, "end": 100, "step": 100},
+                }
+            )
+        ),
+    )
+
+    strip0_capturing = asyncio.Event()
+    original_capture = instrument._capture_continuous
+
+    async def notify_capture(*args, **kwargs):
+        strip0_capturing.set()
+        await asyncio.sleep(0.05)
+        return await original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(instrument, "_capture_continuous", notify_capture)
+
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(strip0_capturing.wait(), timeout=5)
+    await instrument.pause_acquisition()
+
+    for _ in range(100):
+        act = instrument.activity.value
+        if act.kind == "capture" and act.acquisition is not None and act.acquisition.phase.value == "paused":
+            break
+        await asyncio.sleep(0.02)
+
+    assert instrument.activity.value.kind == "capture"
+    assert instrument.activity.value.acquisition.phase.value == "paused"
+
+    await instrument.stop_acquisition()
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.CANCELLED
+    assert [v.status for v in manifest.volumes] == [VolumeStatus.COMPLETED, VolumeStatus.CANCELLED]
+    assert writer.batches == [2]
+    assert instrument.activity.value.kind == "idle"
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+async def test_line_scan_camera_sampling_yz_defaults_and_overrides(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+) -> None:
+    instrument = opened_instrument
+    scan_default = LineScan(axis="x", start=1000, end=1160, spacing=80, runway_s=0.1)
+    assert scan_default.resolve_camera_sampling_yz("camera_1", 0) == CameraSamplingYZ(y=0.195, z=0.169)
+    assert scan_default.resolve_camera_sampling_yz("cam1", 0) == CameraSamplingYZ(y=0.195, z=0.169)
+    assert scan_default.resolve_camera_sampling_yz("camera_2", 1) == CameraSamplingYZ(y=0.293, z=0.254)
+    assert scan_default.resolve_camera_sampling_yz("cam2", 1) == CameraSamplingYZ(y=0.293, z=0.254)
+
+    await add_line(instrument)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    manifest = await records.acquisitions.get(started.id)
+    assert manifest.status is AcquisitionStatus.COMPLETED, manifest.failure
+    # 1400-px axis (frame.y) = camera z (0.169 um), 3200-px axis (frame.x) = camera y (0.195 um)
+    assert writer.open_kwargs[-1]["voxel_size_yx"] == pytest.approx((0.169, 0.195))
+
+    # Override camera_1 sampling in YZ
+    task = instrument.state.value.plan[0]
+    assert task.scan is not None
+    await instrument.update_task(
+        task.id,
+        TaskPatch(
+            scan=task.scan.model_copy(
+                update={
+                    "camera_sampling_yz": {
+                        "camera_1": CameraSamplingYZ(y=0.210, z=0.182),
+                        "camera_2": CameraSamplingYZ(y=0.310, z=0.268),
+                    }
+                }
+            )
+        ),
+    )
+    await instrument._hal.stage.x.move_abs(1000, wait=True)
+    started2 = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    manifest2 = await records.acquisitions.get(started2.id)
+    assert manifest2.status is AcquisitionStatus.COMPLETED, manifest2.failure
+    assert writer.open_kwargs[-1]["voxel_size_yx"] == pytest.approx((0.182, 0.210))
+
+

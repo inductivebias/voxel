@@ -13,6 +13,7 @@
     createAreaTask,
     createLineTask,
     createPositionTask,
+    defaultCameraSamplingYZ,
     deviceReady,
     type DownscaleType,
     type Instrument,
@@ -201,6 +202,10 @@
   const blockers = $derived(checks.filter((check) => check.tone === 'block').length);
 
   let starting = $state(false);
+  let togglingPause = $state(false);
+  const stripLabel = $derived(
+    manifest?.volumes.some((item) => item.scan?.y_stack || item.scan?.axis === 'x') ? 'X-strip' : 'volume'
+  );
 
   function defaultPath(): string {
     const date = new Date();
@@ -355,6 +360,15 @@
       const sync = target.imaging.profiles[currentProfile]?.sync[target.hal.continuous_scan?.generator ?? ''];
       task.scan.target_frame_rate_hz ??= sync ? 1 / (sync.duration + sync.rest_time) : 100;
       task.scan.camera_rate_fraction = null;
+      const existingSampling = task.scan.camera_sampling_yz;
+      task.scan.camera_sampling_yz = Object.fromEntries(
+        Object.keys(target.hal.detection).map((cameraId, idx) => [
+          cameraId,
+          existingSampling?.[cameraId]
+            ? { ...existingSampling[cameraId] }
+            : defaultCameraSamplingYZ(cameraId, idx)
+        ])
+      );
       if (array) {
         task.scan.y_stack = { start: currentPosition.y, end: currentPosition.y + 500, step: 500 };
       }
@@ -393,6 +407,18 @@
       reportFailure(error);
     } finally {
       starting = false;
+    }
+  }
+
+  async function togglePause(source: Instrument, resume: boolean): Promise<void> {
+    togglingPause = true;
+    try {
+      if (resume) await source.resumeAcquisition();
+      else await source.pauseAcquisition();
+    } catch (error) {
+      reportFailure(error);
+    } finally {
+      togglingPause = false;
     }
   }
 
@@ -696,9 +722,17 @@
 <footer class="shrink-0 px-4 pt-4">
   <div class="max-w-4xl">
     {#if capture}
-      <Section heading="Acquiring" variant="raised" class="frame-docked-bottom">
+      <Section
+        heading={active?.phase === 'paused' ? 'Paused' : 'Acquiring'}
+        variant="raised"
+        class="frame-docked-bottom"
+      >
         {#snippet trailing()}
-          {#if active}<Badge>{displayName(active.phase)}</Badge>{/if}
+          {#if active}
+            <Badge tone={active.phase === 'paused' || active.pause_requested ? 'warning' : 'neutral'}>
+              {active.pause_requested ? `Pausing after ${stripLabel}` : displayName(active.phase)}
+            </Badge>
+          {/if}
           <span class="text-sm text-fg-muted tabular-nums">{percent}%</span>
         {/snippet}
         <progress
@@ -746,6 +780,37 @@
             <dd class="font-mono wrap-anywhere">{storageLabel(manifest)}</dd>
           </dl>
           {@render volumes(manifest)}
+          {#if manifest.volumes.length > 1 && active.phase !== 'stopping'}
+            {#if active.phase === 'paused'}
+              <Button class="w-full" disabled={togglingPause} onclick={() => togglePause(instrument, true)}>
+                {togglingPause ? 'Continuing…' : 'Continue scan'}
+              </Button>
+            {:else if active.pause_requested}
+              <Button
+                variant="outline"
+                class="w-full"
+                disabled={togglingPause}
+                onclick={() => togglePause(instrument, true)}
+                title="Cancel the pending pause and keep scanning continuously"
+              >
+                {togglingPause ? 'Continuing…' : `Pausing after ${stripLabel} — Continue scan`}
+              </Button>
+            {:else}
+              <Button
+                variant="outline"
+                class="w-full"
+                disabled={togglingPause || active.volume_index >= manifest.volumes.length - 1}
+                onclick={() => togglePause(instrument, false)}
+                title={
+                  active.volume_index >= manifest.volumes.length - 1
+                    ? `Already on the final ${stripLabel}`
+                    : `Finish the current ${stripLabel} and pause before starting the next one`
+                }
+              >
+                {togglingPause ? 'Pausing…' : `Pause after ${stripLabel}`}
+              </Button>
+            {/if}
+          {/if}
         {:else}
           <p class="text-sm text-fg-muted" role="status">Preparing the acquisition…</p>
         {/if}
