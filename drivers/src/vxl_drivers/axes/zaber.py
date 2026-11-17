@@ -1,5 +1,6 @@
 """Zaber continuous-axis drivers using the Zaber Motion Library ASCII API."""
 
+import logging
 import math
 import threading
 import time
@@ -39,6 +40,9 @@ _POLL_INTERVAL_S = 0.05
 # through this driver take effect at once.
 _SETTINGS_TTL_S = 1.0
 _RESET_ATTEMPTS = 2
+_WINDOW_DISARM_ATTEMPTS = 3
+_WINDOW_DISARM_RETRY_S = 0.1
+_LOG = logging.getLogger(__name__)
 # Largest relative difference between a requested TTL step and the whole native steps it becomes.
 _STEP_TOLERANCE = 1e-3
 # Long enough for the return interface and an NI PFI input to register the pulse.
@@ -650,23 +654,49 @@ class ZaberContinuousScanner(ContinuousScanner):
     def _disarm_window(self) -> None:
         if self._window_output is None or self._window_triggers is None:
             return
-        failures = []
-        for number in self._window_triggers:
+        for attempt in range(1, _WINDOW_DISARM_ATTEMPTS + 1):
+            failures: list[Exception] = []
+            timed_out_triggers: set[int] = set()
+            output_timed_out = False
+            for number in self._window_triggers:
+                try:
+                    trigger = self._device.triggers.get_trigger(number)
+                    trigger.disable()
+                    trigger.clear_action(TriggerAction.ALL)
+                except Exception as error:
+                    failures.append(error)
+                    if isinstance(error, RequestTimeoutException):
+                        timed_out_triggers.add(number)
+            # Always force LOW, even when a trigger command failed. No retry may
+            # prevent us from attempting the remaining independent cleanup steps.
             try:
-                trigger = self._device.triggers.get_trigger(number)
-                trigger.disable()
-                trigger.clear_action(TriggerAction.ALL)
+                self._device.io.set_digital_output(self._window_output, DigitalOutputAction.OFF)
             except Exception as error:
                 failures.append(error)
-        try:
-            self._device.io.set_digital_output(self._window_output, DigitalOutputAction.OFF)
-            if self._device.io.get_digital_output(self._window_output) != 0:
-                raise RuntimeError(f"scan window DO{self._window_output} did not reset LOW")  # noqa: TRY301
-        except Exception as error:
-            failures.append(error)
-        if failures:
-            raise ExceptionGroup("Could not disable scan window", failures)
-        self._window_armed = False
+                output_timed_out = isinstance(error, RequestTimeoutException)
+            for number in self._window_triggers:
+                try:
+                    enabled = self._device.triggers.get_trigger(number).get_enabled_state().enabled
+                    # Retry an unacknowledged disable, but never hide an acknowledged
+                    # command that did not actually disable its trigger.
+                    if enabled and number not in timed_out_triggers:
+                        failures.append(RuntimeError(f"scan window trigger {number} is still enabled"))
+                except Exception as error:
+                    failures.append(error)
+            try:
+                if self._device.io.get_digital_output(self._window_output) != 0 and not output_timed_out:
+                    failures.append(RuntimeError(f"scan window DO{self._window_output} did not reset LOW"))
+            except Exception as error:
+                failures.append(error)
+            if not failures:
+                self._window_armed = False
+                return
+            if attempt == _WINDOW_DISARM_ATTEMPTS or not all(
+                isinstance(error, RequestTimeoutException) for error in failures
+            ):
+                raise ExceptionGroup("Could not disable scan window", failures)
+            _LOG.warning("Scan-window cleanup timed out; retrying (%d/%d)", attempt, _WINDOW_DISARM_ATTEMPTS - 1)
+            time.sleep(_WINDOW_DISARM_RETRY_S)
 
     def disarm_window(self) -> None:
         """Close the position window without waiting for motion or recorder cleanup."""

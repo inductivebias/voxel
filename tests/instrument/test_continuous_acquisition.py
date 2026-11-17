@@ -999,3 +999,31 @@ async def test_line_scan_camera_sampling_yz_defaults_and_overrides(
     assert writer.open_kwargs[-1]["voxel_size_yx"] == pytest.approx((0.182, 0.210))
 
 
+@pytest.mark.usefixtures("writer")
+@pytest.mark.parametrize("capture_failure", [False, True])
+async def test_window_cleanup_runs_after_laser_shutdown(opened_instrument, records, monkeypatch, capture_failure):
+    instrument = opened_instrument
+    axis = instrument._hal.stage.scanning_axis
+    laser = instrument._hal.lasers["laser_488"]
+    original = axis.disarm_scan_window
+    observations = []
+
+    async def check_disarm():
+        enabled = await laser.props.get_value("is_output_enabled")
+        observations.append(enabled)
+        assert not enabled, "serial cleanup retries must not delay laser shutdown"
+        return await original()
+
+    async def fail_wait(*_args, **_kwargs):
+        raise RuntimeError("capture interrupted")
+
+    monkeypatch.setattr(axis, "disarm_scan_window", check_disarm)
+    if capture_failure:
+        monkeypatch.setattr(instrument, "_await_pass", fail_wait)
+    await add_task(instrument)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    manifest = await records.acquisitions.get(started.id)
+    assert observations
+    assert not any(observations)
+    assert manifest.status is (AcquisitionStatus.FAILED if capture_failure else AcquisitionStatus.COMPLETED)
