@@ -1,4 +1,5 @@
 import asyncio
+import json
 from pathlib import Path, PurePosixPath
 from typing import Literal
 
@@ -40,13 +41,16 @@ class _Writer:
         self._close_error = close_error
         self._closing = False
         self.released = False
+        self.opened_subpaths: list[PurePosixPath] = []
         self.opened_kwargs: list[dict[str, object]] = []
+        self.updated_darkfield: list[tuple[PurePosixPath, dict[str, object]]] = []
 
     async def check_writable(self, _storage: StorageSpec) -> None:
         return
 
     async def open_stack(self, *, storage: StorageSpec, subpath: PurePosixPath, **_kwargs: object) -> LocalLocation:
         self._closing = False
+        self.opened_subpaths.append(subpath)
         self.opened_kwargs.append(_kwargs)
         target = self._root / storage.path.as_posix() / f"{subpath.as_posix()}.ome.zarr"
         return LocalLocation(
@@ -55,6 +59,12 @@ class _Writer:
             host="camera-1",
             path=str(target),
         )
+
+    async def update_dataset_darkfield(
+        self, *, storage: StorageSpec, subpath: PurePosixPath, darkfield: dict[str, object]
+    ) -> None:
+        _ = storage
+        self.updated_darkfield.append((subpath, darkfield))
 
     async def begin_batch(self, _num_frames: int) -> None:
         return
@@ -76,7 +86,15 @@ async def writer(opened_instrument: Instrument, tmp_path: Path, monkeypatch: pyt
     instrument = opened_instrument
     writer = _Writer(tmp_path / "data")
     camera = instrument._hal.cameras["camera_1"]
-    for name in ("check_writable", "open_stack", "begin_batch", "capture_state", "close_stack", "release_writer"):
+    for name in (
+        "check_writable",
+        "open_stack",
+        "update_dataset_darkfield",
+        "begin_batch",
+        "capture_state",
+        "close_stack",
+        "release_writer",
+    ):
         monkeypatch.setattr(camera, name, getattr(writer, name))
     await instrument.add_task(
         AcquisitionTask(
@@ -326,3 +344,128 @@ async def test_stepped_batch_capture_starts_signal_generators_with_finite_batch_
         ("stop", None),
         ("stop", None),
     ]
+
+
+async def test_dark_frames_captured_before_scan_with_lasers_off_when_short_scan(
+    opened_instrument: Instrument,
+    writer: _Writer,
+    records: SQLiteRecords,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    instrument = opened_instrument
+    await instrument.update_task(
+        "task",
+        TaskPatch(acquire_dark_frames=True, dark_frame_count=256),
+    )
+    daq = instrument._hal.signal_generators["daq"]
+    orig_start = daq.start
+    laser_states_per_start: list[tuple[int | None, set[str]]] = []
+
+    async def start(repeat: int | None = None) -> None:
+        enabled = {
+            uid
+            for uid, laser in instrument._hal.lasers.items()
+            if await laser.props.get_value("is_output_enabled")
+        }
+        laser_states_per_start.append((repeat, enabled))
+        await orig_start(repeat)
+
+    monkeypatch.setattr(daq, "start", start)
+
+    started = await instrument.start_acquisition(
+        AcquisitionRequest(storage=StorageSpec(path=PurePosixPath("dark-short")))
+    )
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=5)
+    manifest = await records.acquisitions.get(started.id)
+
+    assert manifest.status is AcquisitionStatus.COMPLETED
+    assert writer.opened_subpaths == [
+        PurePosixPath("volumes/000001/single_gfp/gfp.ome.zarr/dark/before"),
+        PurePosixPath("volumes/000001/single_gfp/gfp"),
+    ]
+    assert writer.opened_kwargs[0]["num_frames"] == 256
+    assert writer.opened_kwargs[0]["settings"].dark_floor == 0
+    assert writer.opened_kwargs[0]["settings"].skip_empty_chunks is False
+    # 256 dark frames in batches of batch_z (64) with all lasers off, then 1 scan frame with laser_488 on
+    assert laser_states_per_start == [
+        (64, set()),
+        (64, set()),
+        (64, set()),
+        (64, set()),
+        (1, {"laser_488"}),
+    ]
+    assert len(writer.updated_darkfield) == 1
+    assert writer.updated_darkfield[0][0] == PurePosixPath("volumes/000001/single_gfp/gfp")
+    ch_darkfield = writer.updated_darkfield[0][1]
+    assert ch_darkfield["enabled"] is True
+    assert ch_darkfield["frames"] == 256
+    assert ch_darkfield["lasers_off"] is True
+    assert ch_darkfield["before"] == "dark/before.ome.zarr"
+    assert ch_darkfield["after"] is None
+    assert ch_darkfield["task_scan_duration_s"] is not None
+    assert manifest.volumes[0].darkfield is not None
+    assert manifest.volumes[0].darkfield["channels"]["gfp"]["before"] == "dark/before.ome.zarr"  # type: ignore[index]
+    assert manifest.volumes[0].darkfield["channels"]["gfp"]["after"] is None  # type: ignore[index]
+
+
+async def test_dark_frames_captured_before_and_after_when_scan_exceeds_10_min_threshold(
+    opened_instrument: Instrument,
+    writer: _Writer,
+    records: SQLiteRecords,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    instrument._dark_frame_post_scan_threshold_s = 0.0
+    await instrument.update_task(
+        "task",
+        TaskPatch(acquire_dark_frames=True, dark_frame_count=200),
+    )
+    daq = instrument._hal.signal_generators["daq"]
+    orig_start = daq.start
+    laser_states_per_start: list[tuple[int | None, set[str]]] = []
+
+    async def start(repeat: int | None = None) -> None:
+        enabled = {
+            uid
+            for uid, laser in instrument._hal.lasers.items()
+            if await laser.props.get_value("is_output_enabled")
+        }
+        laser_states_per_start.append((repeat, enabled))
+        await orig_start(repeat)
+
+    monkeypatch.setattr(daq, "start", start)
+
+    started = await instrument.start_acquisition(
+        AcquisitionRequest(storage=StorageSpec(path=PurePosixPath("dark-long")))
+    )
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=5)
+    manifest = await records.acquisitions.get(started.id)
+
+    assert manifest.status is AcquisitionStatus.COMPLETED
+    assert writer.opened_subpaths == [
+        PurePosixPath("volumes/000001/single_gfp/gfp.ome.zarr/dark/before"),
+        PurePosixPath("volumes/000001/single_gfp/gfp"),
+        PurePosixPath("volumes/000001/single_gfp/gfp.ome.zarr/dark/after"),
+    ]
+    assert laser_states_per_start == [
+        (64, set()),
+        (64, set()),
+        (64, set()),
+        (8, set()),
+        (1, {"laser_488"}),
+        (64, set()),
+        (64, set()),
+        (64, set()),
+        (8, set()),
+    ]
+    assert len(writer.updated_darkfield) == 1
+    assert writer.updated_darkfield[0][0] == PurePosixPath("volumes/000001/single_gfp/gfp")
+    ch_darkfield = writer.updated_darkfield[0][1]
+    assert ch_darkfield["before"] == "dark/before.ome.zarr"
+    assert ch_darkfield["after"] == "dark/after.ome.zarr"
+    assert ch_darkfield["before_acquired_at"] is not None
+    assert ch_darkfield["after_acquired_at"] is not None
+    assert manifest.volumes[0].darkfield is not None
+    assert manifest.volumes[0].darkfield["channels"]["gfp"]["before"] == "dark/before.ome.zarr"  # type: ignore[index]
+    assert manifest.volumes[0].darkfield["channels"]["gfp"]["after"] == "dark/after.ome.zarr"  # type: ignore[index]

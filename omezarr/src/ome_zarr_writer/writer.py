@@ -188,6 +188,10 @@ class WriterConfig(WriterSettings):
         default=None,
         description="Raw camera frame width before rectangular binning (defaults to volume_shape.x * bin_x)",
     )
+    darkfield: dict[str, Any] | None = Field(
+        default=None,
+        description="Darkfield calibration metadata and relative paths to dark-frame OME-Zarr subdirectories",
+    )
 
     @cached_property
     def raw_batch_shape(self) -> UIVec3D:
@@ -296,6 +300,7 @@ class WriterConfig(WriterSettings):
             bin_y=self.bin_y,
             bin_x=self.bin_x,
             preprocessing=preprocessing,
+            darkfield=self.darkfield,
         )
 
         return OmeZarrDataset(group=group, arrays=arrays)
@@ -1057,13 +1062,20 @@ class OMEZarrWriter:
             shard_shape=config.shard_shape,
             raw_batch_shape=config.raw_batch_shape,
         )
-        if (
-            self._ring is None
-            or self._ring_failed
-            or not self._ring.matches(config.batch_shape, config.max_level, config.dtype, config.raw_batch_shape)
-            or self._ring_use_gpu != effective_use_gpu
-            or (self._ring_slot_bytes is not None and slot_bytes > self._ring_slot_bytes)
-        ):
+        geom_matches = (
+            self._ring is not None
+            and not self._ring_failed
+            and self._ring.matches(config.batch_shape, config.max_level, config.dtype, config.raw_batch_shape)
+            and self._ring_use_gpu == effective_use_gpu
+        )
+        if geom_matches and self._ring is not None and self._ring_slot_bytes is not None and slot_bytes > self._ring_slot_bytes:
+            # Verify the larger shard footprint still fits the current ring depth before dropping the ring.
+            slots = sizer(config) if sizer is not None else self._slots
+            if slots >= len(self._ring):
+                self._ring_slot_bytes = slot_bytes
+            else:
+                geom_matches = False
+        if not geom_matches or self._ring is None:
             self._drop_ring()
             slots = sizer(config) if sizer is not None else self._slots
             if slots < MIN_SLOTS:  # a ring this shallow cannot overlap collect with flush

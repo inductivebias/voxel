@@ -534,6 +534,9 @@
               >
                 <span class="flex min-w-0 items-center gap-2">
                   <span class="min-w-0 flex-1 truncate text-base text-fg">Task {index + 1}</span>
+                  {#if task.acquire_dark_frames || task.scan?.acquire_dark_frames}
+                    <Badge tone="neutral">Dark ({task.dark_frame_count ?? task.scan?.dark_frame_count ?? 256})</Badge>
+                  {/if}
                   <Badge>{task.scan?.y_stack ? 'XY-Scan' : task.scan ? 'X-Scan' : TASK_TYPES[task.xy.mode]}</Badge>
                   {#if instrument}
                     <span class="text-sm text-fg-muted tabular-nums">{plural(taskVolumes(task.id), 'volume')}</span>

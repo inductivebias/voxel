@@ -116,6 +116,7 @@ class CameraHandle(DeviceHandle[Camera]):
         shear_yz: float = 0.0,
         channel_label: str = "channel 0",
         channel_color: str = "FFFFFF",
+        darkfield: dict[str, Any] | None = None,
     ) -> DatasetLocation:
         """Prepare camera and writer for a stack acquisition; return its durable dataset location.
 
@@ -139,8 +140,24 @@ class CameraHandle(DeviceHandle[Camera]):
             shear_yz=shear_yz,
             channel_label=channel_label,
             channel_color=channel_color,
+            darkfield=darkfield,
         )
         return _DATASET_LOCATION_ADAPTER.validate_python(result)
+
+    async def update_dataset_darkfield(
+        self,
+        *,
+        storage: StorageSpec,
+        subpath: PurePosixPath,
+        darkfield: dict[str, Any],
+    ) -> None:
+        """Update ``attributes.darkfield`` in the root ``zarr.json`` of ``<subpath>.ome.zarr``."""
+        await self.call(
+            "update_dataset_darkfield",
+            storage=storage,
+            subpath=subpath,
+            darkfield=darkfield,
+        )
 
     async def close_stack(self) -> None:
         """Start draining and closing the writer in the background. Poll capture_state until CLOSED."""

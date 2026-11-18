@@ -25,6 +25,7 @@
   import {
     Button,
     buttonVariants,
+    Checkbox,
     Dialog,
     DropdownMenu,
     NumberBox,
@@ -147,6 +148,32 @@
       ? Math.floor((task.scan.y_stack.end - task.scan.y_stack.start) / task.scan.y_stack.step + 1e-9) + 1
       : 1
   );
+  const zChunkEdge = $derived(instrument ? Math.max(64, 1 << instrument.state.output.max_level) : 128);
+  const suggestedDarkFrames = $derived(Math.max(256, zChunkEdge));
+  const suggestedChunkCount = $derived(Math.max(1, Math.round(suggestedDarkFrames / zChunkEdge)));
+  const acquireDarkFrames = $derived(Boolean(task?.acquire_dark_frames || task?.scan?.acquire_dark_frames));
+  const darkFrameCount = $derived(task?.dark_frame_count ?? task?.scan?.dark_frame_count ?? suggestedDarkFrames);
+
+  function updateDarkFrames(
+    patch: { acquire_dark_frames?: boolean; dark_frame_count?: number },
+    context: EditContext = {}
+  ): void {
+    if (!task) return;
+    const nextAcquire = patch.acquire_dark_frames ?? acquireDarkFrames;
+    const nextCount = Math.max(1, Math.min(4096, Math.round(patch.dark_frame_count ?? darkFrameCount)));
+    if (task.scan) {
+      patchTask(
+        {
+          acquire_dark_frames: nextAcquire,
+          dark_frame_count: nextCount,
+          scan: { ...task.scan, acquire_dark_frames: nextAcquire, dark_frame_count: nextCount }
+        },
+        context
+      );
+    } else {
+      patchTask({ acquire_dark_frames: nextAcquire, dark_frame_count: nextCount }, context);
+    }
+  }
 
   function updateHold(axis: 'x' | 'y' | 'z', value: number, context: EditContext): void {
     if (!task) return;
@@ -482,6 +509,47 @@
               </FieldRow>
             {/if}
           {/each}
+          <FieldRow label="Dark-frames">
+            <label class="flex h-ui-sm items-center gap-2 text-sm whitespace-nowrap text-fg">
+              <Checkbox
+                value={acquireDarkFrames}
+                onChange={(checked) => updateDarkFrames({ acquire_dark_frames: checked })}
+                {disabled}
+              />
+              Acquire dark-frames
+            </label>
+            <NumberBox
+              value={darkFrameCount}
+              min={1}
+              max={4096}
+              step={zChunkEdge}
+              bigStep={zChunkEdge}
+              decimals={0}
+              suffix="frames"
+              aria-label="Dark-frame count"
+              onEditStart={() => instrument.edits.hold()}
+              onChange={(count, edit) => updateDarkFrames({ dark_frame_count: count }, edit)}
+              disabled={disabled || !acquireDarkFrames}
+            />
+          </FieldRow>
+          <p class="text-xs text-fg-muted">
+            Suggested: {suggestedDarkFrames} frames ({suggestedChunkCount} × {zChunkEdge}-frame OME-Zarr Z-chunk{suggestedChunkCount >
+            1
+              ? 's'
+              : ''} at L{instrument.state.output.max_level}). Collected with all lasers off into
+            <code>dark/before.ome.zarr</code> before the scan, and into <code>dark/after.ome.zarr</code> if total scan time
+            exceeds 10 min.
+            {#if acquireDarkFrames && darkFrameCount !== suggestedDarkFrames}
+              <button
+                type="button"
+                class="ml-1 underline hover:text-fg"
+                {disabled}
+                onclick={() => updateDarkFrames({ dark_frame_count: suggestedDarkFrames })}
+              >
+                Use {suggestedDarkFrames}
+              </button>
+            {/if}
+          </p>
           <p class="text-sm text-fg-muted">
             {#if task.scan.y_stack}
               Each X end is exclusive. Y moves between sweeps, up to the inclusive Y end in whole steps. Z must already
@@ -858,6 +926,37 @@
               onChange={(traversal) => patchTask({ traversal })}
             />
           </FieldRow>
+          <FieldRow label="Dark-frames">
+            <label class="flex h-ui-sm items-center gap-2 text-sm whitespace-nowrap text-fg">
+              <Checkbox
+                value={acquireDarkFrames}
+                onChange={(checked) => updateDarkFrames({ acquire_dark_frames: checked })}
+                {disabled}
+              />
+              Acquire dark-frames
+            </label>
+            <NumberBox
+              value={darkFrameCount}
+              min={1}
+              max={4096}
+              step={zChunkEdge}
+              bigStep={zChunkEdge}
+              decimals={0}
+              suffix="frames"
+              aria-label="Dark-frame count"
+              onEditStart={() => instrument.edits.hold()}
+              onChange={(count, edit) => updateDarkFrames({ dark_frame_count: count }, edit)}
+              disabled={disabled || !acquireDarkFrames}
+            />
+          </FieldRow>
+          <p class="text-xs text-fg-muted">
+            Suggested: {suggestedDarkFrames} frames ({suggestedChunkCount} × {zChunkEdge}-frame OME-Zarr Z-chunk{suggestedChunkCount >
+            1
+              ? 's'
+              : ''} at L{instrument.state.output.max_level}). Collected with all lasers off into
+            <code>dark/before.ome.zarr</code> before the scan, and into <code>dark/after.ome.zarr</code> if total scan time
+            exceeds 10 min.
+          </p>
         </div>
       </Section>
     {/if}

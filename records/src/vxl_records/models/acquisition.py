@@ -139,6 +139,8 @@ class LineScan(RecordModel):
     camera_rate_fraction: float | None = Field(default=0.95, gt=0, lt=1, allow_inf_nan=False)
     target_frame_rate_hz: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     y_stack: YScanRows | None = None
+    acquire_dark_frames: bool = False
+    dark_frame_count: int = Field(default=256, ge=1, le=4096)
 
     def resolve_camera_sampling_yz(self, camera_id: str, index: int = 0) -> CameraSamplingYZ:
         """Return the configured or default (y, z) sampling in µm for ``camera_id``."""
@@ -172,6 +174,8 @@ class PlannedVolume(RecordModel):
     z_end: float = Field(allow_inf_nan=False)
     routes: dict[str, str] = Field(default_factory=dict)
     scan: LineScan | None = None
+    acquire_dark_frames: bool = False
+    dark_frame_count: int = Field(default=256, ge=1, le=4096)
 
     @model_validator(mode="after")
     def _check_z_range(self) -> Self:
@@ -193,6 +197,7 @@ class AcquisitionVolume(PlannedVolume):
     status: VolumeStatus = VolumeStatus.PENDING
     datasets: dict[ChannelName, Dataset] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    darkfield: dict[str, JsonValue] | None = None
 
     def transition(self, status: VolumeStatus) -> Self:
         """Return this volume in a valid next lifecycle state."""
@@ -343,6 +348,11 @@ class AcquisitionManifest(RecordModel):
     def register_datasets(self, volume_index: int, datasets: Mapping[str, Dataset]) -> Self:
         """Register the channel datasets for one volume."""
         volume = self._get_volume(volume_index).register_datasets(datasets)
+        return self._replace_volume(volume_index, volume)
+
+    def set_volume_darkfield(self, volume_index: int, darkfield: Mapping[str, JsonValue]) -> Self:
+        """Attach or update darkfield calibration metadata for one volume."""
+        volume = self._get_volume(volume_index).model_copy(update={"darkfield": dict(darkfield)})
         return self._replace_volume(volume_index, volume)
 
     def complete_volume(self, volume_index: int, *, warnings: list[str] | None = None) -> Self:

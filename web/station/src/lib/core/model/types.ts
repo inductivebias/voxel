@@ -276,6 +276,8 @@ export interface LineScan {
   target_frame_rate_hz?: number | null;
   y_stack?: { start: number; end: number; step: number } | null;
   camera_sampling_yz?: Record<string, CameraSamplingYZ>;
+  acquire_dark_frames?: boolean;
+  dark_frame_count?: number;
 }
 
 /** Persisted acquisition intent expanded into concrete volumes by the instrument. */
@@ -287,6 +289,8 @@ export interface AcquisitionTask {
   z: ZDefinition;
   traversal: TileOrder;
   iteration: IterationOrder;
+  acquire_dark_frames?: boolean;
+  dark_frame_count?: number;
 }
 
 /** Tile acquisition ordering strategy. */
@@ -399,6 +403,8 @@ export interface TaskPatch {
   z?: ZDefinition;
   traversal?: TileOrder;
   iteration?: IterationOrder;
+  acquire_dark_frames?: boolean;
+  dark_frame_count?: number;
 }
 
 // ---- preview control payloads ----
@@ -504,6 +510,8 @@ export interface PlannedVolume {
   z_step: number;
   z_end: number;
   routes: Record<string, string>;
+  acquire_dark_frames?: boolean;
+  dark_frame_count?: number;
 }
 
 /** One task/profile capture and its channel datasets. */
@@ -511,6 +519,7 @@ export interface AcquisitionVolume extends PlannedVolume {
   status: VolumeStatus;
   datasets: Record<string, AcquisitionDataset>;
   warnings?: string[];
+  darkfield?: Record<string, unknown> | null;
 }
 
 /** Parameters of an acquisition run; `task_ids=null` → every planned task in traversal order. */
@@ -519,6 +528,8 @@ export interface AcquisitionRequest {
   task_ids?: string[] | null;
   operator?: string | null;
   continue_on_error?: boolean | null;
+  acquire_dark_frames?: boolean | null;
+  dark_frame_count?: number | null;
 }
 
 export interface AcquisitionFailure {

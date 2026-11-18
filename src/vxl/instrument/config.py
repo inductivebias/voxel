@@ -457,6 +457,8 @@ class AcquisitionTask(FrozenModel):
     z: ZDefinition
     traversal: TileOrder = TileOrder.SNAKE_ROW
     iteration: IterationOrder = IterationOrder.POSITION_MAJOR
+    acquire_dark_frames: bool = False
+    dark_frame_count: int = Field(default=256, ge=1, le=4096)
 
     @model_validator(mode="after")
     def _check_line_scan(self) -> Self:
@@ -464,6 +466,26 @@ class AcquisitionTask(FrozenModel):
             self.xy.mode != "explicit_points" or len(self.xy.points) != 1 or self.z.start != self.z.end
         ):
             raise ValueError("a line scan needs one anchor position and a fixed Z hold position")
+        if self.scan is not None:
+            scan_fields = self.scan.model_fields_set
+            task_fields = self.model_fields_set
+            acq_dark = self.acquire_dark_frames
+            dark_cnt = self.dark_frame_count
+            if "acquire_dark_frames" in scan_fields and "acquire_dark_frames" not in task_fields:
+                acq_dark = self.scan.acquire_dark_frames
+            if "dark_frame_count" in scan_fields and "dark_frame_count" not in task_fields:
+                dark_cnt = self.scan.dark_frame_count
+            if acq_dark != self.acquire_dark_frames or dark_cnt != self.dark_frame_count:
+                object.__setattr__(self, "acquire_dark_frames", acq_dark)
+                object.__setattr__(self, "dark_frame_count", dark_cnt)
+            if self.scan.acquire_dark_frames != acq_dark or self.scan.dark_frame_count != dark_cnt:
+                object.__setattr__(
+                    self,
+                    "scan",
+                    self.scan.model_copy(
+                        update={"acquire_dark_frames": acq_dark, "dark_frame_count": dark_cnt}
+                    ),
+                )
         return self
 
     @field_validator("profiles")
@@ -482,6 +504,8 @@ class TaskPatch(Patch):
     z: ZDefinition | None = None
     traversal: TileOrder | None = None
     iteration: IterationOrder | None = None
+    acquire_dark_frames: bool | None = None
+    dark_frame_count: Annotated[int, Field(ge=1, le=4096)] | None = None
 
 
 class WriterPatch(Patch):

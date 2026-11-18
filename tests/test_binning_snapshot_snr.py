@@ -488,3 +488,112 @@ def test_anscombe_sqrt_and_linear_noise_bounded_quantization(tmp_path: Path) -> 
     meta = json.loads((zarr_root / "zarr.json").read_text())
     assert meta["attributes"]["preprocessing"]["bin"] == [1, 2, 3]
     assert (zarr_root / "0" / "c" / "0" / "0" / "0" / "0").exists()
+
+
+# ── 5. Dark-Frame Subdirectory & Metadata in OME-Zarr ───────────────────────────
+
+
+async def test_dark_frames_subdirectory_and_metadata_in_ome_zarr(tmp_path: Path) -> None:
+    """Verify writing dark/before.ome.zarr and dark/after.ome.zarr inside a scan's .ome.zarr
+    and persisting attributes.darkfield in zarr.json."""
+    from pathlib import PurePosixPath
+    from unittest.mock import MagicMock
+
+    from ome_zarr_writer import (
+        Compression,
+        Dtype,
+        Local,
+        OMEZarrWriter,
+        ScaleLevel,
+        UIVec3D,
+        UVec3D,
+        WriterConfig,
+    )
+    from vxl_records import StorageSpec
+
+    from vxl.devices.camera.base import CameraController
+
+    rng = np.random.default_rng(77)
+    scan_target = tmp_path / "run" / "volumes" / "000001" / "single_gfp" / "gfp"
+    dark_before_target = Path(f"{scan_target}.ome.zarr") / "dark" / "before"
+    dark_after_target = Path(f"{scan_target}.ome.zarr") / "dark" / "after"
+
+    dark_cfg = WriterConfig(
+        volume_shape=UIVec3D(z=64, y=32, x=32),
+        voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
+        dtype=Dtype.UINT16,
+        max_level=ScaleLevel.L0,
+        compression=Compression.BLOSC_ZSTD,
+        dark_floor=0,
+        skip_empty_chunks=False,
+    )
+    scan_cfg = WriterConfig(
+        volume_shape=UIVec3D(z=128, y=32, x=32),
+        voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
+        dtype=Dtype.UINT16,
+        max_level=ScaleLevel.L0,
+        compression=Compression.BLOSC_ZSTD,
+        darkfield={
+            "enabled": True,
+            "frames": 64,
+            "lasers_off": True,
+            "before": "dark/before.ome.zarr",
+            "after": None,
+        },
+    )
+
+    writer = OMEZarrWriter(slots=2)
+    try:
+        # 1. Pre-scan dark frames in <scan>.ome.zarr/dark/before.ome.zarr
+        writer.begin_stack(dark_cfg, Local(target=dark_before_target))
+        for _ in range(64):
+            with writer.new_frame() as frame:
+                frame[...] = rng.integers(95, 108, size=(32, 32), dtype=np.uint16)
+        writer.end_stack()
+
+        # 2. Main scan stack in <scan>.ome.zarr (reusing writer ring)
+        writer.begin_stack(scan_cfg, Local(target=scan_target))
+        for _ in range(128):
+            with writer.new_frame() as frame:
+                frame[...] = rng.integers(100, 1500, size=(32, 32), dtype=np.uint16)
+        writer.end_stack()
+
+        # 3. Post-scan dark frames in <scan>.ome.zarr/dark/after.ome.zarr
+        writer.begin_stack(dark_cfg, Local(target=dark_after_target))
+        for _ in range(64):
+            with writer.new_frame() as frame:
+                frame[...] = rng.integers(96, 109, size=(32, 32), dtype=np.uint16)
+        writer.end_stack()
+    finally:
+        writer.close()
+
+    zarr_root = Path(f"{scan_target}.ome.zarr")
+    assert (zarr_root / "dark" / "before.ome.zarr" / "zarr.json").is_file()
+    assert (zarr_root / "dark" / "after.ome.zarr" / "zarr.json").is_file()
+
+    # Update root zarr.json attributes.darkfield via CameraController.update_dataset_darkfield
+    ctrl = MagicMock(spec=CameraController)
+    ctrl._system = MagicMock()
+    ctrl._system.resolve_storage.return_value = Local(target=scan_target)
+
+    async def _run_sync(fn, *args, **kwargs):
+        return fn(*args, **kwargs)
+
+    ctrl._run_sync = _run_sync
+    updated_meta = {
+        "enabled": True,
+        "frames": 64,
+        "lasers_off": True,
+        "before": "dark/before.ome.zarr",
+        "after": "dark/after.ome.zarr",
+        "task_scan_duration_s": 725.4,
+    }
+    await CameraController.update_dataset_darkfield(
+        ctrl,
+        storage=StorageSpec(path=PurePosixPath("run")),
+        subpath=PurePosixPath("volumes/000001/single_gfp/gfp"),
+        darkfield=updated_meta,
+    )
+
+    root_meta = json.loads((zarr_root / "zarr.json").read_text(encoding="utf-8"))
+    assert root_meta["attributes"]["darkfield"] == updated_meta

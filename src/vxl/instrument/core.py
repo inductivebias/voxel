@@ -4,6 +4,7 @@ import getpass
 import json
 import logging
 import math
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
@@ -89,6 +90,7 @@ async def _gather_hardware[T](*calls: Awaitable[T]) -> list[T]:
 # How long a continuous pass may sit stopped short of its frames before it fails.
 _PASS_STOP_GRACE_S = 1.0
 _RECORDER_FINISH_TIMEOUT_S = 5.0
+DEFAULT_DARK_FRAME_POST_SCAN_THRESHOLD_S = 600.0  # 10 minutes
 
 
 @dataclass
@@ -134,6 +136,8 @@ class AcquisitionRequest(BaseModel):
     task_ids: list[str] | None = None
     operator: str | None = None
     continue_on_error: bool | None = None
+    acquire_dark_frames: bool | None = None
+    dark_frame_count: int | None = Field(default=None, ge=1, le=4096)
 
 
 class AcquisitionPhase(StrEnum):
@@ -271,6 +275,7 @@ class Instrument:
         self._resume_event.set()
         self._continue_on_error_next = False
         self._snapshot_active = False
+        self._dark_frame_post_scan_threshold_s: float = DEFAULT_DARK_FRAME_POST_SCAN_THRESHOLD_S
         self.fov: ReactiveQuery[tuple[float, float]] = ReactiveQuery(fn=self._compute_current_fov)
         self.profile_fovs = Computed[dict[str, dict[str, Bounds]]](
             self._store,
@@ -973,7 +978,19 @@ class Instrument:
         def prepare() -> AcquisitionTask:
             for existing in self._store.value.plan:
                 if existing.id == task_id:
-                    return AcquisitionTask.model_validate({**existing.model_dump(), **patch.changes()})
+                    merged = {**existing.model_dump(), **patch.changes()}
+                    if merged.get("scan") is not None:
+                        scan_dict = dict(merged["scan"])
+                        if "acquire_dark_frames" in patch.model_fields_set and patch.acquire_dark_frames is not None:
+                            scan_dict["acquire_dark_frames"] = patch.acquire_dark_frames
+                        elif "scan" in patch.model_fields_set and patch.scan is not None:
+                            merged["acquire_dark_frames"] = patch.scan.acquire_dark_frames
+                        if "dark_frame_count" in patch.model_fields_set and patch.dark_frame_count is not None:
+                            scan_dict["dark_frame_count"] = patch.dark_frame_count
+                        elif "scan" in patch.model_fields_set and patch.scan is not None:
+                            merged["dark_frame_count"] = patch.scan.dark_frame_count
+                        merged["scan"] = scan_dict
+                    return AcquisitionTask.model_validate(merged)
             raise OperationRejectedError(f"No such task '{task_id}'")
 
         return await self._undoable_edit("Update task", prepare, self._write_task, edit_id=edit_id)
@@ -1048,7 +1065,21 @@ class Instrument:
             if selected is not None and (unknown := selected - known):
                 raise OperationRejectedError("; ".join(f"No such task '{task_id}'" for task_id in sorted(unknown)))
             volumes = [
-                AcquisitionVolume.model_validate(volume.model_dump())
+                AcquisitionVolume.model_validate(
+                    {
+                        **volume.model_dump(),
+                        **(
+                            {"acquire_dark_frames": request.acquire_dark_frames}
+                            if request.acquire_dark_frames is not None
+                            else {}
+                        ),
+                        **(
+                            {"dark_frame_count": request.dark_frame_count}
+                            if request.dark_frame_count is not None
+                            else {}
+                        ),
+                    }
+                )
                 for volume in self.planned_volumes.value
                 if selected is None or volume.task in selected
             ]
@@ -1998,6 +2029,9 @@ class Instrument:
                     scan=task.scan,
                     z_end=z.end,
                     routes=routes,
+                    acquire_dark_frames=task.acquire_dark_frames
+                    or (task.scan.acquire_dark_frames if task.scan is not None else False),
+                    dark_frame_count=task.dark_frame_count,
                 )
                 for point, z, routes, profile in ordered
             )
@@ -2070,10 +2104,42 @@ class Instrument:
     async def _execute_acquisition(self, manifest: AcquisitionManifest) -> None:
         """Execute every volume in a running manifest and finalize the acquisition."""
         diagnostics: list[dict[str, Any]] = []
+        first_vol_for_key: dict[tuple[str, str], int] = {}
+        last_vol_for_key: dict[tuple[str, str], int] = {}
+        for idx, vol in enumerate(manifest.volumes):
+            key = (vol.task, vol.profile)
+            if key not in first_vol_for_key:
+                first_vol_for_key[key] = idx
+            last_vol_for_key[key] = idx
+        darkfield_states: dict[tuple[str, str], dict[str, Any]] = {}
         try:
             for volume_index in range(len(manifest.volumes)):
+                vol = manifest.volumes[volume_index]
+                key = (vol.task, vol.profile)
+                if vol.acquire_dark_frames and key not in darkfield_states:
+                    before_ts = await self._capture_dark_frames(
+                        manifest,
+                        vol,
+                        first_volume_index=first_vol_for_key[key],
+                        phase_tag="before",
+                    )
+                    darkfield_states[key] = {
+                        "first_volume_index": first_vol_for_key[key],
+                        "frames": vol.dark_frame_count,
+                        "before_acquired_at": before_ts,
+                        "after_acquired_at": None,
+                        "scan_started_mono": time.monotonic(),
+                        "task_scan_duration_s": None,
+                        "completed_volumes": [],
+                    }
                 try:
-                    manifest = await self._execute_volume(manifest, volume_index)
+                    manifest = await self._execute_volume(
+                        manifest,
+                        volume_index,
+                        darkfield_state=darkfield_states.get(key),
+                    )
+                    if key in darkfield_states:
+                        darkfield_states[key]["completed_volumes"].append(volume_index)
                 except Exception as error:
                     if not manifest.continue_on_error or self._cleanup_errors:
                         raise
@@ -2097,6 +2163,19 @@ class Instrument:
                         "Diagnostic acquisition: strip %d failed; cleanup succeeded, continuing to the next strip",
                         volume_index + 1,
                     )
+                if key in darkfield_states and volume_index == last_vol_for_key[key]:
+                    df_state = darkfield_states[key]
+                    duration_s = round(time.monotonic() - float(df_state["scan_started_mono"]), 3)
+                    df_state["task_scan_duration_s"] = duration_s
+                    if duration_s >= self._dark_frame_post_scan_threshold_s and not self._cleanup_errors:
+                        after_ts = await self._capture_dark_frames(
+                            manifest,
+                            vol,
+                            first_volume_index=first_vol_for_key[key],
+                            phase_tag="after",
+                        )
+                        df_state["after_acquired_at"] = after_ts
+                    manifest = await self._finalize_darkfield_metadata(manifest, key, df_state)
                 if self._pause_requested and volume_index + 1 < len(manifest.volumes):
                     if self._uses_continuous(manifest.volumes[volume_index]):
                         with suppress(Exception):
@@ -2154,7 +2233,263 @@ class Instrument:
             except Exception:
                 logger.exception("Failed to close the log window for acquisition %s", manifest.id)
 
-    async def _execute_volume(self, manifest: AcquisitionManifest, volume_index: int) -> AcquisitionManifest:
+    def _build_channel_darkfield_metadata(
+        self,
+        *,
+        first_volume_index: int,
+        volume_index: int,
+        profile_id: str,
+        channel_id: str,
+        darkfield_state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Build the ``attributes.darkfield`` dict for one channel's OME-Zarr dataset."""
+        first_vol_dir = f"{first_volume_index + 1:06d}"
+        is_primary = volume_index == first_volume_index
+        rel_before = (
+            "dark/before.ome.zarr"
+            if is_primary
+            else f"../../../{first_vol_dir}/{profile_id}/{channel_id}.ome.zarr/dark/before.ome.zarr"
+        )
+        acq_before = f"volumes/{first_vol_dir}/{profile_id}/{channel_id}.ome.zarr/dark/before.ome.zarr"
+        after_at = darkfield_state.get("after_acquired_at")
+        rel_after = (
+            (
+                "dark/after.ome.zarr"
+                if is_primary
+                else f"../../../{first_vol_dir}/{profile_id}/{channel_id}.ome.zarr/dark/after.ome.zarr"
+            )
+            if after_at is not None
+            else None
+        )
+        acq_after = (
+            f"volumes/{first_vol_dir}/{profile_id}/{channel_id}.ome.zarr/dark/after.ome.zarr"
+            if after_at is not None
+            else None
+        )
+        return {
+            "enabled": True,
+            "frames": int(darkfield_state["frames"]),
+            "lasers_off": True,
+            "post_scan_threshold_s": self._dark_frame_post_scan_threshold_s,
+            "task_scan_duration_s": darkfield_state.get("task_scan_duration_s"),
+            "before": rel_before,
+            "before_acquired_at": darkfield_state.get("before_acquired_at"),
+            "acquisition_before": acq_before,
+            "after": rel_after,
+            "after_acquired_at": after_at,
+            "acquisition_after": acq_after,
+        }
+
+    def _build_volume_darkfield_metadata(
+        self,
+        *,
+        volume_index: int,
+        profile_id: str,
+        channel_ids: Sequence[str],
+        darkfield_state: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """Build the volume-level darkfield metadata summary for manifest and ``scan.json``."""
+        first_volume_index = int(darkfield_state["first_volume_index"])
+        per_channel = {
+            ch_id: self._build_channel_darkfield_metadata(
+                first_volume_index=first_volume_index,
+                volume_index=volume_index,
+                profile_id=profile_id,
+                channel_id=ch_id,
+                darkfield_state=darkfield_state,
+            )
+            for ch_id in channel_ids
+        }
+        first_ch = next(iter(per_channel.values()), {})
+        return {
+            "enabled": True,
+            "frames": int(darkfield_state["frames"]),
+            "lasers_off": True,
+            "post_scan_threshold_s": self._dark_frame_post_scan_threshold_s,
+            "task_scan_duration_s": darkfield_state.get("task_scan_duration_s"),
+            "before": first_ch.get("before"),
+            "before_acquired_at": darkfield_state.get("before_acquired_at"),
+            "after": first_ch.get("after"),
+            "after_acquired_at": darkfield_state.get("after_acquired_at"),
+            "channels": per_channel,
+        }
+
+    async def _capture_dark_frames(
+        self,
+        manifest: AcquisitionManifest,
+        volume: PlannedVolume,
+        *,
+        first_volume_index: int,
+        phase_tag: Literal["before", "after"],
+    ) -> str:
+        """Collect ``volume.dark_frame_count`` frames with all lasers inhibited into
+        ``volumes/<first_volume_index>/<profile>/<ch_id>.ome.zarr/dark/<phase_tag>.ome.zarr``."""
+        num_frames = int(volume.dark_frame_count)
+        channels = {uid: self._channels[uid] for uid in self._store.value.imaging.profiles[volume.profile].channels}
+        base_settings = self._store.value.output
+        dark_settings = base_settings.model_copy(
+            update={
+                "dark_floor": 0,
+                "skip_empty_chunks": False,
+                "keep_bits": None,
+                "lossy_step_noise": None,
+            }
+        )
+        batch_z = dark_settings.batch_z
+        detection_ids = list(self._hal.topology.detection)
+        base_subpath = PurePosixPath(
+            "volumes",
+            f"{first_volume_index + 1:06d}",
+            volume.profile,
+        )
+        logger.info(
+            "Capturing %d %s-scan dark frames (all lasers off) for task %s / profile %s",
+            num_frames,
+            phase_tag,
+            volume.task,
+            volume.profile,
+        )
+        await self._update_acquisition(
+            manifest,
+            volume_index=first_volume_index,
+            phase=AcquisitionPhase.CONFIGURING,
+            frames_captured=0,
+        )
+        capture_error: BaseException | None = None
+        try:
+            await self._inhibit_laser_outputs()
+            await _gather_hardware(*(ch.disable_laser_output() for ch in self._all_lasers()))
+            await self._apply_profile(volume.profile)
+            async with self._lock:
+                await self._ensure_routes(volume.routes)
+            # Re-verify lasers remain inhibited before opening dark-frame stacks
+            await self._inhibit_laser_outputs()
+
+            def _dark_geom(ch_id: str) -> dict[str, Any]:
+                channel = self._channel_config(ch_id)
+                kwargs: dict[str, Any] = {
+                    "channel_label": f"{channel.label or ch_id} (dark {phase_tag})",
+                    "channel_color": "FFFFFF",
+                }
+                if volume.scan is not None:
+                    cam_idx = detection_ids.index(channel.detection) if channel.detection in detection_ids else 0
+                    sampling = volume.scan.resolve_camera_sampling_yz(channel.detection, cam_idx)
+                    kwargs["voxel_size_yx"] = (sampling.z, sampling.y)
+                return kwargs
+
+            geom = {ch_id: _dark_geom(ch_id) for ch_id in channels}
+            await _gather_hardware(
+                *(
+                    ch.camera.open_stack(
+                        storage=manifest.storage,
+                        subpath=base_subpath / f"{ch_id}.ome.zarr" / "dark" / phase_tag,
+                        num_frames=num_frames,
+                        z_step=volume.z_step,
+                        magnification=self._hal.topology.detection[self._channel_config(ch_id).detection].magnification,
+                        settings=dark_settings,
+                        **geom[ch_id],
+                    )
+                    for ch_id, ch in channels.items()
+                )
+            )
+            signals = self._store.value.imaging.profiles[volume.profile].sync.values()
+            period = max((float(s.duration) + float(s.rest_time) for s in signals), default=1.0)
+            for batch_idx in range(math.ceil(num_frames / batch_z)):
+                frames = min(batch_z, num_frames - batch_idx * batch_z)
+                await _gather_hardware(*(ch.camera.begin_batch(frames) for ch in channels.values()))
+                await self._start_signal_generators(repeat=frames)
+                try:
+                    async with asyncio.timeout(30.0 + 2 * frames * period):
+                        while True:
+                            states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
+                            if all(state is CaptureState.DONE for state in states):
+                                break
+                            await asyncio.sleep(0.05)
+                finally:
+                    await self._stop_signal_generators()
+        except BaseException as error:
+            capture_error = error
+        finally:
+            with suppress(Exception):
+                await self._inhibit_laser_outputs()
+            with suppress(Exception):
+                await self._stop_signal_generators()
+            close_errors = await self._close_stacks(list(channels.values()))
+            self._cleanup_errors.extend(close_errors)
+        if capture_error is not None:
+            raise capture_error
+        if close_errors:
+            raise ExceptionGroup(
+                f"dark-frame ({phase_tag}) stack close failed for task {volume.task} / profile {volume.profile}",
+                close_errors,
+            )
+        acquired_at = datetime.datetime.now(tz=datetime.UTC).isoformat()
+        logger.info(
+            "Captured %d %s-scan dark frames: task %s / profile %s",
+            num_frames,
+            phase_tag,
+            volume.task,
+            volume.profile,
+        )
+        return acquired_at
+
+    async def _finalize_darkfield_metadata(
+        self,
+        manifest: AcquisitionManifest,
+        key: tuple[str, str],
+        darkfield_state: Mapping[str, Any],
+    ) -> AcquisitionManifest:
+        """Update OME-Zarr ``zarr.json``, ``scan.json``, and manifest records with final darkfield metadata."""
+        _, profile_id = key
+        channels = {uid: self._channels[uid] for uid in self._store.value.imaging.profiles[profile_id].channels}
+        first_volume_index = int(darkfield_state["first_volume_index"])
+        for vol_idx in darkfield_state.get("completed_volumes", []):
+            vol_subpath = PurePosixPath("volumes", f"{vol_idx + 1:06d}", profile_id)
+            await _gather_hardware(
+                *(
+                    ch.camera.update_dataset_darkfield(
+                        storage=manifest.storage,
+                        subpath=vol_subpath / ch_id,
+                        darkfield=self._build_channel_darkfield_metadata(
+                            first_volume_index=first_volume_index,
+                            volume_index=vol_idx,
+                            profile_id=profile_id,
+                            channel_id=ch_id,
+                            darkfield_state=darkfield_state,
+                        ),
+                    )
+                    for ch_id, ch in channels.items()
+                )
+            )
+            vol_darkfield = self._build_volume_darkfield_metadata(
+                volume_index=vol_idx,
+                profile_id=profile_id,
+                channel_ids=list(channels.keys()),
+                darkfield_state=darkfield_state,
+            )
+            scan_json = self._system.resolve_storage(manifest.storage, vol_subpath).target / "scan.json"
+            if scan_json.exists():
+                def _patch_scan_json(p: Path | S3Path = scan_json, df: dict[str, Any] = vol_darkfield) -> None:
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                    raw["darkfield"] = df
+                    _write_json(p, raw)
+
+                await asyncio.to_thread(_patch_scan_json)
+            manifest = await self._records.acquisitions.set_volume_darkfield(
+                manifest.id,
+                volume_index=vol_idx,
+                darkfield=vol_darkfield,
+            )
+        await self._update_acquisition(manifest)
+        return manifest
+
+    async def _execute_volume(
+        self,
+        manifest: AcquisitionManifest,
+        volume_index: int,
+        *,
+        darkfield_state: Mapping[str, Any] | None = None,
+    ) -> AcquisitionManifest:
         """Execute and persist the complete lifecycle of one manifest volume.
 
         Cleanup inhibits laser output, stops DAQ generation, resets the stepper, and finalizes writers.
@@ -2197,12 +2532,25 @@ class Instrument:
             if planned is None and num_frames > 1:
                 await scanning_axis.configure_ttl_stepper(TTLStepperConfig(step_mode=StepMode.RELATIVE))
                 await scanning_axis.queue_relative_move(volume.z_step)
-            manifest = await self._open_stacks(manifest, volume_index, subpath, channels)
+            manifest = await self._open_stacks(
+                manifest,
+                volume_index,
+                subpath,
+                channels,
+                darkfield_state=darkfield_state,
+            )
             await self._update_acquisition(manifest, phase=AcquisitionPhase.CAPTURING)
 
             if planned is not None and progress is not None:
                 capture_warnings = await self._capture_continuous(
-                    manifest, volume, subpath, channels, planned, progress
+                    manifest,
+                    volume,
+                    subpath,
+                    channels,
+                    planned,
+                    progress,
+                    darkfield_state=darkfield_state,
+                    volume_index=volume_index,
                 )
                 frames_done = num_frames
                 await self._update_acquisition(manifest, frames_captured=num_frames)
@@ -2306,6 +2654,8 @@ class Instrument:
         volume_index: int,
         subpath: PurePosixPath,
         channels: Mapping[str, Channel],
+        *,
+        darkfield_state: Mapping[str, Any] | None = None,
     ) -> AcquisitionManifest:
         """Open every channel's dataset for the volume and register where each is written."""
         volume = manifest.volumes[volume_index]
@@ -2319,6 +2669,14 @@ class Instrument:
                 "channel_label": channel.label or ch_id,
                 "channel_color": "FFFFFF" if channel.colormap == "white" else channel.colormap.lstrip("#").upper(),
             }
+            if darkfield_state is not None:
+                kwargs["darkfield"] = self._build_channel_darkfield_metadata(
+                    first_volume_index=int(darkfield_state["first_volume_index"]),
+                    volume_index=volume_index,
+                    profile_id=volume.profile,
+                    channel_id=ch_id,
+                    darkfield_state=darkfield_state,
+                )
             if volume.scan is not None:
                 cam_idx = detection_ids.index(channel.detection) if channel.detection in detection_ids else 0
                 sampling = volume.scan.resolve_camera_sampling_yz(channel.detection, cam_idx)
@@ -2546,6 +2904,9 @@ class Instrument:
         channels: Mapping[str, Channel],
         planned: ContinuousPass,
         progress: "_PassProgress",
+        *,
+        darkfield_state: Mapping[str, Any] | None = None,
+        volume_index: int = 0,
     ) -> list[str]:
         """Capture every frame of the volume in one constant-speed pass and record where each was taken.
 
@@ -2667,6 +3028,16 @@ class Instrument:
             "prepared": prepared,
             "final": final,
             "recorded": recorded.model_dump(mode="json"),
+            "darkfield": (
+                self._build_volume_darkfield_metadata(
+                    volume_index=volume_index,
+                    profile_id=volume.profile,
+                    channel_ids=list(channels.keys()),
+                    darkfield_state=darkfield_state,
+                )
+                if darkfield_state is not None
+                else None
+            ),
         }
         target = self._system.resolve_storage(manifest.storage, subpath).target / "scan.json"
         await asyncio.to_thread(_write_json, target, record)

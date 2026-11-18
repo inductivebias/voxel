@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import shutil
 import time
@@ -615,6 +616,7 @@ class CameraController(DeviceController["Camera"]):
         shear_yz: float = 0.0,
         channel_label: str = "channel 0",
         channel_color: str = "FFFFFF",
+        darkfield: dict[str, Any] | None = None,
     ) -> DatasetLocation:
         """Prepare the camera + writer for a stack and return its durable dataset location.
 
@@ -672,6 +674,7 @@ class CameraController(DeviceController["Camera"]):
             filter_size=filter_size,
             raw_frame_y=frame.y,
             raw_frame_x=frame.x,
+            darkfield=darkfield,
         )
 
         # The coordinator persists across volumes so its ring is reused. Ring sizing happens inside
@@ -697,6 +700,31 @@ class CameraController(DeviceController["Camera"]):
         if target is None:
             raise RuntimeError("writer did not expose a dataset target")
         return self._system.describe_dataset_location(storage, target)
+
+    @describe(label="Update Dataset Darkfield Metadata")
+    async def update_dataset_darkfield(
+        self,
+        *,
+        storage: StorageSpec,
+        subpath: PurePosixPath,
+        darkfield: dict[str, Any],
+    ) -> None:
+        """Update ``attributes.darkfield`` in the root ``zarr.json`` of ``<subpath>.ome.zarr``."""
+
+        def _update() -> None:
+            dest = self._system.resolve_storage(storage, subpath)
+            target = dest.target
+            if not target.name.endswith(".ome.zarr"):
+                target = target.with_name(f"{target.name}.ome.zarr")
+            zarr_json = target / "zarr.json"
+            if not zarr_json.exists():
+                return
+            raw = json.loads(zarr_json.read_text(encoding="utf-8"))
+            attrs = raw.setdefault("attributes", {})
+            attrs["darkfield"] = darkfield
+            zarr_json.write_text(f"{json.dumps(raw, indent=2)}\n", encoding="utf-8")
+
+        await self._run_sync(_update)
 
     def _size_ring(self, config: WriterConfig) -> int:
         """Choose the depth of a ring the writer is about to allocate.
