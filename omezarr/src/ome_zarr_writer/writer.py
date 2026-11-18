@@ -43,17 +43,20 @@ from vxlib.vector import UIVec3D, UVec3D, Vec3D
 
 from ome_zarr_writer.array import ArrayWriter
 from ome_zarr_writer.dataset import (
+    BinningMode,
     Compression,
     DownscaleType,
     Dtype,
+    LossyDomain,
     OmeZarrDataset,
+    PreFilterType,
     ScaleLevel,
     SpaceUnit,
     Zarr3ArrayMeta,
     Zarr3GroupMeta,
 )
-from ome_zarr_writer.pyramid_gpu import is_gpu_available
-from ome_zarr_writer.sizing import MIN_SLOTS, RingSizingError, per_slot_bytes
+from ome_zarr_writer.pyramid_gpu import get_free_gpu_bytes, is_gpu_available
+from ome_zarr_writer.sizing import MIN_SLOTS, RingSizingError, gpu_workspace_bytes, per_slot_bytes, vram_fits_batch
 from ome_zarr_writer.slot import BatchResult, BatchSlot, OutputSetup, SlotStage
 from ome_zarr_writer.storage import Local, S3Store, StagedS3, StagingConfig, Storage
 from ome_zarr_writer.transfer import TransferJob, run_s5cmd
@@ -106,6 +109,21 @@ class WriterSettings(BaseModel):
         default=False,
         description="Omit all-fill_value chunks from Zarr v3 shard index and skip empty shards",
     )
+    lossy_step_noise: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=10.0,
+        description="Quantisation step as a multiple of estimated noise σ (e.g. 1.0 rounds to 1σ steps; None or 0 disables)",
+    )
+    lossy_domain: LossyDomain = Field(
+        default=LossyDomain.SQRT,
+        description="Domain for noise estimation and quantisation ('sqrt' Anscombe or 'linear')",
+    )
+    noise_sigma: float | None = Field(
+        default=None,
+        ge=0.0,
+        description="Explicit noise σ override (None auto-estimates from MAD of first differences on first batch)",
+    )
     downscale_type: DownscaleType = Field(
         default=DownscaleType.GAUSSIAN,
         description="Pyramid downsample method. Gaussian (anti-aliased) is the default for display-quality",
@@ -147,6 +165,36 @@ class WriterConfig(WriterSettings):
     shear_yz: float = 0.0
     channel_label: str = "channel 0"
     channel_color: str = "FFFFFF"
+    bin_y: int = Field(default=1, ge=1, le=16, description="Per-camera 2D rectangular binning factor in Y")
+    bin_x: int = Field(default=1, ge=1, le=16, description="Per-camera 2D rectangular binning factor in X")
+    bin_mode: BinningMode = Field(
+        default=BinningMode.MEAN,
+        description="Reduction mode for rectangular (bin_y, bin_x) binning",
+    )
+    pre_filter: PreFilterType = Field(
+        default=PreFilterType.NONE,
+        description="Per-camera 2D spatial pre-filter applied before rectangular binning",
+    )
+    filter_size: int = Field(default=3, ge=3, le=5, description="Spatial pre-filter kernel size (3 or 5)")
+    highpass_add: float = Field(
+        default=100.0,
+        description="Pedestal offset added after high-pass background subtraction",
+    )
+    raw_frame_y: int | None = Field(
+        default=None,
+        description="Raw camera frame height before rectangular binning (defaults to volume_shape.y * bin_y)",
+    )
+    raw_frame_x: int | None = Field(
+        default=None,
+        description="Raw camera frame width before rectangular binning (defaults to volume_shape.x * bin_x)",
+    )
+
+    @cached_property
+    def raw_batch_shape(self) -> UIVec3D:
+        """Raw (pre-binning) L0 batch shape collected from the camera."""
+        ry = self.raw_frame_y if self.raw_frame_y is not None else self.volume_shape.y * self.bin_y
+        rx = self.raw_frame_x if self.raw_frame_x is not None else self.volume_shape.x * self.bin_x
+        return UIVec3D(z=self.batch_z, y=ry, x=rx)
 
     @cached_property
     def shard_shape(self) -> UIVec3D:
@@ -207,6 +255,33 @@ class WriterConfig(WriterSettings):
                 },
             )
 
+        has_preproc = (
+            self.bin_y > 1
+            or self.bin_x > 1
+            or self.pre_filter != PreFilterType.NONE
+            or self.keep_bits is not None
+            or self.dark_floor > 0
+            or (self.lossy_step_noise is not None and self.lossy_step_noise > 0.0 and self.lossy_domain != LossyDomain.NONE)
+        )
+        preprocessing: dict[str, Any] | None = None
+        if has_preproc:
+            preprocessing = {
+                "bin": [1, int(self.bin_y), int(self.bin_x)],
+                "bin_mode": self.bin_mode.value,
+                "pre_filter": self.pre_filter.value,
+                "filter_size": int(self.filter_size),
+                "highpass_add": float(self.highpass_add) if self.pre_filter == PreFilterType.HIGHPASS else None,
+                "dark_floor": int(self.dark_floor),
+                "keep_bits": self.keep_bits,
+                "lossy_step_noise": self.lossy_step_noise,
+                "lossy_domain": (
+                    self.lossy_domain.value
+                    if (self.lossy_step_noise is not None and self.lossy_step_noise > 0.0)
+                    else None
+                ),
+                "noise_sigma": self.noise_sigma,
+            }
+
         group = Zarr3GroupMeta.multiscale(
             voxel_size=self.voxel_size,
             voxel_unit=self.voxel_unit,
@@ -218,6 +293,9 @@ class WriterConfig(WriterSettings):
             shear_yz=self.shear_yz,
             channel_label=self.channel_label,
             channel_color=self.channel_color,
+            bin_y=self.bin_y,
+            bin_x=self.bin_x,
+            preprocessing=preprocessing,
         )
 
         return OmeZarrDataset(group=group, arrays=arrays)
@@ -303,22 +381,51 @@ class Ring:
     batch_shape: UIVec3D
     max_level: ScaleLevel
     dtype: Dtype
+    raw_batch_shape: UIVec3D | None = None
 
     @classmethod
-    def allocate(cls, *, slots: int, prefix: str, batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> "Ring":
+    def allocate(
+        cls,
+        *,
+        slots: int,
+        prefix: str,
+        batch_shape: UIVec3D,
+        max_level: ScaleLevel,
+        dtype: Dtype,
+        raw_batch_shape: UIVec3D | None = None,
+    ) -> "Ring":
         """Allocate `slots` BatchSlots for one batch geometry, built concurrently (each spawns a worker
         and prefaults its shared memory)."""
+        eff_raw = raw_batch_shape if (raw_batch_shape is not None and raw_batch_shape != batch_shape) else None
 
         def _build(i: int) -> BatchSlot:
-            return BatchSlot(name=f"{prefix}_{i}", shape_l0=batch_shape, max_level=max_level, dtype=dtype)
+            return BatchSlot(
+                name=f"{prefix}_{i}",
+                shape_l0=batch_shape,
+                max_level=max_level,
+                dtype=dtype,
+                raw_shape_l0=eff_raw,
+            )
 
         with ThreadPoolExecutor(max_workers=min(slots, 8)) as pool:
             built = tuple(pool.map(_build, range(slots)))
-        return cls(slots=built, batch_shape=batch_shape, max_level=max_level, dtype=dtype)
+        return cls(slots=built, batch_shape=batch_shape, max_level=max_level, dtype=dtype, raw_batch_shape=eff_raw)
 
-    def matches(self, batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> bool:
+    def matches(
+        self,
+        batch_shape: UIVec3D,
+        max_level: ScaleLevel,
+        dtype: Dtype,
+        raw_batch_shape: UIVec3D | None = None,
+    ) -> bool:
         """Whether this ring's slots have the given batch shape, pyramid depth, and dtype."""
-        return self.batch_shape == batch_shape and self.max_level == max_level and self.dtype == dtype
+        eff_raw = raw_batch_shape if (raw_batch_shape is not None and raw_batch_shape != batch_shape) else None
+        return (
+            self.batch_shape == batch_shape
+            and self.max_level == max_level
+            and self.dtype == dtype
+            and self.raw_batch_shape == eff_raw
+        )
 
     def bind_output(self, setup: OutputSetup) -> None:
         """Point every slot's worker at the dataset described by `setup` (open its per-level writers)."""
@@ -403,7 +510,7 @@ class DatasetWriter:
         *,
         backend: ArrayWriter.Backend,
     ) -> None:
-        if not ring.matches(config.batch_shape, config.max_level, config.dtype):
+        if not ring.matches(config.batch_shape, config.max_level, config.dtype, config.raw_batch_shape):
             raise ValueError(
                 f"ring geometry {ring.batch_shape}/{ring.max_level}/{ring.dtype} does not match writer "
                 f"config {config.batch_shape}/{config.max_level}/{config.dtype}"
@@ -449,6 +556,15 @@ class DatasetWriter:
                 keep_bits=config.keep_bits,
                 dark_floor=config.dark_floor,
                 skip_empty_chunks=config.skip_empty_chunks,
+                bin_y=config.bin_y,
+                bin_x=config.bin_x,
+                pre_filter=config.pre_filter,
+                filter_size=config.filter_size,
+                bin_mode=config.bin_mode,
+                highpass_add=config.highpass_add,
+                lossy_step_noise=config.lossy_step_noise,
+                lossy_domain=config.lossy_domain,
+                noise_sigma=config.noise_sigma,
             )
         )
 
@@ -910,17 +1026,41 @@ class OMEZarrWriter:
         if self._active is not None:
             raise RuntimeError("stack already open; call end_stack() first")
         effective_use_gpu = (config.use_gpu or self._backend == ArrayWriter.Backend.GPU) and is_gpu_available()
+        if effective_use_gpu:
+            free_vram = get_free_gpu_bytes()
+            if free_vram > 0 and not vram_fits_batch(
+                config.batch_shape,
+                config.max_level,
+                config.dtype,
+                free_vram_bytes=free_vram,
+                raw_batch_shape=config.raw_batch_shape,
+                shard_shape=config.shard_shape if (self._backend in (None, ArrayWriter.Backend.GPU)) else None,
+            ):
+                needed_vram = gpu_workspace_bytes(
+                    config.batch_shape,
+                    config.max_level,
+                    config.dtype,
+                    raw_batch_shape=config.raw_batch_shape,
+                    shard_shape=config.shard_shape if (self._backend in (None, ArrayWriter.Backend.GPU)) else None,
+                )
+                log.warning(
+                    "GPU batch workspace (%d MiB) exceeds 85%% of free VRAM (%d MiB); falling back to CPU writer",
+                    needed_vram // (1024 * 1024),
+                    free_vram // (1024 * 1024),
+                )
+                effective_use_gpu = False
         slot_bytes = per_slot_bytes(
             config.batch_shape,
             config.max_level,
             config.dtype,
             use_gpu=effective_use_gpu,
             shard_shape=config.shard_shape,
+            raw_batch_shape=config.raw_batch_shape,
         )
         if (
             self._ring is None
             or self._ring_failed
-            or not self._ring.matches(config.batch_shape, config.max_level, config.dtype)
+            or not self._ring.matches(config.batch_shape, config.max_level, config.dtype, config.raw_batch_shape)
             or self._ring_use_gpu != effective_use_gpu
             or (self._ring_slot_bytes is not None and slot_bytes > self._ring_slot_bytes)
         ):
@@ -934,6 +1074,7 @@ class OMEZarrWriter:
                 batch_shape=config.batch_shape,
                 max_level=config.max_level,
                 dtype=config.dtype,
+                raw_batch_shape=config.raw_batch_shape,
             )
             self._ring_use_gpu = effective_use_gpu
             self._ring_slot_bytes = slot_bytes

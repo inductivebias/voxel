@@ -5,7 +5,7 @@
   import { prefs } from '$lib/core/prefs';
   import { clampTopLeft } from '$lib/core/utils/vec';
   import { NumberBox } from '@voxel/kit';
-  import { ChevronDown, Crosshair, RotateCw } from '@voxel/kit/icons';
+  import { Activity, Camera, ChevronDown, Crosshair, Loader, RotateCw } from '@voxel/kit/icons';
 
   import { isFullViewport } from './render';
   import {
@@ -166,6 +166,38 @@
       title={crosshairVisible.get() ? 'Hide pixel crosshair' : 'Show pixel crosshair'}
     >
       <Crosshair width="14" height="14" />
+    </button>
+    <button
+      type="button"
+      onclick={() => void previewer.takeSnapshot()}
+      disabled={previewer.snapshotPending || previewer.snrPending || previewer.previewing}
+      class="flex h-6 w-5 shrink-0 cursor-pointer items-center justify-center rounded text-fg-muted transition-colors hover:bg-element-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+      aria-label="Take single-frame laser snapshot"
+      title={previewer.previewing
+        ? 'Stop live preview before taking a single-frame snapshot'
+        : 'Take single-frame laser snapshot (saves .tif & keeps frame on screen)'}
+    >
+      {#if previewer.snapshotPending}
+        <Loader width="14" height="14" class="animate-spin text-fg" />
+      {:else}
+        <Camera width="14" height="14" />
+      {/if}
+    </button>
+    <button
+      type="button"
+      onclick={() => void previewer.runSnrDiagnostics(32, 8)}
+      disabled={previewer.snrPending || previewer.snapshotPending || previewer.previewing}
+      class="flex h-6 w-5 shrink-0 cursor-pointer items-center justify-center rounded text-fg-muted transition-colors hover:bg-element-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+      aria-label="Run stationary SNR & photobleaching diagnostics"
+      title={previewer.previewing
+        ? 'Stop live preview before running SNR diagnostics'
+        : 'Run stationary SNR & photobleaching diagnostics (32 frames + 8 dark, opens HTML report)'}
+    >
+      {#if previewer.snrPending}
+        <Loader width="14" height="14" class="animate-spin text-fg" />
+      {:else}
+        <Activity width="14" height="14" />
+      {/if}
     </button>
     <button
       type="button"

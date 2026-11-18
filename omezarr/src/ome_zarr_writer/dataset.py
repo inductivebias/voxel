@@ -341,6 +341,28 @@ class DownscaleType(StrEnum):
     MAX = "max"
 
 
+class PreFilterType(StrEnum):
+    NONE = "none"
+    MEAN = "mean"
+    GAUSSIAN = "gaussian"
+    MEDIAN = "median"
+    HIGHPASS = "highpass"
+
+
+class BinningMode(StrEnum):
+    MEAN = "mean"
+    MEDIAN = "median"
+    SUM = "sum"
+    MAX = "max"
+    NEAREST = "nearest"
+
+
+class LossyDomain(StrEnum):
+    NONE = "none"
+    SQRT = "sqrt"
+    LINEAR = "linear"
+
+
 class SpaceAxis(SparseModel):
     name: Literal[AxisName.X, AxisName.Y, AxisName.Z]
     type: Literal[AxisType.SPACE] = AxisType.SPACE
@@ -719,6 +741,7 @@ class OmeMeta(SparseModel):
 
 class ZarrGroupAttributes(SparseModel):
     ome: OmeMeta
+    preprocessing: dict[str, Any] | None = None
 
 
 class Zarr3GroupMeta(SparseModel):
@@ -742,12 +765,23 @@ class Zarr3GroupMeta(SparseModel):
         shear_yz: float = 0.0,
         channel_label: str = "channel 0",
         channel_color: str = "FFFFFF",
+        bin_z: int = 1,
+        bin_y: int = 1,
+        bin_x: int = 1,
+        preprocessing: dict[str, Any] | None = None,
     ) -> "Zarr3GroupMeta":
         """A Zarr v3 group with OME-NGFF v0.6 multiscale attributes for a CZYX
         dataset. Builds the `physical` coordinate system, per-level sequence
         transforms (scale, half-voxel center translation, and optional oblique
         shear affine), and default `omero` channel display metadata."""
         oz, oy, ox = (origin.z, origin.y, origin.x) if origin is not None else (0.0, 0.0, 0.0)
+        # Shift origin to the center of the L0 binned block: voxel_raw * (bin - 1) / 2 = voxel_binned * (bin - 1) / (2 * bin)
+        if bin_z > 1:
+            oz += voxel_size.z * (bin_z - 1) / (2.0 * bin_z)
+        if bin_y > 1:
+            oy += voxel_size.y * (bin_y - 1) / (2.0 * bin_y)
+        if bin_x > 1:
+            ox += voxel_size.x * (bin_x - 1) / (2.0 * bin_x)
         has_origin = oz != 0.0 or oy != 0.0 or ox != 0.0
         has_shear = shear_xz != 0.0 or shear_yz != 0.0
         affine = AffineTransform.from_shear(shear_xz=shear_xz, shear_yz=shear_yz, ndim=4) if has_shear else None
@@ -807,7 +841,8 @@ class Zarr3GroupMeta(SparseModel):
                         )
                     ],
                     omero=Omero.default(dtype=dtype, label=channel_label, color=channel_color),
-                )
+                ),
+                preprocessing=preprocessing,
             )
         )
 

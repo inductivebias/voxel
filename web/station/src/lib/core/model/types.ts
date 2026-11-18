@@ -303,6 +303,7 @@ export type ScaleLevel = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
 export type Compression = 'none' | 'gzip' | 'zstd' | 'lz4' | 'blosc.lz4' | 'blosc.zstd';
 export type CompressionShuffle = 'noshuffle' | 'shuffle' | 'bitshuffle';
 export type DownscaleType = 'gaussian' | 'mean' | 'min' | 'max';
+export type LossyDomain = 'none' | 'sqrt' | 'linear';
 
 /** OME-Zarr writer settings. */
 export interface WriterSettings {
@@ -315,6 +316,10 @@ export interface WriterSettings {
   keep_bits: number | null;
   dark_floor: number;
   skip_empty_chunks: boolean;
+  lossy_step_noise?: number | null;
+  lossy_domain?: LossyDomain;
+  noise_sigma?: number | null;
+  use_gpu?: boolean;
   downscale_type: DownscaleType;
   target_shard_gb: number;
 }

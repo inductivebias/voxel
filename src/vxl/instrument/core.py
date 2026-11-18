@@ -25,6 +25,7 @@ from vxl_records import (
     StorageSpec,
     VolumeStatus,
     VoxelRecords,
+    default_camera_sampling_yz,
 )
 from vxlib.asyncio import settle
 from vxlib.history import Change, HistoryState, UndoHistory
@@ -35,6 +36,7 @@ from vxlib.schema import FrozenModel
 from rigup import DeviceHandle, DeviceInterface, DeviceProps, PropResults, Result
 from vxl.devices.axes import ContinuousAxisHandle, StepMode, TTLStepperConfig
 from vxl.devices.camera import CameraHandle, CaptureState, SensorROI
+from vxl.devices.camera.base import SnapshotFrameInfo
 from vxl.devices.daq.clocked import Signals
 from vxl.devices.daq.recording import RecorderArm
 from vxl.hal import HAL, ContinuousScan, HardwareTopology
@@ -70,6 +72,7 @@ from .errors import (
 from .metadata import ExperimentMetadata, resolve_metadata_class
 from .planning import resolve_xy, resolve_z
 from .scanning import ContinuousPass, plan_continuous_pass
+from .snr import CameraSnrAnalysis, SnrReportResult, render_snr_html_report
 from .store import PROMOTABLE_FIELDS, InstrumentStore
 
 logger = logging.getLogger(__name__)
@@ -182,6 +185,16 @@ class CaptureActivity(FrozenModel):
 Activity = Annotated[IdleActivity | PreviewActivity | CaptureActivity, Field(discriminator="kind")]
 
 
+class SnapshotResult(FrozenModel):
+    """Result returned by :meth:`Instrument.snapshot`."""
+
+    timestamp: str
+    profile_id: str
+    stage_xyz_um: tuple[float, float, float] | None = None
+    output_dir: str
+    frames: dict[str, SnapshotFrameInfo]
+
+
 @dataclass(frozen=True)
 class Channel:
     """Runtime handles for one protocol channel.
@@ -257,6 +270,7 @@ class Instrument:
         self._resume_event = asyncio.Event()
         self._resume_event.set()
         self._continue_on_error_next = False
+        self._snapshot_active = False
         self.fov: ReactiveQuery[tuple[float, float]] = ReactiveQuery(fn=self._compute_current_fov)
         self.profile_fovs = Computed[dict[str, dict[str, Bounds]]](
             self._store,
@@ -443,6 +457,266 @@ class Instrument:
         """Stop preview if it is running."""
         async with self._lock:
             await self._stop_preview()
+
+    async def snapshot(self, *, save_tiff: bool = True) -> SnapshotResult:
+        """Capture a single laser-gated snapshot frame across all active preview channels, save each
+        frame as a calibrated ``.tif`` file by default, and keep the snapshot displayed on screen
+        in ``IdleActivity`` with lasers off."""
+        async with self._lock:
+            self._ensure_not_busy("take a snapshot")
+            if isinstance(self._activity.value, PreviewActivity):
+                await self._stop_preview()
+
+            channels = self.active_channels
+            chans = [channels[uid] for uid in self._preview_channels.value if uid in channels]
+            if not chans:
+                chans = list(channels.values())
+            if not chans:
+                raise OperationRejectedError("No active channels available for snapshot")
+
+            routing = self._hal.routing
+            current = await asyncio.gather(*(dimension.current_route() for dimension in routing.values()))
+            if unsettled := [uid for uid, route in zip(routing, current, strict=True) if route is None]:
+                raise OperationRejectedError(
+                    f"Select a known, settled route before taking a snapshot: {', '.join(unsettled)}"
+                )
+
+            stage = self._hal.stage
+            x, y, z = await asyncio.gather(stage.x.position.get(), stage.y.position.get(), stage.z.position.get())
+            stage_xyz = (float(x), float(y), float(z)) if all(math.isfinite(v) for v in (x, y, z)) else None
+
+            profile_id = self._active_profile_id.value
+            profile = self.active_profile
+            laser_chans = self._profile_lasers(profile)
+
+            await self._inhibit_laser_outputs()
+            await _gather_hardware(*(ch.prepare_laser(profile.lasers[ch.laser.uid]) for ch in laser_chans))
+            await self._apply_signals()
+            await self._reset_preview()
+            with suppress(NotImplementedError, RuntimeError):
+                await self._hal.stage.scanning_axis.reset_ttl_stepper()
+
+            await _gather_hardware(*(ch.camera.arm_capture(1) for ch in chans))
+
+            self._snapshot_active = True
+            try:
+                try:
+                    await _gather_hardware(*(ch.enable_laser_output() for ch in laser_chans))
+                    # Allow serial/APC laser modulation loop to reach full optical power before exposure starts
+                    await asyncio.sleep(0.015)
+                    await self._start_signal_generators()
+                    await _gather_hardware(*(ch.camera.capture_frames_raw(1, slot_key="snapshot") for ch in chans))
+                finally:
+                    # Immediately inhibit all lasers and stop DAQ triggers before disk I/O or preview encoding
+                    with suppress(Exception):
+                        await self._inhibit_laser_outputs()
+                    with suppress(Exception):
+                        await self._stop_signal_generators()
+
+                now = datetime.datetime.now()
+                snap_dir = self._system.store / self.path.stem / "snapshots" / now.strftime("%Y%m%d")
+                detection_ids = list(self._hal.topology.detection)
+                laser_summary = {
+                    ch.uid: {
+                        "wavelength": ch.laser.props.value("wavelength"),
+                        "power_setpoint_mw": ch.laser.props.value("power_setpoint_mw"),
+                    }
+                    for ch in laser_chans
+                }
+
+                async def _process_one(ch: Channel) -> tuple[str, SnapshotFrameInfo]:
+                    cam_id = ch.camera.uid
+                    cam_idx = detection_ids.index(cam_id) if cam_id in detection_ids else 0
+                    sampling = default_camera_sampling_yz(cam_id, cam_idx)
+                    exp_val = ch.camera.props.value("exposure_time_ms")
+                    exp_ms = float(exp_val) if isinstance(exp_val, (int, float)) else 10.0
+                    pos_part = (
+                        f"_x{round(stage_xyz[0])}um_y{round(stage_xyz[1])}um_z{round(stage_xyz[2])}um"
+                        if stage_xyz is not None
+                        else ""
+                    )
+                    filename = (
+                        f"snapshot_{now.strftime('%Y%m%d_%H%M%S')}_{profile_id}_{ch.uid}_{cam_id}"
+                        f"{pos_part}_{round(exp_ms)}ms.tif"
+                    )
+                    save_path = str(snap_dir / filename) if save_tiff else None
+                    meta = {
+                        "instrument": self.path.stem,
+                        "profile_id": profile_id,
+                        "channel_id": ch.uid,
+                        "camera_id": cam_id,
+                        "timestamp": now.isoformat(),
+                        "stage_xyz_um": list(stage_xyz) if stage_xyz is not None else None,
+                        "exposure_time_ms": exp_ms,
+                        "lasers": laser_summary,
+                    }
+                    info = await ch.camera.process_snapshot(
+                        slot_key="snapshot",
+                        save_path=save_path,
+                        pixel_size_um=(sampling.z, sampling.y),
+                        metadata=meta,
+                    )
+                    return (ch.uid, info)
+
+                processed = await _gather_hardware(*(_process_one(ch) for ch in chans))
+            finally:
+                self._snapshot_active = False
+
+            logger.info("Captured single-frame snapshot (%d channels) -> %s", len(chans), snap_dir)
+            return SnapshotResult(
+                timestamp=now.isoformat(),
+                profile_id=profile_id,
+                stage_xyz_um=stage_xyz,
+                output_dir=str(snap_dir),
+                frames=dict(processed),
+            )
+
+    async def run_snr_diagnostics(
+        self,
+        *,
+        num_frames: int = 32,
+        dark_frames: int = 8,
+        report_url_prefix: str = "",
+    ) -> SnrReportResult:
+        """Capture ``num_frames`` stationary signal frames (+ ``dark_frames`` laser-off dark frames)
+        across all active cameras, compute bleaching-accounted SNR, contrast, and sharpness diagnostics,
+        and write a self-contained HTML report ``snr_report.html``."""
+        if num_frames < 2 or num_frames > 256:
+            raise OperationRejectedError("num_frames must be between 2 and 256")
+        if dark_frames < 0 or dark_frames > 128:
+            raise OperationRejectedError("dark_frames must be between 0 and 128")
+
+        async with self._lock:
+            self._ensure_not_busy("run stationary SNR diagnostics")
+            if isinstance(self._activity.value, PreviewActivity):
+                await self._stop_preview()
+
+            channels = self.active_channels
+            chans = [channels[uid] for uid in self._preview_channels.value if uid in channels]
+            if not chans:
+                chans = list(channels.values())
+            if not chans:
+                raise OperationRejectedError("No active channels available for SNR diagnostics")
+
+            routing = self._hal.routing
+            current = await asyncio.gather(*(dimension.current_route() for dimension in routing.values()))
+            if unsettled := [uid for uid, route in zip(routing, current, strict=True) if route is None]:
+                raise OperationRejectedError(
+                    f"Select a known, settled route before running SNR diagnostics: {', '.join(unsettled)}"
+                )
+
+            stage = self._hal.stage
+            x, y, z = await asyncio.gather(stage.x.position.get(), stage.y.position.get(), stage.z.position.get())
+            stage_xyz = (float(x), float(y), float(z)) if all(math.isfinite(v) for v in (x, y, z)) else None
+
+            profile_id = self._active_profile_id.value
+            profile = self.active_profile
+            laser_chans = self._profile_lasers(profile)
+
+            await self._inhibit_laser_outputs()
+            await _gather_hardware(*(ch.prepare_laser(profile.lasers[ch.laser.uid]) for ch in laser_chans))
+            await self._apply_signals()
+            await self._reset_preview()
+            with suppress(NotImplementedError, RuntimeError):
+                await self._hal.stage.scanning_axis.reset_ttl_stepper()
+
+            self._snapshot_active = True
+            try:
+                # 1. Capture N stationary signal frames with active profile lasers enabled
+                await _gather_hardware(*(ch.camera.arm_capture(num_frames) for ch in chans))
+                try:
+                    await _gather_hardware(*(ch.enable_laser_output() for ch in laser_chans))
+                    await asyncio.sleep(0.015)
+                    await self._start_signal_generators()
+                    await _gather_hardware(
+                        *(ch.camera.capture_frames_raw(num_frames, slot_key="signal") for ch in chans)
+                    )
+                finally:
+                    with suppress(Exception):
+                        await self._inhibit_laser_outputs()
+                    with suppress(Exception):
+                        await self._stop_signal_generators()
+
+                # 2. Optional K dark frames with all lasers inhibited
+                if dark_frames > 0:
+                    await _gather_hardware(*(ch.camera.arm_capture(dark_frames) for ch in chans))
+                    try:
+                        await self._start_signal_generators()
+                        await _gather_hardware(
+                            *(ch.camera.capture_frames_raw(dark_frames, slot_key="dark") for ch in chans)
+                        )
+                    finally:
+                        with suppress(Exception):
+                            await self._stop_signal_generators()
+
+                # 3. Analyze stacks and write HTML report + TIFF projections
+                now = datetime.datetime.now()
+                report_id = f"snr_{now.strftime('%Y%m%d_%H%M%S')}_{profile_id}"
+                out_dir = self._system.store / self.path.stem / "snr_diagnostics" / report_id
+                detection_ids = list(self._hal.topology.detection)
+
+                async def _analyze_one(ch: Channel) -> tuple[str, CameraSnrAnalysis]:
+                    cam_id = ch.camera.uid
+                    cam_idx = detection_ids.index(cam_id) if cam_id in detection_ids else 0
+                    sampling = default_camera_sampling_yz(cam_id, cam_idx)
+                    exp_val = ch.camera.props.value("exposure_time_ms")
+                    exp_ms = float(exp_val) if isinstance(exp_val, (int, float)) else 10.0
+                    analysis = await ch.camera.analyze_snr_buffer(
+                        output_dir=str(out_dir),
+                        channel_id=ch.uid,
+                        profile_id=profile_id,
+                        pixel_size_um=(sampling.z, sampling.y),
+                        exposure_ms=exp_ms,
+                    )
+                    return (cam_id, analysis)
+
+                analyzed_pairs = await _gather_hardware(*(_analyze_one(ch) for ch in chans))
+                cam_analyses = dict(analyzed_pairs)
+            finally:
+                self._snapshot_active = False
+
+            laser_summary = {
+                ch.uid: {
+                    "wavelength": ch.laser.props.value("wavelength"),
+                    "power_setpoint_mw": ch.laser.props.value("power_setpoint_mw"),
+                    "modulation_mode": profile.lasers.get(ch.uid, "software"),
+                }
+                for ch in laser_chans
+            }
+            report_path = render_snr_html_report(
+                report_id=report_id,
+                timestamp=now,
+                instrument_name=self.path.stem,
+                profile_id=profile_id,
+                stage_xyz_um=stage_xyz,
+                laser_summary=laser_summary,
+                cameras=cam_analyses,
+                output_dir=out_dir,
+            )
+            report_url = f"{report_url_prefix}/diagnostics/reports/{report_id}" if report_url_prefix else str(report_path)
+            logger.info("Completed stationary SNR & photobleaching diagnostics -> %s", report_path)
+            return SnrReportResult(
+                report_id=report_id,
+                timestamp=now.isoformat(),
+                profile_id=profile_id,
+                num_frames=num_frames,
+                dark_frames=dark_frames,
+                stage_xyz_um=stage_xyz,
+                output_dir=str(out_dir),
+                report_path=str(report_path),
+                metrics_path=str(out_dir / "snr_metrics.json"),
+                report_url=report_url,
+                cameras=cam_analyses,
+            )
+
+    def get_snr_report_html(self, report_id: str) -> str:
+        """Read a previously generated ``snr_report.html`` by ``report_id``."""
+        if "/" in report_id or "\\" in report_id or ".." in report_id:
+            raise FileNotFoundError(report_id)
+        report_path = self._system.store / self.path.stem / "snr_diagnostics" / report_id / "snr_report.html"
+        if not report_path.is_file():
+            raise FileNotFoundError(f"SNR report '{report_id}' not found")
+        return report_path.read_text(encoding="utf-8")
 
     async def set_preview_channels(self, channel_ids: Collection[str]) -> None:
         """Choose which active-profile channels preview runs, restarting a running preview with them.
@@ -1353,7 +1627,7 @@ class Instrument:
             x, y, z = stage.x.position.value, stage.y.position.value, stage.z.position.value
             position = None
             if (
-                not isinstance(self._activity.value, IdleActivity)
+                (not isinstance(self._activity.value, IdleActivity) or self._snapshot_active)
                 and x is not None
                 and y is not None
                 and z is not None

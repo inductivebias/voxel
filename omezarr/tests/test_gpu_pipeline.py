@@ -15,10 +15,13 @@ from ome_zarr_writer import (
     Dtype,
     Local,
     OMEZarrWriter,
+    PreFilterType,
     ScaleLevel,
     UIVec3D,
     UVec3D,
     WriterConfig,
+    filter_and_bin_2d,
+    filter_and_bin_volume,
     is_gpu_available,
     pyramids_3d_gpu,
 )
@@ -739,3 +742,118 @@ def test_gpu_array_writer_last_written_bytes(tmp_path: Path) -> None:
         assert w.last_written_bytes == 0
     finally:
         w.close()
+
+
+# ── 8. Rectangular (a x b) GPU/CPU Binning with Pre-Filters ─────────────────────
+
+
+@pytest.mark.parametrize("bin_y,bin_x", [(1, 1), (2, 2), (2, 3), (3, 4)])
+@pytest.mark.parametrize(
+    "pre_filter",
+    [PreFilterType.NONE, PreFilterType.MEAN, PreFilterType.GAUSSIAN, PreFilterType.MEDIAN],
+)
+@pytest.mark.parametrize("filter_size", [3, 5])
+def test_filter_and_bin_volume_cpu_and_gpu_parity(
+    bin_y: int,
+    bin_x: int,
+    pre_filter: PreFilterType,
+    filter_size: int,
+) -> None:
+    """Verify CPU and GPU rectangular (bin_y x bin_x) binning + pre-filtering produce identical results."""
+    vol, _ = _make_bitdepth_volume((8, 48, 60), bit_depth=16, seed=123)
+    out_cpu = filter_and_bin_volume(
+        vol,
+        bin_y=bin_y,
+        bin_x=bin_x,
+        pre_filter=pre_filter,
+        filter_size=filter_size,
+        use_gpu=False,
+    )
+    assert out_cpu.shape == (8, 48 // bin_y, 60 // bin_x)
+    assert out_cpu.dtype == vol.dtype
+
+    # Verify 2D wrapper matches slice 0 of 3D volume
+    out_2d_cpu = filter_and_bin_2d(
+        vol[0],
+        bin_y=bin_y,
+        bin_x=bin_x,
+        pre_filter=pre_filter,
+        filter_size=filter_size,
+        use_gpu=False,
+    )
+    np.testing.assert_array_equal(out_2d_cpu, out_cpu[0])
+
+    if is_gpu_available():
+        out_gpu = filter_and_bin_volume(
+            vol,
+            bin_y=bin_y,
+            bin_x=bin_x,
+            pre_filter=pre_filter,
+            filter_size=filter_size,
+            use_gpu=True,
+        )
+        np.testing.assert_array_equal(out_gpu, out_cpu)
+
+        out_2d_gpu = filter_and_bin_2d(
+            vol[0],
+            bin_y=bin_y,
+            bin_x=bin_x,
+            pre_filter=pre_filter,
+            filter_size=filter_size,
+            use_gpu=True,
+        )
+        np.testing.assert_array_equal(out_2d_gpu, out_cpu[0])
+
+
+@pytest.mark.parametrize("use_gpu", [False, True])
+def test_omezarr_writer_with_rectangular_gpu_binning_and_prefilter(
+    tmp_path: Path,
+    use_gpu: bool,
+) -> None:
+    """End-to-end OMEZarrWriter with rectangular (2 x 3) binning + 3x3 Gaussian pre-filter."""
+    if use_gpu and not is_gpu_available():
+        pytest.skip("CUDA GPU not available")
+
+    raw_z, raw_y, raw_x = 32, 128, 192
+    bin_y, bin_x = 2, 3
+    out_y, out_x = raw_y // bin_y, raw_x // bin_x  # 64 x 64
+    raw_vol, dtype = _make_bitdepth_volume((raw_z, raw_y, raw_x), bit_depth=16, seed=77)
+
+    cfg = WriterConfig(
+        volume_shape=UIVec3D(z=raw_z, y=out_y, x=out_x),
+        voxel_size=UVec3D(z=1.0, y=0.4 * bin_y, x=0.4 * bin_x),
+        max_level=ScaleLevel.L1,
+        dtype=dtype,
+        compression=Compression.BLOSC_LZ4,
+        bin_y=bin_y,
+        bin_x=bin_x,
+        pre_filter=PreFilterType.GAUSSIAN,
+        filter_size=3,
+        use_gpu=use_gpu,
+    )
+    assert (cfg.raw_batch_shape.y, cfg.raw_batch_shape.x) == (raw_y, raw_x)
+
+    out_dir = tmp_path / f"binned_{'gpu' if use_gpu else 'cpu'}.ome.zarr"
+    writer = OMEZarrWriter(slots=2)
+    try:
+        writer.begin_stack(cfg, Local(target=out_dir))
+        for z_idx in range(raw_z):
+            with writer.new_frame() as frame:
+                assert frame.shape == (raw_y, raw_x)
+                frame[...] = raw_vol[z_idx]
+        writer.end_stack()
+    finally:
+        writer.close()
+
+    read_l0 = TSArrayReader(out_dir / "0").read_3d(z0=0, n=raw_z)
+    assert read_l0.shape == (raw_z, out_y, out_x)
+    expected_l0 = filter_and_bin_volume(
+        raw_vol,
+        bin_y=bin_y,
+        bin_x=bin_x,
+        pre_filter=PreFilterType.GAUSSIAN,
+        filter_size=3,
+        use_gpu=False,
+    )
+    np.testing.assert_array_equal(read_l0, expected_l0)
+

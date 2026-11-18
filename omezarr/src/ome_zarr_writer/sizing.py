@@ -60,6 +60,7 @@ def per_slot_bytes(
     *,
     use_gpu: bool = False,
     shard_shape: UIVec3D | None = None,
+    raw_batch_shape: UIVec3D | None = None,
 ) -> int:
     """Peak RAM one ring slot needs, in bytes.
 
@@ -83,6 +84,8 @@ def per_slot_bytes(
     crashing a run that is hours in.
     """
     shm = 0
+    if raw_batch_shape is not None and raw_batch_shape != batch_shape:
+        shm += _voxels(raw_batch_shape) * dtype.itemsize
     worker_pyramid = 0
     worker_cast = 0
     for level in max_level.levels:
@@ -95,9 +98,20 @@ def per_slot_bytes(
     return shm + worker_pyramid + worker_cast + pinned
 
 
-def gpu_workspace_bytes(batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> int:
-    """Device VRAM allocated by one :class:`~ome_zarr_writer.pyramid_gpu.GpuPyramidWorkspace`."""
+def gpu_workspace_bytes(
+    batch_shape: UIVec3D,
+    max_level: ScaleLevel,
+    dtype: Dtype,
+    *,
+    raw_batch_shape: UIVec3D | None = None,
+    shard_shape: UIVec3D | None = None,
+) -> int:
+    """Device VRAM allocated by one :class:`~ome_zarr_writer.pyramid_gpu.GpuPyramidWorkspace`
+    plus optional :class:`~ome_zarr_writer.array.gpu.GPUArrayWriter` shard encoding buffers.
+    """
     vram = 0
+    if raw_batch_shape is not None and raw_batch_shape != batch_shape:
+        vram += max(1, raw_batch_shape.z) * max(1, raw_batch_shape.y) * max(1, raw_batch_shape.x) * dtype.itemsize
     for level in max_level.levels:
         shp = level.scale(batch_shape)
         voxels = max(1, shp.z) * max(1, shp.y) * max(1, shp.x)
@@ -109,15 +123,50 @@ def gpu_workspace_bytes(batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtyp
         y_half = max(1, batch_shape.y // 2)
         x_half = max(1, batch_shape.x // 2)
         vram += z_scratch * y_half * x_half * _F32_ITEMSIZE
+    if shard_shape is not None:
+        # GPUArrayWriter allocates d_chunks + d_comp + d_packed (~3x largest shard bytes)
+        vram += 3 * _voxels(shard_shape) * dtype.itemsize
     return vram
 
 
-def ring_shm_bytes(slots: int, batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> int:
+def vram_fits_batch(
+    batch_shape: UIVec3D,
+    max_level: ScaleLevel,
+    dtype: Dtype,
+    *,
+    free_vram_bytes: int,
+    raw_batch_shape: UIVec3D | None = None,
+    shard_shape: UIVec3D | None = None,
+    max_vram_fraction: float = 0.85,
+) -> bool:
+    """Return True if a single GPU worker's transient VRAM arena fits within ``max_vram_fraction * free_vram_bytes``."""
+    if free_vram_bytes <= 0:
+        return False
+    needed = gpu_workspace_bytes(
+        batch_shape,
+        max_level,
+        dtype,
+        raw_batch_shape=raw_batch_shape,
+        shard_shape=shard_shape,
+    )
+    return needed <= int(free_vram_bytes * max_vram_fraction)
+
+
+def ring_shm_bytes(
+    slots: int,
+    batch_shape: UIVec3D,
+    max_level: ScaleLevel,
+    dtype: Dtype,
+    *,
+    raw_batch_shape: UIVec3D | None = None,
+) -> int:
     """Resident shared memory a ring of ``slots`` holds — the part that stays allocated between volumes.
 
     Smaller than ``slots * per_slot_bytes(...)``, which also counts the workers' transient buffers.
     """
     per_slot_shm = sum(_voxels(level.scale(batch_shape)) * dtype.itemsize for level in max_level.levels)
+    if raw_batch_shape is not None and raw_batch_shape != batch_shape:
+        per_slot_shm += _voxels(raw_batch_shape) * dtype.itemsize
     return slots * per_slot_shm
 
 
@@ -131,6 +180,7 @@ def slots_for_budget(
     label: str = "",
     use_gpu: bool = False,
     shard_shape: UIVec3D | None = None,
+    raw_batch_shape: UIVec3D | None = None,
 ) -> int:
     """Deepest ring this geometry can fill within ``budget_bytes``, clamped to the ring-depth bounds.
 
@@ -150,7 +200,14 @@ def slots_for_budget(
             lands.
     """
     prefix = f"{label}: " if label else ""
-    slot_bytes = per_slot_bytes(batch_shape, max_level, dtype, use_gpu=use_gpu, shard_shape=shard_shape)
+    slot_bytes = per_slot_bytes(
+        batch_shape,
+        max_level,
+        dtype,
+        use_gpu=use_gpu,
+        shard_shape=shard_shape,
+        raw_batch_shape=raw_batch_shape,
+    )
     max_slots = budget_bytes // slot_bytes if slot_bytes else 0
     if max_slots < MIN_SLOTS:
         raise RingBudgetExceededError(

@@ -163,7 +163,66 @@ def _gather_inner_chunks_kernel(
     elem_in_b = v_idx - b * elems_per_block
     sub_idx = a_idx * blocks_per_chunk + b
 
-    if shuffle_flag != 0 and typesize > 1:
+    if shuffle_flag == 0x04 and typesize > 1:
+        n_groups = elems_per_block // 8
+        n_aligned = n_groups * 8
+        if elem_in_b < n_aligned:
+            if (elem_in_b & 7) != 0:
+                return
+            g = elem_in_b >> 3
+            for k in range(typesize):
+                b0 = np.uint8(0)
+                b1 = np.uint8(0)
+                b2 = np.uint8(0)
+                b3 = np.uint8(0)
+                b4 = np.uint8(0)
+                b5 = np.uint8(0)
+                b6 = np.uint8(0)
+                b7 = np.uint8(0)
+                for lane in range(8):
+                    v_l = v_idx + lane
+                    dz_l = v_l // cy_cx
+                    rem_l = v_l - dz_l * cy_cx
+                    dy_l = rem_l // cx
+                    dx_l = rem_l - dy_l * cx
+                    gz_l = shard_z0 + iz * cz + dz_l - slab_z0
+                    gy_l = shard_y0 + iy * cy + dy_l
+                    gx_l = shard_x0 + ix * cx + dx_l
+                    ib_l = (0 <= gz_l < slab_z) and (0 <= gy_l < vy) and (0 <= gx_l < vx)
+                    val_l = d_slab_u8[gz_l, gy_l, gx_l, k] if ib_l else np.uint8(0)
+                    for bit in range(8):
+                        bit_val = np.uint8(((val_l >> bit) & 1) << lane)
+                        if bit == 0:
+                            b0 |= bit_val
+                        elif bit == 1:
+                            b1 |= bit_val
+                        elif bit == 2:
+                            b2 |= bit_val
+                        elif bit == 3:
+                            b3 |= bit_val
+                        elif bit == 4:
+                            b4 |= bit_val
+                        elif bit == 5:
+                            b5 |= bit_val
+                        elif bit == 6:
+                            b6 |= bit_val
+                        else:
+                            b7 |= bit_val
+                plane_base = k * 8 * n_groups + g
+                d_sub_blocks[sub_idx, plane_base + 0 * n_groups] = b0
+                d_sub_blocks[sub_idx, plane_base + 1 * n_groups] = b1
+                d_sub_blocks[sub_idx, plane_base + 2 * n_groups] = b2
+                d_sub_blocks[sub_idx, plane_base + 3 * n_groups] = b3
+                d_sub_blocks[sub_idx, plane_base + 4 * n_groups] = b4
+                d_sub_blocks[sub_idx, plane_base + 5 * n_groups] = b5
+                d_sub_blocks[sub_idx, plane_base + 6 * n_groups] = b6
+                d_sub_blocks[sub_idx, plane_base + 7 * n_groups] = b7
+        else:
+            base = elem_in_b * typesize
+            for k in range(typesize):
+                val = d_slab_u8[gz, gy, gx, k] if in_bounds else np.uint8(0)
+                d_sub_blocks[sub_idx, base + k] = val
+    elif shuffle_flag != 0 and typesize > 1:
         for k in range(typesize):
             val = d_slab_u8[gz, gy, gx, k] if in_bounds else np.uint8(0)
             d_sub_blocks[sub_idx, k * elems_per_block + elem_in_b] = val
@@ -216,7 +275,24 @@ def _pack_blosc_shard_kernel(  # noqa: C901
                 d_shard_out[chunk_out_base + 12 + k] = np.uint8((ct32 >> (8 * k)) & 0xFF)
         sub_idx = c * blocks_per_chunk + b
         raw_base = chunk_out_base + 16 + b * blocksize
-        if shuffle_flag != 0 and typesize > 1:
+        if shuffle_flag == 0x04 and typesize > 1:
+            elems_per_block = blocksize // typesize
+            n_groups = elems_per_block // 8
+            n_aligned = n_groups * 8
+            for e in range(tid, elems_per_block, stride):
+                if e < n_aligned:
+                    g = e >> 3
+                    lane = e & 7
+                    for k in range(typesize):
+                        out_b = np.uint8(0)
+                        for bit in range(8):
+                            p_val = d_sub_blocks[sub_idx, (k * 8 + bit) * n_groups + g]
+                            out_b |= np.uint8(((p_val >> lane) & 1) << bit)
+                        d_shard_out[raw_base + e * typesize + k] = out_b
+                else:
+                    for k in range(typesize):
+                        d_shard_out[raw_base + e * typesize + k] = d_sub_blocks[sub_idx, e * typesize + k]
+        elif shuffle_flag != 0 and typesize > 1:
             elems_per_block = blocksize // typesize
             for e in range(tid, elems_per_block, stride):
                 for k in range(typesize):
@@ -314,8 +390,11 @@ def _parse_inner_codecs(codecs: list[Any], typesize: int) -> tuple[str, str, int
                 nvcomp_alg, blosc_flag_fmt = "zstd", 0x80
             else:
                 raise ValueError(f"Unsupported Blosc cname for GPUArrayWriter: {cname}")
-            if typesize > 1 and inner.configuration.shuffle != "noshuffle":
-                shuffle_flag = 0x01
+            if typesize > 1:
+                if inner.configuration.shuffle == "bitshuffle":
+                    shuffle_flag = 0x04
+                elif inner.configuration.shuffle == "shuffle":
+                    shuffle_flag = 0x01
         else:
             raise ValueError(f"Unsupported inner codec for GPUArrayWriter: {inner}")
 

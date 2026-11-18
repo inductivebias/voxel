@@ -228,6 +228,11 @@ export class PreviewSession {
   redrawGeneration = $state(0);
   error = $state<string | null>(null);
   viewport = $state<PreviewViewport>({ ...DEFAULT_VIEWPORT });
+  snapshotPending = $state(false);
+  snrPending = $state(false);
+  previewing = $state(false);
+  lastSnapshotPaths = $state<Record<string, string>>({});
+  lastSnrReportUrl = $state<string | null>(null);
 
   readonly zoomModel = new NumericModel(1, { min: 1, max: 100, step: 0.1, home: 1, onPatch: (v) => this.setZoom(v) });
   readonly panXModel = new NumericModel(0, { min: 0, max: 1, step: 0.01, home: 0, onPatch: (v) => this.setPanX(v) });
@@ -351,6 +356,72 @@ export class PreviewSession {
 
   stopPreview(): Promise<void> {
     return this.#client.post(`${this.#instrumentBase}/preview/stop`);
+  }
+
+  async takeSnapshot(): Promise<void> {
+    if (this.snapshotPending || this.snrPending) return;
+    this.snapshotPending = true;
+    this.error = null;
+    try {
+      const res = await this.#client.post<{
+        saved_paths?: Record<string, string>;
+      }>(`${this.#instrumentBase}/preview/snapshot`);
+      if (res?.saved_paths) {
+        this.lastSnapshotPaths = res.saved_paths;
+      }
+    } catch (error) {
+      this.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.snapshotPending = false;
+    }
+  }
+
+  async runSnrDiagnostics(numFrames = 32, darkFrames = 8): Promise<void> {
+    if (this.snrPending || this.snapshotPending) return;
+    this.snrPending = true;
+    this.error = null;
+    const reportWindow = typeof window !== 'undefined' ? window.open('about:blank', '_blank') : null;
+    if (reportWindow) {
+      reportWindow.document.title = 'Generating Voxel SNR & Photobleaching Report...';
+      reportWindow.document.body.style.background = '#09090b';
+      reportWindow.document.body.style.color = '#e4e4e7';
+      reportWindow.document.body.style.fontFamily = 'system-ui, sans-serif';
+      reportWindow.document.body.style.display = 'flex';
+      reportWindow.document.body.style.alignItems = 'center';
+      reportWindow.document.body.style.justifyContent = 'center';
+      reportWindow.document.body.style.height = '100vh';
+      reportWindow.document.body.innerHTML =
+        `<div style="text-align:center">` +
+        `<h2 style="font-size:18px;margin-bottom:8px">Acquiring ${numFrames} stationary frames (+ ${darkFrames} dark frames) & computing SNR / Photobleaching report...</h2>` +
+        `<p style="color:#a1a1aa;font-size:13px">Lasers will automatically turn off immediately after frame capture completes.</p>` +
+        `</div>`;
+    }
+    try {
+      const res = await this.#client.post<{
+        report_id: string;
+        report_url: string;
+        html_path: string;
+        summary: Record<string, Record<string, number>>;
+      }>(`${this.#instrumentBase}/diagnostics/snr`, {
+        num_frames: numFrames,
+        dark_frames: darkFrames
+      });
+      if (res?.report_url) {
+        this.lastSnrReportUrl = res.report_url;
+        if (reportWindow && !reportWindow.closed) {
+          reportWindow.location.href = res.report_url;
+        } else if (typeof window !== 'undefined') {
+          window.open(res.report_url, '_blank');
+        }
+      }
+    } catch (error) {
+      this.error = error instanceof Error ? error.message : String(error);
+      if (reportWindow && !reportWindow.closed) {
+        reportWindow.close();
+      }
+    } finally {
+      this.snrPending = false;
+    }
   }
 
   setChannelVisible(name: string, visible: boolean): void {
@@ -684,6 +755,7 @@ export class PreviewSession {
   #applyStatus = (status: InstrumentStatus, stateCursor = this.#previewStateCursor): void => {
     this.#latestStateCursor = stateCursor;
     this.#fov = status.fov;
+    this.previewing = status.activity.kind !== 'idle';
     const imaging = status.state.imaging;
     // List only the channels that stream: those of the running preview or capture, or those preview would run.
     const activity = status.activity;
@@ -745,8 +817,7 @@ export class PreviewSession {
   async #handleFrame(frame: DecodedPreviewFrame): Promise<void> {
     if (
       frame.delivery.state_cursor.stream_id !== this.#previewStateCursor.stream_id ||
-      frame.delivery.state_cursor.seq < this.#previewStateCursor.seq ||
-      frame.delivery.state_cursor.seq > this.#latestStateCursor.seq
+      frame.delivery.state_cursor.seq < this.#previewStateCursor.seq
     )
       return;
     const channel = this.channels.find((candidate) => candidate.name === frame.delivery.channel_id);

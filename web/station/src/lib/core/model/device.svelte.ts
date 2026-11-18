@@ -530,6 +530,7 @@ export class CameraHandle extends DeviceHandle {
   sensorSizePx = $derived.by<Vec2D | null>(() => parseVec2D(this.getProp('sensor_size_px')?.value));
   pixelSizeUm = $derived.by<Vec2D | null>(() => parseVec2D(this.getProp('pixel_size_um')?.value));
   frameSizePx = $derived.by<Vec2D | null>(() => parseVec2D(this.getProp('frame_size_px')?.value));
+  outputFrameSizePx = $derived.by<Vec2D | null>(() => parseVec2D(this.getProp('output_frame_size_px')?.value));
   frameAreaUm = $derived.by<Vec2D | null>(() => parseVec2D(this.getProp('frame_area_um')?.value));
 }
 

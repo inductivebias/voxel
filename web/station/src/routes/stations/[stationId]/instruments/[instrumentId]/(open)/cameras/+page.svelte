@@ -136,6 +136,7 @@
       {@const info = deviceReady(camera) && streaming ? camera.streamInfo : undefined}
       {@const dropIssue = issues.about({ device: camera.id }).find(({ code }) => code === 'camera.dropped_frames')}
       {@const frame = camera.connected ? camera.frameSizePx : null}
+      {@const outFrame = camera.connected ? camera.outputFrameSizePx : null}
       {@const sizeMb = camera.connected ? camera.frameSizeMb?.value : undefined}
       {@const buffer = info ? camera.bufferFill : null}
       {@const bufferPercent = buffer == null ? null : Math.max(0, Math.min(100, buffer * 100))}
@@ -212,14 +213,59 @@
             locked,
             select: true
           })}
+          {@render setting({
+            name: 'GPU Bin Y',
+            deviceId: camera.id,
+            prop: camera.getProp('gpu_bin_y'),
+            locked,
+            select: true,
+            format: (value) => `${value}×`
+          })}
+          {@render setting({
+            name: 'GPU Bin X',
+            deviceId: camera.id,
+            prop: camera.getProp('gpu_bin_x'),
+            locked,
+            select: true,
+            format: (value) => `${value}×`
+          })}
+          {@render setting({
+            name: 'GPU Bin mode',
+            deviceId: camera.id,
+            prop: camera.getProp('gpu_bin_mode'),
+            locked,
+            select: true,
+            format: (value) => displayName(String(value))
+          })}
+          {@render setting({
+            name: 'GPU Pre-filter',
+            deviceId: camera.id,
+            prop: camera.getProp('gpu_pre_filter'),
+            locked,
+            select: true,
+            format: (value) => displayName(String(value))
+          })}
+          {@render setting({
+            name: 'GPU Filter size',
+            deviceId: camera.id,
+            prop: camera.getProp('gpu_filter_size'),
+            locked,
+            format: (value) => `${value}×${value}`
+          })}
         </div>
 
         <div class="space-y-2">
           <div
             class="grid min-w-0 grid-cols-[minmax(0,1fr)_--spacing(24)] overflow-hidden rounded-sm border border-control-line bg-element-bg font-mono text-[10px] tabular-nums"
           >
-            <span class="flex h-6 min-w-0 items-center gap-1 px-1.5" title="Frame dimensions">
-              <span class="truncate">{frame ? `${frame.x} × ${frame.y}` : '— × —'}</span>
+            <span class="flex h-6 min-w-0 items-center gap-1 px-1.5" title="Frame dimensions (sensor → output)">
+              <span class="truncate"
+                >{frame
+                  ? outFrame && (outFrame.x !== frame.x || outFrame.y !== frame.y)
+                    ? `${frame.x} × ${frame.y} → ${outFrame.x} × ${outFrame.y}`
+                    : `${frame.x} × ${frame.y}`
+                  : '— × —'}</span
+              >
               <span class="text-fg-muted">px</span>
             </span>
             <span

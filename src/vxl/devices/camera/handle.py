@@ -1,7 +1,7 @@
 """Camera device handle with typed methods."""
 
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ome_zarr_writer import WriterSettings
 from pydantic import TypeAdapter
@@ -15,11 +15,15 @@ from vxl.devices.camera.base import (
     Camera,
     CaptureState,
     SensorROI,
+    SnapshotFrameInfo,
     StorageStatus,
     TriggerMode,
     TriggerPolarity,
 )
 from vxl.preview import PreviewViewport
+
+if TYPE_CHECKING:
+    from vxl.instrument.snr import CameraSnrAnalysis
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -168,6 +172,97 @@ class CameraHandle(DeviceHandle[Camera]):
         """Reset the sensor ROI to the full sensor. Returns the applied ROI."""
         result = await self.call("reset_roi")
         return SensorROI.model_validate(result)
+
+    async def arm_capture(
+        self,
+        num_frames: int = 1,
+        trigger_mode: TriggerMode = TriggerMode.ON,
+        trigger_polarity: TriggerPolarity = TriggerPolarity.RISING_EDGE,
+    ) -> None:
+        """Arm the camera to capture ``num_frames`` hardware-triggered frames."""
+        await self.call("arm_capture", num_frames, trigger_mode, trigger_polarity)
+
+    async def capture_frames_raw(
+        self,
+        num_frames: int = 1,
+        *,
+        slot_key: str = "snapshot",
+    ) -> int:
+        """Grab ``num_frames`` armed frames directly from hardware and immediately stop the camera."""
+        result = await self.call("capture_frames_raw", num_frames, slot_key=slot_key)
+        return int(result)
+
+    async def process_snapshot(
+        self,
+        *,
+        slot_key: str = "snapshot",
+        save_path: str | None = None,
+        pixel_size_um: tuple[float, float] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SnapshotFrameInfo:
+        """Process a previously captured raw snapshot frame, optionally save as TIFF, and emit preview."""
+        result = await self.call(
+            "process_snapshot",
+            slot_key=slot_key,
+            save_path=save_path,
+            pixel_size_um=pixel_size_um,
+            metadata=metadata,
+        )
+        return SnapshotFrameInfo.model_validate(result)
+
+    async def grab_snapshot(
+        self,
+        *,
+        save_path: str | None = None,
+        pixel_size_um: tuple[float, float] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SnapshotFrameInfo:
+        """Grab one armed frame, apply GPU binning, optionally save as TIFF, and emit preview."""
+        result = await self.call(
+            "grab_snapshot",
+            save_path=save_path,
+            pixel_size_um=pixel_size_um,
+            metadata=metadata,
+        )
+        return SnapshotFrameInfo.model_validate(result)
+
+    async def collect_frames_to_buffer(
+        self,
+        num_frames: int,
+        *,
+        slot_key: str = "signal",
+        emit_last_preview: bool = True,
+    ) -> int:
+        """Grab ``num_frames`` armed frames into an internal diagnostic buffer."""
+        result = await self.call(
+            "collect_frames_to_buffer",
+            num_frames,
+            slot_key=slot_key,
+            emit_last_preview=emit_last_preview,
+        )
+        return int(result)
+
+    async def analyze_snr_buffer(
+        self,
+        *,
+        output_dir: str,
+        channel_id: str,
+        profile_id: str,
+        pixel_size_um: tuple[float, float],
+        exposure_ms: float,
+    ) -> "CameraSnrAnalysis":
+        """Analyze buffered signal + dark frames and return stationary SNR + photobleaching metrics."""
+        from vxl.instrument.snr import CameraSnrAnalysis  # noqa: PLC0415
+
+        result = await self.call(
+            "analyze_snr_buffer",
+            output_dir=output_dir,
+            channel_id=channel_id,
+            profile_id=profile_id,
+            pixel_size_um=pixel_size_um,
+            exposure_ms=exposure_ms,
+        )
+        return CameraSnrAnalysis.model_validate(result)
 
     @staticmethod
     def _parse_vec2d(value: object) -> Vec2D:

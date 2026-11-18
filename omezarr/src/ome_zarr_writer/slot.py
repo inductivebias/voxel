@@ -52,12 +52,14 @@ from ome_zarr_writer.array.gpu import (
     release_shared_encoder_buffers,
     release_shared_encoder_device_buffers,
 )
-from ome_zarr_writer.dataset import DownscaleType, Dtype, ScaleLevel
+from ome_zarr_writer.dataset import BinningMode, DownscaleType, Dtype, LossyDomain, PreFilterType, ScaleLevel
 from ome_zarr_writer.storage import S3Store
 
 from .pyramid import pyramids_3d_numba
 from .pyramid_gpu import (
     GpuPyramidWorkspace,
+    estimate_noise_sigma,
+    filter_and_bin_volume,
     flush_gpu_deallocations,
     is_gpu_available,
     preprocess_volume,
@@ -178,6 +180,15 @@ class OutputSetup(BaseModel):
     keep_bits: int | None = None  # optional LSB bit-rounding before downsampling/compression
     dark_floor: int = 0  # optional dark-floor clamp (<= dark_floor -> 0) before compression
     skip_empty_chunks: bool = False  # omit all-fill_value chunks from Zarr v3 shard index
+    bin_y: int = 1  # optional 2D rectangular binning factor in Y
+    bin_x: int = 1  # optional 2D rectangular binning factor in X
+    pre_filter: PreFilterType = PreFilterType.NONE  # optional 2D spatial pre-filter before binning
+    filter_size: int = 3  # kernel size (3 or 5) for pre_filter
+    bin_mode: BinningMode = BinningMode.MEAN  # reduction mode for rectangular (bin_y, bin_x) binning
+    highpass_add: float = 100.0  # pedestal offset added after highpass background subtraction
+    lossy_step_noise: float | None = None  # optional noise-bounded rounding step (multiple of σ)
+    lossy_domain: LossyDomain = LossyDomain.SQRT  # domain for noise-bounded rounding ('sqrt' or 'linear')
+    noise_sigma: float | None = None  # explicit noise σ override (None auto-estimates on first batch)
 
 
 @dataclass(frozen=True)
@@ -199,14 +210,17 @@ class BatchResult:
 # segments once; bind_output opens the per-level writers; each task reuses both.
 # ---------------------------------------------------------------------------
 
+_RAW_SHM_KEY = -1
 _WORKER_SHMS: list[SharedMemory] = []
 _WORKER_ARRAYS: dict[ScaleLevel, np.ndarray] = {}
+_WORKER_RAW: dict[str, np.ndarray] = {}
 _WORKER_WRITERS: dict[ScaleLevel, ArrayWriter] = {}
 _WORKER_STATE: dict[str, OutputSetup] = {}  # holds the current "setup"; a dict to avoid a global rebind
 _LAYER_WARNED: list[bool] = []  # one-shot latch for the threading-layer warning (list mutated in place, no `global`)
 _WORKER_GPU_WS: dict[str, GpuPyramidWorkspace] = {}
-_WORKER_PINNED_L0: list[bool] = []
+_WORKER_PINNED_L0: list[np.ndarray] = []
 _GPU_FALLBACK_WARNED: list[bool] = []
+_WORKER_LOCKED_NOISE: dict[str, float] = {}
 
 
 def _worker_init(shm_layout: list[tuple[int, str, tuple[int, int, int]]], dtype_str: str) -> None:
@@ -225,7 +239,10 @@ def _worker_init(shm_layout: list[tuple[int, str, tuple[int, int, int]]], dtype_
         shm = SharedMemory(name=shm_name, create=False, track=False)
         arr = np.ndarray(shape, dtype=dtype_str, buffer=shm.buf)
         _WORKER_SHMS.append(shm)
-        _WORKER_ARRAYS[ScaleLevel(level_value)] = arr
+        if level_value == _RAW_SHM_KEY:
+            _WORKER_RAW["raw"] = arr
+        else:
+            _WORKER_ARRAYS[ScaleLevel(level_value)] = arr
 
 
 def _worker_bind_output(setup: OutputSetup) -> None:
@@ -234,6 +251,7 @@ def _worker_bind_output(setup: OutputSetup) -> None:
     for writer in _WORKER_WRITERS.values():
         writer.close()
     _WORKER_WRITERS.clear()
+    _WORKER_LOCKED_NOISE.clear()
     for level in setup.levels:
         writer = setup.backend()
         writer.open(setup.author_root / str(level.value), setup.store)
@@ -243,12 +261,12 @@ def _worker_bind_output(setup: OutputSetup) -> None:
     _WORKER_STATE["setup"] = setup
 
     if (setup.use_gpu or setup.backend == ArrayWriter.Backend.GPU) and is_gpu_available():
-        l0_full = _WORKER_ARRAYS.get(ScaleLevel.L0)
-        if l0_full is not None and not _WORKER_PINNED_L0 and register_pinned_host_memory(l0_full):
-            _WORKER_PINNED_L0.append(True)
+        src_full = _WORKER_RAW.get("raw", _WORKER_ARRAYS.get(ScaleLevel.L0))
+        if src_full is not None and not _WORKER_PINNED_L0 and register_pinned_host_memory(src_full):
+            _WORKER_PINNED_L0.append(src_full)
         with _gpu_worker_slot():
-            if l0_full is not None:
-                warmup_gpu_pyramid(l0_full.dtype, setup.reduction)
+            if src_full is not None:
+                warmup_gpu_pyramid(src_full.dtype, setup.reduction)
             for writer in _WORKER_WRITERS.values():
                 if isinstance(writer, GPUArrayWriter):
                     writer.warmup()
@@ -261,13 +279,14 @@ def _worker_close_output() -> None:
     for writer in _WORKER_WRITERS.values():
         writer.close()
     _WORKER_WRITERS.clear()
+    _WORKER_LOCKED_NOISE.clear()
     for ws in _WORKER_GPU_WS.values():
         ws.close()
     _WORKER_GPU_WS.clear()
     release_shared_encoder_buffers()
-    if _WORKER_PINNED_L0 and ScaleLevel.L0 in _WORKER_ARRAYS:
-        unregister_pinned_host_memory(_WORKER_ARRAYS[ScaleLevel.L0])
-        _WORKER_PINNED_L0.clear()
+    for pinned_arr in _WORKER_PINNED_L0:
+        unregister_pinned_host_memory(pinned_arr)
+    _WORKER_PINNED_L0.clear()
     flush_gpu_deallocations()
 
 
@@ -299,9 +318,44 @@ def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: i
     max_level = ScaleLevel(max_level_value)
 
     process_started = datetime.now(UTC)
-    block = _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0]
-    if setup.dark_floor > 0 or setup.keep_bits is not None:
-        block = preprocess_volume(block, keep_bits=setup.keep_bits, dark_floor=setup.dark_floor)
+    raw_full = _WORKER_RAW.get("raw")
+    block = raw_full[:filled_l0] if raw_full is not None else _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0]
+    if setup.bin_y > 1 or setup.bin_x > 1 or setup.pre_filter != PreFilterType.NONE:
+        block = filter_and_bin_volume(
+            block,
+            bin_y=setup.bin_y,
+            bin_x=setup.bin_x,
+            pre_filter=setup.pre_filter,
+            filter_size=setup.filter_size,
+            bin_mode=setup.bin_mode,
+            highpass_add=setup.highpass_add,
+            use_gpu=False,
+        )
+        _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0] = block
+
+    has_lossy = setup.lossy_step_noise is not None and setup.lossy_step_noise > 0.0 and setup.lossy_domain != LossyDomain.NONE
+    if setup.dark_floor > 0 or setup.keep_bits is not None or has_lossy:
+        sigma_val = setup.noise_sigma
+        offset_val: float | None = None
+        if has_lossy:
+            if sigma_val is None or sigma_val <= 0.0 or setup.lossy_domain == LossyDomain.SQRT:
+                if "sigma" not in _WORKER_LOCKED_NOISE:
+                    est_sigma, est_off = estimate_noise_sigma(block, domain=setup.lossy_domain)
+                    _WORKER_LOCKED_NOISE["sigma"] = est_sigma if (sigma_val is None or sigma_val <= 0.0) else float(sigma_val)
+                    _WORKER_LOCKED_NOISE["offset"] = est_off
+                sigma_val = _WORKER_LOCKED_NOISE["sigma"]
+                offset_val = _WORKER_LOCKED_NOISE.get("offset", 0.0)
+        block = preprocess_volume(
+            block,
+            keep_bits=setup.keep_bits,
+            dark_floor=setup.dark_floor,
+            lossy_step_noise=setup.lossy_step_noise,
+            lossy_domain=setup.lossy_domain,
+            noise_sigma=sigma_val,
+            sqrt_offset=offset_val,
+        )
+        _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0] = block
+
     pyramid = pyramids_3d_numba(block, max_level, reduction=setup.reduction, parallel=True)
     _warn_if_slow_threading_layer()
     for level, vol in pyramid.items():
@@ -351,13 +405,22 @@ def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_id
 
     max_level = ScaleLevel(max_level_value)
     l0_full = _WORKER_ARRAYS[ScaleLevel.L0]
-    if not _WORKER_PINNED_L0 and register_pinned_host_memory(l0_full):
-        _WORKER_PINNED_L0.append(True)
+    raw_full = _WORKER_RAW.get("raw")
+    src_full = raw_full if raw_full is not None else l0_full
+    if not _WORKER_PINNED_L0 and register_pinned_host_memory(src_full):
+        _WORKER_PINNED_L0.append(src_full)
 
-    block = l0_full[:filled_l0]
+    block = src_full[:filled_l0]
     z_start = batch_idx * setup.batch_z
     z_end = min(z_start + setup.batch_z, setup.volume_z)
     all_gpu_writers = all(isinstance(_WORKER_WRITERS[lvl], GPUArrayWriter) for lvl in setup.levels)
+    needs_bin_or_filter = setup.bin_y > 1 or setup.bin_x > 1 or setup.pre_filter != PreFilterType.NONE
+    has_l0_preprocess = (
+        needs_bin_or_filter
+        or setup.dark_floor > 0
+        or setup.keep_bits is not None
+        or (setup.lossy_step_noise is not None and setup.lossy_step_noise > 0.0 and setup.lossy_domain != LossyDomain.NONE)
+    )
 
     flushed = 0
     written_bytes: int | None = None
@@ -365,43 +428,75 @@ def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_id
         process_started = datetime.now(UTC)
         ws = _WORKER_GPU_WS.get("ws")
         shape_l0 = UIVec3D(z=l0_full.shape[0], y=l0_full.shape[1], x=l0_full.shape[2])
-        if ws is None or ws.shape_l0 != shape_l0 or ws.max_level != max_level or ws.dtype != l0_full.dtype:
-            if ws is not None:
-                ws.close()
-            ws = GpuPyramidWorkspace(shape_l0, max_level, l0_full.dtype)
-            _WORKER_GPU_WS["ws"] = ws
-
-        d_levels: dict[ScaleLevel, object] = {}
+        raw_shape_l0 = (
+            UIVec3D(z=raw_full.shape[0], y=raw_full.shape[1], x=raw_full.shape[2])
+            if raw_full is not None
+            else (shape_l0 if needs_bin_or_filter else None)
+        )
         try:
-            d_levels = ws.compute_from_host(
-                block,
-                max_level,
-                reduction=setup.reduction,
-                copy_levels_to=None if all_gpu_writers else _WORKER_ARRAYS,
-                return_host_f32=False,
-                keep_bits=setup.keep_bits,
-                dark_floor=setup.dark_floor,
-            )
-            process_ended = datetime.now(UTC)
-            flush_started = process_ended
+            if (
+                ws is None
+                or ws.shape_l0 != shape_l0
+                or ws.raw_shape_l0 != raw_shape_l0
+                or ws.max_level != max_level
+                or ws.dtype != l0_full.dtype
+            ):
+                if ws is not None:
+                    ws.close()
+                ws = GpuPyramidWorkspace(shape_l0, max_level, l0_full.dtype, raw_shape_l0=raw_shape_l0)
+                _WORKER_GPU_WS["ws"] = ws
 
-            if all_gpu_writers:
-                written_bytes = 0
-                for level in setup.levels:
-                    z0, z1 = z_start // level.factor, z_end // level.factor
-                    d_slab = d_levels[level][: z1 - z0]  # type: ignore[index]
-                    gpu_writer = cast("GPUArrayWriter", _WORKER_WRITERS[level])
-                    flushed += gpu_writer.write_slice_gpu(setup.channel, z0, d_slab)
-                    written_bytes += gpu_writer.last_written_bytes
-                    gpu_writer.release_device_buffers()
-                    d_slab = None
-        finally:
-            d_levels.clear()
-            # Release transient GPU device buffers on slot exit so idle workers hold 0 VRAM
-            # and never starve or OOM other worker processes.
-            ws.release_device_buffers()
-            release_shared_encoder_device_buffers()
-            flush_gpu_deallocations()
+            d_levels: dict[ScaleLevel, object] = {}
+            try:
+                d_levels = ws.compute_from_host(
+                    block,
+                    max_level,
+                    reduction=setup.reduction,
+                    copy_levels_to=None if all_gpu_writers else _WORKER_ARRAYS,
+                    copy_l0_to=(l0_full if (not all_gpu_writers and has_l0_preprocess) else None),
+                    return_host_f32=False,
+                    keep_bits=setup.keep_bits,
+                    dark_floor=setup.dark_floor,
+                    bin_y=setup.bin_y,
+                    bin_x=setup.bin_x,
+                    pre_filter=setup.pre_filter,
+                    filter_size=setup.filter_size,
+                    bin_mode=setup.bin_mode,
+                    highpass_add=setup.highpass_add,
+                    lossy_step_noise=setup.lossy_step_noise,
+                    lossy_domain=setup.lossy_domain,
+                    noise_sigma=setup.noise_sigma,
+                )
+                process_ended = datetime.now(UTC)
+                flush_started = process_ended
+
+                if all_gpu_writers:
+                    written_bytes = 0
+                    for level in setup.levels:
+                        z0, z1 = z_start // level.factor, z_end // level.factor
+                        d_slab = d_levels[level][: z1 - z0]  # type: ignore[index]
+                        gpu_writer = cast("GPUArrayWriter", _WORKER_WRITERS[level])
+                        flushed += gpu_writer.write_slice_gpu(setup.channel, z0, d_slab)
+                        written_bytes += gpu_writer.last_written_bytes
+                        gpu_writer.release_device_buffers()
+                        d_slab = None
+            finally:
+                d_levels.clear()
+                # Release transient GPU device buffers on slot exit so idle workers hold 0 VRAM
+                # and never starve or OOM other worker processes.
+                ws.release_device_buffers()
+                release_shared_encoder_device_buffers()
+                flush_gpu_deallocations()
+        except Exception as exc:
+            if "OUT_OF_MEMORY" in str(exc) or "OutOfMemory" in type(exc).__name__:
+                log.warning("GPU VRAM exhausted during batch processing (%s); falling back to CPU worker", exc)
+                if ws is not None:
+                    ws.release_device_buffers()
+                release_shared_encoder_device_buffers()
+                flush_gpu_deallocations()
+                if not all_gpu_writers:
+                    return _worker_process_and_write(max_level_value, filled_l0, batch_idx)
+            raise
 
     if not all_gpu_writers:
         for level in setup.levels:
@@ -426,9 +521,18 @@ def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_id
 class BatchSlot:
     """A ring slot backed by SharedMemory whose worker downsamples and writes each batch to the store."""
 
-    def __init__(self, name: str, shape_l0: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> None:
+    def __init__(
+        self,
+        name: str,
+        shape_l0: UIVec3D,
+        max_level: ScaleLevel,
+        dtype: Dtype,
+        *,
+        raw_shape_l0: UIVec3D | None = None,
+    ) -> None:
         self.name = name
         self.shape_l0 = shape_l0
+        self.raw_shape_l0 = raw_shape_l0 if (raw_shape_l0 is not None and raw_shape_l0 != shape_l0) else None
         self.max_level = max_level
         self._dtype = dtype.dtype
         self._dtype_str = np.dtype(self._dtype).str
@@ -442,10 +546,21 @@ class BatchSlot:
         self._use_gpu = False
 
         # Allocate one shared-memory segment per level (L0 + pyramid), prefaulted off the capture path.
-        self._shms: dict[ScaleLevel, SharedMemory] = {}
+        self._shms: dict[ScaleLevel | int, SharedMemory] = {}
         self._arrays: dict[ScaleLevel, np.ndarray] = {}
+        self._raw_array: np.ndarray | None = None
         shm_layout: list[tuple[int, str, tuple[int, int, int]]] = []
         try:
+            if self.raw_shape_l0 is not None:
+                raw_shape = (self.raw_shape_l0.z, self.raw_shape_l0.y, self.raw_shape_l0.x)
+                raw_nbytes = int(np.prod(raw_shape)) * self._dtype.itemsize
+                raw_shm_name = f"{self.name}_raw"
+                raw_shm = SharedMemory(name=raw_shm_name, create=True, size=raw_nbytes, track=False)
+                raw_arr = np.ndarray(raw_shape, dtype=self._dtype, buffer=raw_shm.buf)
+                _prefault_zero(raw_arr)
+                self._shms[_RAW_SHM_KEY] = raw_shm
+                self._raw_array = raw_arr
+                shm_layout.append((_RAW_SHM_KEY, raw_shm_name, raw_shape))
             for level in self.max_level.levels:
                 shp = level.scale(self.shape_l0)
                 shape = (shp.z, shp.y, shp.x)
@@ -513,13 +628,14 @@ class BatchSlot:
             self.filled_l0 = 0
 
     def frame_array(self) -> np.ndarray:
-        """Return the next writable L0 frame destination while this slot is collecting."""
+        """Return the next writable frame destination while this slot is collecting."""
         with self._condition:
             if self.stage != SlotStage.COLLECTING:
                 raise RuntimeError(f"frame_array requires COLLECTING, got {self.stage.name}")
             if self.filled_l0 >= self.shape_l0.z:
                 raise IndexError(f"slot is full at L0 depth {self.shape_l0.z}")
-            return self._arrays[ScaleLevel.L0][self.filled_l0]
+            buf = self._raw_array if self._raw_array is not None else self._arrays[ScaleLevel.L0]
+            return buf[self.filled_l0]
 
     def commit_frame(self) -> None:
         """Mark a populated L0 frame as complete and visible to slot consumers."""
@@ -536,7 +652,8 @@ class BatchSlot:
             if self.filled_l0 <= 0:
                 raise RuntimeError("cannot retain a slot with no committed frames")
             self._active_readers += 1
-            frame = self._arrays[ScaleLevel.L0][self.filled_l0 - 1].view()
+            buf = self._raw_array if self._raw_array is not None else self._arrays[ScaleLevel.L0]
+            frame = buf[self.filled_l0 - 1].view()
             frame.flags.writeable = False
             return frame
 
@@ -590,6 +707,7 @@ class BatchSlot:
             self._release_shms()
 
     def _release_shms(self) -> None:
+        self._raw_array = None
         self._arrays.clear()
         for shm in self._shms.values():
             try:
