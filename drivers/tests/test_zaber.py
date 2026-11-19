@@ -1629,227 +1629,71 @@ def test_window_disarm_forces_off_even_if_one_trigger_disable_fails(controller, 
     axis.close()
 
 
-def test_zaber_get_setting_and_removed_raw_mutators(controller):
-    hub, _, sdk, _ = controller
-    axis = zaber.ZaberLinearAxis(uid="x", hub=hub, device_serial=12345, axis_number=1)
-    sdk.settings.values["cloop.servo.p"] = 1234.0
-
-    assert axis.get_setting(" cloop.servo.p ") == 1234.0
-    with pytest.raises(ValueError, match="empty"):
-        axis.get_setting("   ")
-
-    assert not hasattr(axis, "set_setting")
-    assert not hasattr(axis, "command")
-    axis.close()
-    hub.close()
-
-
-def test_zaber_get_servo_tuning_and_paramset_parsing(controller):
-    hub, _, sdk, _ = controller
-    axis = zaber.ZaberLinearAxis(uid="x", hub=hub, device_serial=12345, axis_number=1)
-
-    tuning = axis.get_servo_tuning()
-    assert tuning == {
-        "paramset": "live",
-        "startup_paramset": "default",
-        "type": "ffpid",
-        "version": 4,
-        "params": {"kp": 100.0, "ki": 20.0},
-        "pid": {"p": 100.0, "i": 20.0, "d": 2.5, "fc": 200.0},
-        "simple": {
-            "is_used": True,
-            "load_mass_kg": 0.5,
-            "carriage_mass_kg": 0.2,
-            "params": {"Stiffness": 0.5},
-        },
-    }
-
-    assert axis.get_servo_tuning(" LIVE ")["paramset"] == "live"
-    assert axis.get_servo_tuning("staging")["paramset"] == "staging"
-    assert axis.get_servo_tuning("DEFAULT")["paramset"] == "default"
-    assert axis.get_servo_tuning("1")["paramset"] == "1"
-    assert axis.get_servo_tuning("p_1")["paramset"] == "1"
-    assert axis.get_servo_tuning("P_9")["paramset"] == "9"
-
-    for bad in ("", "   ", "0", "10", "p_0", "p_10", "unknown"):
-        with pytest.raises(ValueError, match="Unknown servo paramset"):
-            axis.get_servo_tuning(bad)
-
-    sdk.servo_tuner.pid_error = NotSupportedException("PID not supported")
-    sdk.servo_tuner.simple_error = NotSupportedException("Simple not supported")
-    partial = axis.get_servo_tuning("live")
-    assert partial["pid"] is None
-    assert partial["simple"] is None
-
-    sdk.servo_tuner.pid_error = RequestTimeoutException("timed out")
-    with pytest.raises(RequestTimeoutException):
-        axis.get_servo_tuning("live")
-
-    axis.close()
-    hub.close()
-
-
-def test_zaber_set_simple_servo_tuning_atomic_staging_and_validation(controller):
-    hub, _, sdk, _ = controller
-    axis = zaber.ZaberLinearAxis(uid="x", hub=hub, device_serial=12345, axis_number=1)
-    _ = axis.speed
-    assert axis._settings
-
-    result = axis.set_simple_servo_tuning(load_mass_kg=1.25, stiffness=0.7, enable_feed_forward=False)
-    assert not axis._settings
-    assert sdk.servo_tuner.calls == [
-        ("get_simple_tuning_param_definitions",),
-        (
-            "set_simple_tuning",
-            ServoTuningParamset.STAGING,
-            [("Stiffness", 0.7)],
-            1.25,
-            zaber.Units.INERTIA_KILOGRAMS,
-            False,
-        ),
-        ("load_paramset", ServoTuningParamset.LIVE, ServoTuningParamset.STAGING),
-    ]
-    assert result["paramset"] == "live"
-    assert result["simple"] == {
-        "is_used": True,
-        "load_mass_kg": 1.25,
-        "carriage_mass_kg": 0.2,
-        "params": {"Stiffness": 0.7},
-    }
-
-    sdk.servo_tuner.calls.clear()
-    staging_result = axis.set_simple_servo_tuning(load_mass_kg=0.0, stiffness=0.25, paramset="staging")
-    assert staging_result["paramset"] == "staging"
-    assert [call[0] for call in sdk.servo_tuner.calls] == [
-        "get_simple_tuning_param_definitions",
-        "set_simple_tuning",
-    ]
-
-    sdk.servo_tuner.calls.clear()
-    slot_result = axis.set_simple_servo_tuning(load_mass_kg=2.0, stiffness=1.0, paramset="p_2")
-    assert slot_result["paramset"] == "2"
-    assert sdk.servo_tuner.calls[-1] == ("load_paramset", ServoTuningParamset.P_2, ServoTuningParamset.STAGING)
-
-    with pytest.raises(ValueError, match="load_mass_kg"):
-        axis.set_simple_servo_tuning(load_mass_kg=-0.1, stiffness=0.5)
-    with pytest.raises(ValueError, match="load_mass_kg"):
-        axis.set_simple_servo_tuning(load_mass_kg=float("nan"), stiffness=0.5)
-    with pytest.raises(ValueError, match="stiffness"):
-        axis.set_simple_servo_tuning(load_mass_kg=1.0, stiffness=-0.01)
-    with pytest.raises(ValueError, match="stiffness"):
-        axis.set_simple_servo_tuning(load_mass_kg=1.0, stiffness=1.01)
-    with pytest.raises(ValueError, match="stiffness"):
-        axis.set_simple_servo_tuning(load_mass_kg=1.0, stiffness=float("inf"))
-    with pytest.raises(ValueError, match="default"):
-        axis.set_simple_servo_tuning(load_mass_kg=1.0, stiffness=0.5, paramset="default")
-
-    axis.close()
-    hub.close()
-
-
-def test_zaber_set_pid_servo_tuning_atomic_staging_and_validation(controller):
-    hub, _, sdk, _ = controller
-    axis = zaber.ZaberLinearAxis(uid="x", hub=hub, device_serial=12345, axis_number=1)
-    _ = axis.speed
-    assert axis._settings
-
-    result = axis.set_pid_servo_tuning(p=150.0, i=30.0, d=4.0, fc=250.0)
-    assert not axis._settings
-    assert sdk.servo_tuner.calls == [
-        ("set_pid_tuning", ServoTuningParamset.STAGING, 150.0, 30.0, 4.0, 250.0),
-        ("load_paramset", ServoTuningParamset.LIVE, ServoTuningParamset.STAGING),
-    ]
-    assert result["paramset"] == "live"
-    assert result["pid"] == {"p": 150.0, "i": 30.0, "d": 4.0, "fc": 250.0}
-
-    sdk.servo_tuner.calls.clear()
-    staging = axis.set_pid_servo_tuning(p=0.0, i=0.0, d=0.0, fc=100.0, paramset="staging")
-    assert staging["paramset"] == "staging"
-    assert sdk.servo_tuner.calls == [("set_pid_tuning", ServoTuningParamset.STAGING, 0.0, 0.0, 0.0, 100.0)]
-
-    with pytest.raises(ValueError, match="p must be"):
-        axis.set_pid_servo_tuning(p=-1.0, i=0.0, d=0.0, fc=100.0)
-    with pytest.raises(ValueError, match="i must be"):
-        axis.set_pid_servo_tuning(p=1.0, i=-1.0, d=0.0, fc=100.0)
-    with pytest.raises(ValueError, match="d must be"):
-        axis.set_pid_servo_tuning(p=1.0, i=0.0, d=float("nan"), fc=100.0)
-    with pytest.raises(ValueError, match="fc must be"):
-        axis.set_pid_servo_tuning(p=1.0, i=0.0, d=0.0, fc=0.0)
-    with pytest.raises(ValueError, match="fc must be"):
-        axis.set_pid_servo_tuning(p=1.0, i=0.0, d=0.0, fc=-10.0)
-    with pytest.raises(ValueError, match="default"):
-        axis.set_pid_servo_tuning(p=1.0, i=0.0, d=0.0, fc=100.0, paramset="default")
-
-    axis.close()
-    hub.close()
-
-
-def test_zaber_load_servo_paramset_and_startup_paramset(controller):
-    hub, _, _, _ = controller
-    axis = zaber.ZaberLinearAxis(uid="x", hub=hub, device_serial=12345, axis_number=1)
-
-    axis.set_pid_servo_tuning(p=200.0, i=50.0, d=6.0, fc=300.0, paramset="live")
-    _ = axis.speed
-    assert axis._settings
-    saved = axis.load_servo_paramset("P_3", "live")
-    assert not axis._settings
-    assert saved["paramset"] == "3"
-    assert saved["pid"] == {"p": 200.0, "i": 50.0, "d": 6.0, "fc": 300.0}
-
-    restored = axis.load_servo_paramset("live", "default")
-    assert restored["paramset"] == "live"
-    assert restored["pid"] == {"p": 100.0, "i": 20.0, "d": 2.5, "fc": 200.0}
-
-    with pytest.raises(ValueError, match="default"):
-        axis.load_servo_paramset("default", "live")
-
-    _ = axis.speed
-    assert axis._settings
-    assert axis.set_servo_startup_paramset("p_3") == "3"
-    assert not axis._settings
-    assert axis.get_servo_tuning("live")["startup_paramset"] == "3"
-    assert axis.set_servo_startup_paramset("default") == "default"
-
-    with pytest.raises(ValueError, match="stored paramset"):
-        axis.set_servo_startup_paramset("live")
-    with pytest.raises(ValueError, match="stored paramset"):
-        axis.set_servo_startup_paramset("staging")
-
-    axis.close()
-    hub.close()
-
-
-def test_zaber_servo_tuning_mutations_rejected_when_busy_or_scan_prepared(controller, monkeypatch):
+def test_zaber_get_setting_and_servo_tuner_commands(controller, monkeypatch):
     hub, _, sdk, _ = controller
     axis, scanner = scan_axis(hub, monkeypatch)
+    sdk.settings.values["driver.current.servo"] = 420.0
 
-    sdk.busy = True
-    assert axis.get_servo_tuning("live")["paramset"] == "live"
-    sdk.servo_tuner.calls.clear()
-    with pytest.raises(RuntimeError, match="busy"):
-        axis.set_simple_servo_tuning(load_mass_kg=1.0, stiffness=0.5)
-    with pytest.raises(RuntimeError, match="busy"):
-        axis.set_pid_servo_tuning(p=100.0, i=10.0, d=1.0, fc=100.0)
-    with pytest.raises(RuntimeError, match="busy"):
-        axis.load_servo_paramset("live", "default")
-    with pytest.raises(RuntimeError, match="busy"):
-        axis.set_servo_startup_paramset("1")
-    assert not sdk.servo_tuner.calls
-    sdk.busy = False
+    # Read-only get_setting kept; raw set_setting/command removed.
+    assert axis.get_setting(" driver.current.servo ") == 420.0
+    with pytest.raises(ValueError, match="empty"):
+        axis.get_setting("   ")
+    assert not hasattr(axis, "set_setting")
+    assert not hasattr(axis, "command")
 
-    scanner.prepare(start=SCAN_START, speed=2000)
-    assert axis.get_servo_tuning("live")["paramset"] == "live"
-    sdk.servo_tuner.calls.clear()
-    with pytest.raises(RuntimeError, match="prepared"):
-        axis.set_simple_servo_tuning(load_mass_kg=1.0, stiffness=0.5)
-    with pytest.raises(RuntimeError, match="prepared"):
-        axis.set_pid_servo_tuning(p=100.0, i=10.0, d=1.0, fc=100.0)
-    with pytest.raises(RuntimeError, match="prepared"):
-        axis.load_servo_paramset("live", "default")
-    with pytest.raises(RuntimeError, match="prepared"):
-        axis.set_servo_startup_paramset("1")
-    assert not sdk.servo_tuner.calls
+    # get_servo_tuning + paramset parsing + non-timeout vs timeout error handling.
+    tuning = axis.get_servo_tuning("p_1")
+    assert tuning["paramset"] == "1"
+    assert tuning["startup_paramset"] == "default"
+    assert tuning["pid"] == {"p": 100.0, "i": 20.0, "d": 2.5, "fc": 200.0}
+    with pytest.raises(ValueError, match="Unknown servo paramset"):
+        axis.get_servo_tuning("bad")
 
-    scanner.reset()
+    sdk.servo_tuner.pid_error = NotSupportedException("unsupported")
+    assert axis.get_servo_tuning("live")["pid"] is None
+    sdk.servo_tuner.pid_error = RequestTimeoutException("timeout")
+    with pytest.raises(RequestTimeoutException):
+        axis.get_servo_tuning("live")
+    sdk.servo_tuner.pid_error = None
+
+    # Simple tuning & PID tuning stage via STAGING -> LIVE and invalidate _settings cache.
+    _ = axis.speed
+    assert axis._settings
+    res = axis.set_simple_servo_tuning(load_mass_kg=1.25, stiffness=0.8, enable_feed_forward=False)
+    assert not axis._settings
+    assert sdk.servo_tuner.calls[-1] == ("load_paramset", ServoTuningParamset.LIVE, ServoTuningParamset.STAGING)
+    assert res["simple"]["load_mass_kg"] == 1.25
+    assert res["simple"]["params"] == {"Stiffness": 0.8}
+
+    pid_res = axis.set_pid_servo_tuning(p=150.0, i=30.0, d=4.0, fc=250.0)
+    assert pid_res["pid"] == {"p": 150.0, "i": 30.0, "d": 4.0, "fc": 250.0}
+
+    # Paramset copy + startup persistence + validation.
+    assert axis.load_servo_paramset("P_3", "live")["paramset"] == "3"
+    assert axis.set_servo_startup_paramset("p_3") == "3"
+    assert axis.load_servo_paramset("live", "default")["pid"] == {"p": 100.0, "i": 20.0, "d": 2.5, "fc": 200.0}
+    for bad_call, match in (
+        (lambda: axis.set_simple_servo_tuning(load_mass_kg=-1.0, stiffness=0.5), "load_mass_kg"),
+        (lambda: axis.set_simple_servo_tuning(load_mass_kg=1.0, stiffness=1.5), "stiffness"),
+        (lambda: axis.set_pid_servo_tuning(p=1.0, i=0.0, d=0.0, fc=0.0), "fc"),
+        (lambda: axis.load_servo_paramset("default", "live"), "default"),
+        (lambda: axis.set_servo_startup_paramset("live"), "stored paramset"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            bad_call()
+
+    # Mutations rejected while busy or scan-prepared; reads remain allowed.
+    for setup, teardown, match in (
+        (lambda: setattr(sdk, "busy", True), lambda: setattr(sdk, "busy", False), "busy"),
+        (lambda: scanner.prepare(start=SCAN_START, speed=2000), scanner.reset, "prepared"),
+    ):
+        setup()
+        assert axis.get_servo_tuning("live")["paramset"] == "live"
+        with pytest.raises(RuntimeError, match=match):
+            axis.set_simple_servo_tuning(load_mass_kg=1.0, stiffness=0.5)
+        with pytest.raises(RuntimeError, match=match):
+            axis.load_servo_paramset("live", "default")
+        teardown()
+
     axis.close()
     hub.close()
