@@ -261,25 +261,43 @@ uv run vxl-zaber-diagnose --host <controller-host>
 
 ## Zaber servo / velocity-ripple tuning
 
-`ZaberLinearAxis` exposes `get_setting(name)`, `set_setting(name, value)`, and `command(cmd)` as
-Voxel device commands (in native controller units under the hub lock), allowing live programmatic
-inspection and tuning of closed-loop servo (`ictrl.pidff.*`) and feedforward (`ictrl.ff.*`) gains.
+`ZaberLinearAxis` exposes typed `ServoTuner` commands (`get_servo_tuning`, `set_simple_servo_tuning`,
+`set_pid_servo_tuning`, `load_servo_paramset`, `set_servo_startup_paramset`) alongside read-only
+`get_setting(name)` for telemetry (e.g. `driver.current.servo`, `cloop.servo.effort`, `system.voltage`).
+Mutations hold the hub lock, reject changes while the axis is busy or a continuous scan is prepared,
+and stage writes through `STAGING` before atomically loading `LIVE`.
 
-[`scripts/tune_zaber_scan.py`](scripts/tune_zaber_scan.py) uses those commands over the `vxl serve`
-REST API to run a bounded coordinate search that minimizes continuous-scan `dt_ms` velocity ripple:
+[`scripts/tune_zaber_scan.py`](scripts/tune_zaber_scan.py) supports three workflows:
 
 ```bash
-# Analyze an existing scan.json or scan_failure.json
+# 1. Analyze an existing scan.json or scan_failure.json locally (no server required)
 python3 scripts/tune_zaber_scan.py --analyze /path/to/scan.json
 
-# Snapshot / restore Zaber gains
+# 2. Snapshot / restore current Zaber live servo tuning via the vxl serve REST API
+# (--session-id is auto-discovered from the station snapshot when omitted; set VOXEL_WEB_PASSWORD or --password if auth is enabled)
 python3 scripts/tune_zaber_scan.py --station-id <STATION_UUID> --snapshot zaber_backup.json
 python3 scripts/tune_zaber_scan.py --station-id <STATION_UUID> --restore zaber_backup.json
 
-# Run bounded tuning against a short test scan task (add --apply-best to keep tuned gains)
+# 3. Sweep Zaber Simple Tuning stiffness over repeated Voxel test scans
+# (add --apply-best to keep the winner in LIVE, and --persist-paramset 1..9 to save & set startup slot)
 python3 scripts/tune_zaber_scan.py \
   --station-id <STATION_UUID> \
   --task-id <TASK_ID> \
   --data-root /data/users/cfxuser \
+  --load-mass-kg 1.5 \
+  --stiffness-values 0.5,0.6,0.7,0.8,0.9,1.0 \
+  --repeats 2 \
+  --apply-best \
+  --persist-paramset 1
+
+# 4. Direct Zaber 1 kHz oscilloscope + ServoTuner sweep (measures pos - encoder.pos following error
+# and velocity ripple directly on the controller without cameras, DAQ, or Zarr)
+python3 scripts/tune_zaber_scan.py \
+  --zaber-host <CONTROLLER_IP> \
+  --axis 1 \
+  --scan-start-mm 5.0 \
+  --scan-end-mm 25.0 \
+  --scan-speed-mm-s 5.0 \
+  --load-mass-kg 1.5 \
   --apply-best
 ```
