@@ -660,6 +660,7 @@ export interface InstrumentStatus {
   profile_fovs: Record<string, Record<string, Bounds>>;
   planned_volumes: PlannedVolume[];
   history: HistoryState;
+  jog: JogState;
 }
 
 export type AcquisitionPhase = 'positioning' | 'configuring' | 'capturing' | 'finalizing' | 'stopping';
@@ -740,6 +741,21 @@ export interface InstrumentView extends InstrumentState {
   devices: Record<string, DeviceState>;
   history: HistoryState;
   remote_stores: Record<string, Remote>;
+  jog?: JogState;
+}
+
+/** Handheld-controller stage jogging: off until enabled, refused and switched off by a capture. */
+export interface JogState {
+  /** Every stage axis supports velocity jogging. */
+  available: boolean;
+  /** The operator armed jogging; sticks move the stage only while this is true. */
+  enabled: boolean;
+  /** An axis is being driven by the sticks right now. */
+  active: boolean;
+  /** Full-stick speed, µm/s. */
+  max_speed_um_s: number;
+  /** Why jogging was last switched off, if not by the operator. */
+  message: string | null;
 }
 
 export interface DeviceState {
@@ -782,6 +798,14 @@ export interface LogEntry {
   node_id: string | null;
   attributes: Record<string, unknown>;
   exception: LogException | null;
+}
+
+/** Latest stick deflections: logical x, y, z as fractions of full jog speed in [-1, 1]. */
+export interface StageJogUpdate {
+  action: 'stage.jog';
+  session_id: string;
+  seq: number;
+  velocity: [number, number, number];
 }
 
 export interface PreviewViewportUpdate {

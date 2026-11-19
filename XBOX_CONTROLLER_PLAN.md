@@ -1,6 +1,39 @@
 # Plan: Xbox controller jogging for the Zaber stages
 
-Status: **proposal, for review before implementation**. Branch: `xbox-controller-integration` (from `mobi`).
+Status: **implemented on this branch; awaiting commissioning on Mobi.** Branch: `xbox-controller-integration`
+(from `mobi`). The decisions below settle the open questions; where the implementation differs from the original
+proposal, the decisions win.
+
+## Decisions (review of 2026-11-19)
+
+| Question | Decision | Implemented as |
+| --- | --- | --- |
+| Where the controller connects | Station workstation, USB | Browser Gamepad API on the workstation (`localhost` is a secure context, so no HTTPS needed) |
+| Axes | Match Voxel | Sticks drive Voxel's logical x/y/z, in the directions the stage view draws them (stick up = +Y, right stick up = +Z), following `StageOrientation` signs; no separate invert settings |
+| Enabling | One press of a bumper arms it; obvious in the GUI; always off during acquisition | **Left bumper toggles** jogging. A **Jog ON/OFF** button next to the stage position boxes turns green with a ring, and the stage controls get a green outline, while armed. Starting an acquisition halts any jog and switches it off; it cannot be re-armed until the capture ends |
+| Speed | Small deflection slow, full deflection fastest, cap 2 mm/s | Dead zone 0.12, then `0.25·m + 0.75·m³` response; full stick = **2 mm/s**, enforced as a hard server-side cap (`MAX_JOG_SPEED_UM_S`) |
+| Jog during live preview | Yes | Allowed whenever no capture is running |
+
+### Controls
+
+| Control | Action |
+| --- | --- |
+| Left bumper (press once) | Toggle jogging on/off |
+| Left stick | X/Y, speed proportional to deflection |
+| Right stick, vertical | Z |
+| B | Halt all axes |
+| Jog button in the stage footer | Same toggle as the left bumper; shows ON/OFF/locked, a pulsing dot while moving, and the controller status in its tooltip |
+
+### Where the code lives
+
+- `drivers/src/vxl_drivers/axes/zaber.py` — `ZaberLinearAxis.move_vel` (Zaber `move velocity`, stopped by the controller's soft limits).
+- `src/vxl/devices/axes/continuous/base.py` — `ContinuousAxis.move_vel` hook and the `jog` controller command (refused while TTL stepping or scanning); `simulated.py` implements it.
+- `src/vxl/instrument/jog.py` — `StageJog`: enable switch, speed scaling and cap, 300 ms watchdog, single-client ownership, lockout.
+- `src/vxl/instrument/core.py` — wiring, `set_jog_enabled`, `jog_stage`, lockout on acquisition start and close.
+- `src/vxl/web/realtime.py` — `stage.jog` messages on the state WebSocket; disconnect stops and disarms. `router.py` — `POST …/instrument/stage/jog {enabled}`.
+- `web/station/src/lib/core/gamepad/` — stick mapping (with tests) and the Gamepad API reader; `shell/JogToggle.svelte` — the button.
+
+The sections below are the original proposal, kept for reference.
 
 ## Goal
 
