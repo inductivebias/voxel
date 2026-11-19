@@ -38,11 +38,17 @@ import numba.core.config as numba_config
 import numpy as np
 from cloudpathlib import S3Path
 from numba.np.ufunc.parallel import threading_layer
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from vxlib.vector import UIVec3D
 
 from ome_zarr_writer.array import ArrayWriter
 from ome_zarr_writer.dataset import DownscaleType, Dtype, ScaleLevel
+from ome_zarr_writer.preprocess import (
+    PreprocessSpec,
+    binned_shape,
+    cast_and_lut_f32_to_u16,
+    process_batch_l0,
+)
 from ome_zarr_writer.storage import S3Store
 
 from .pyramid import pyramids_3d_numba
@@ -87,6 +93,7 @@ class SlotStage(IntEnum):
     IDLE = 0
     COLLECTING = 1
     PROCESSING = 2
+    PENDING_HALO = 3
 
 
 class OutputSetup(BaseModel):
@@ -106,9 +113,13 @@ class OutputSetup(BaseModel):
     store: S3Store | None  # S3 connection for a remote write, else None (local filesystem)
     channel: int  # leading-axis index this writer owns
     levels: tuple[ScaleLevel, ...]  # pyramid levels to write — one ArrayWriter each
-    batch_z: int  # L0 depth per batch → maps batch_idx to its z-range
-    volume_z: int  # total L0 depth → clamps the final partial batch
+    batch_z: int  # raw L0 depth per batch → maps batch_idx to its z-range when unbinned
+    volume_z: int  # total raw L0 depth → clamps the final partial batch when unbinned
     reduction: DownscaleType = DownscaleType.MEAN  # pyramid downsample method (mirrors config.downscale_type)
+    preprocess: PreprocessSpec = Field(default_factory=PreprocessSpec)
+    binned_batch_z: int | None = None
+    binned_volume_z: int | None = None
+    finest_axis: int = 0
 
 
 @dataclass(frozen=True)
@@ -122,6 +133,8 @@ class BatchResult:
     flush_started: datetime
     flush_ended: datetime
     flushed_bytes: int
+    resolved_offset: float | None = None
+    resolved_sigma_y: float | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -131,13 +144,19 @@ class BatchResult:
 
 _WORKER_SHMS: list[SharedMemory] = []
 _WORKER_ARRAYS: dict[ScaleLevel, np.ndarray] = {}
+_WORKER_HALO: dict[str, np.ndarray] = {}
 _WORKER_WRITERS: dict[ScaleLevel, ArrayWriter] = {}
 _WORKER_STATE: dict[str, OutputSetup] = {}  # holds the current "setup"; a dict to avoid a global rebind
+_WORKER_LUT: dict[str, np.ndarray] = {}  # per-dataset cached 65,536-entry uint16 LUT (avoids IPC pickling)
 _LAYER_WARNED: list[bool] = []  # one-shot latch for the threading-layer warning (list mutated in place, no `global`)
 
 
-def _worker_init(shm_layout: list[tuple[int, str, tuple[int, int, int]]], dtype_str: str) -> None:
-    """Runs once per worker on startup: attach to the shared-memory segments (one per level)."""
+def _worker_init(
+    shm_layout: list[tuple[int, str, tuple[int, int, int]]],
+    dtype_str: str,
+    halo_layout: list[tuple[str, str, tuple[int, int, int]]] | None = None,
+) -> None:
+    """Runs once per worker on startup: attach to the shared-memory segments (one per level + optional halos)."""
     # Ignore SIGINT/Ctrl+C in workers: on Windows CTRL_C_EVENT hits the whole process group, so
     # otherwise each worker blocked in the pool's call queue dumps a KeyboardInterrupt traceback.
     # The parent handles the interrupt and tears the pool down via the normal close() path.
@@ -153,6 +172,11 @@ def _worker_init(shm_layout: list[tuple[int, str, tuple[int, int, int]]], dtype_
         arr = np.ndarray(shape, dtype=dtype_str, buffer=shm.buf)
         _WORKER_SHMS.append(shm)
         _WORKER_ARRAYS[ScaleLevel(level_value)] = arr
+    for key, shm_name, shape in halo_layout or ():
+        shm = SharedMemory(name=shm_name, create=False, track=False)
+        arr = np.ndarray(shape, dtype=dtype_str, buffer=shm.buf)
+        _WORKER_SHMS.append(shm)
+        _WORKER_HALO[key] = arr
 
 
 def _worker_bind_output(setup: OutputSetup) -> None:
@@ -166,6 +190,10 @@ def _worker_bind_output(setup: OutputSetup) -> None:
         writer.open(setup.author_root / str(level.value), setup.store)
         _WORKER_WRITERS[level] = writer
     _WORKER_STATE["setup"] = setup
+    _WORKER_LUT.clear()
+    spec = setup.preprocess
+    if spec.has_quantize and not spec.needs_auto_sqrt and _WORKER_ARRAYS[ScaleLevel.L0].dtype == np.uint16:
+        _WORKER_LUT["lut"] = spec.build_lut()
 
 
 def _worker_close_output() -> None:
@@ -194,32 +222,72 @@ def _warn_if_slow_threading_layer() -> None:
         log.debug("numba threading layer: %s", layer)
 
 
-def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: int) -> BatchResult:
-    """Downsample the collected L0 block into the pyramid (in shared memory), then write every level to
-    the store. Runs entirely in the worker process, so the compress+write never touches the main GIL."""
+def _worker_process_and_write(
+    max_level_value: int,
+    filled_l0: int,
+    batch_idx: int,
+    lead_count: int = 0,
+    trail_count: int = 0,
+    sqrt_params: tuple[float, float] | None = None,
+) -> BatchResult:
+    """Preprocess and downsample the collected L0 block into the pyramid (in shared memory), then write
+    every level to the store. Runs entirely in the worker process, so the compress+write never touches
+    the main GIL."""
     setup = _WORKER_STATE.get("setup")
     if setup is None:
         raise RuntimeError("worker has no OutputSetup; call bind_output before flush")
     max_level = ScaleLevel(max_level_value)
+    spec = setup.preprocess
 
     process_started = datetime.now(UTC)
-    block = _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0]
-    pyramid = pyramids_3d_numba(block, max_level, reduction=setup.reduction, parallel=True)
+    raw_block = _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0]
+    resolved_offset: float | None = None
+    resolved_sigma_y: float | None = None
+    active_lut = _WORKER_LUT.get("lut")
+
+    if active_lut is None and sqrt_params is not None and spec.has_quantize and raw_block.dtype == np.uint16:
+        active_lut = spec.build_lut(offset=sqrt_params[0], sigma_y=sqrt_params[1])
+        _WORKER_LUT["lut"] = active_lut
+
+    if spec.is_active:
+        halo_lead = _WORKER_HALO["lead"][:lead_count] if lead_count > 0 else None
+        halo_trail = _WORKER_HALO["trail"][:trail_count] if trail_count > 0 else None
+        l0_out, resolved_offset, resolved_sigma_y = process_batch_l0(
+            raw_block,
+            spec,
+            halo_lead=halo_lead,
+            halo_trail=halo_trail,
+            lut=active_lut,
+            finest_axis=setup.finest_axis,
+        )
+        if active_lut is None and spec.has_quantize and l0_out.dtype == np.uint16:
+            active_lut = spec.build_lut(offset=resolved_offset, sigma_y=resolved_sigma_y)
+            _WORKER_LUT["lut"] = active_lut
+    else:
+        l0_out = raw_block
+
+    pyramid = pyramids_3d_numba(l0_out, max_level, reduction=setup.reduction, parallel=True)
     _warn_if_slow_threading_layer()
     for level, vol in pyramid.items():
         arr = _WORKER_ARRAYS[level]
         z = min(arr.shape[0], vol.shape[0])
         y = min(arr.shape[1], vol.shape[1])
         x = min(arr.shape[2], vol.shape[2])
-        arr[:z, :y, :x] = vol[:z, :y, :x].astype(arr.dtype)
+        if active_lut is not None and arr.dtype == np.uint16:
+            cast_and_lut_f32_to_u16(vol[:z, :y, :x], active_lut, arr[:z, :y, :x])
+        else:
+            arr[:z, :y, :x] = vol[:z, :y, :x].astype(arr.dtype)
 
     process_ended = datetime.now(UTC)  # also the flush start — the write begins as soon as the pyramid is ready
-    z_start = batch_idx * setup.batch_z
-    z_end = min(z_start + setup.batch_z, setup.volume_z)
+    binned_batch_z = setup.binned_batch_z if setup.binned_batch_z is not None else setup.batch_z
+    binned_volume_z = setup.binned_volume_z if setup.binned_volume_z is not None else setup.volume_z
+    z_start = batch_idx * binned_batch_z
+    z_end = min(z_start + l0_out.shape[0], binned_volume_z)
     flushed = 0
     for level in setup.levels:
         z0, z1 = z_start // level.factor, z_end // level.factor
-        flushed += _WORKER_WRITERS[level].write_slice(setup.channel, z0, _WORKER_ARRAYS[level][: z1 - z0])
+        src = l0_out[: z1 - z0] if level == ScaleLevel.L0 else _WORKER_ARRAYS[level][: z1 - z0]
+        flushed += _WORKER_WRITERS[level].write_slice(setup.channel, z0, src)
 
     return BatchResult(
         process_started=process_started,
@@ -227,6 +295,8 @@ def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: i
         flush_started=process_ended,
         flush_ended=datetime.now(UTC),
         flushed_bytes=flushed,
+        resolved_offset=resolved_offset,
+        resolved_sigma_y=resolved_sigma_y,
     )
 
 
@@ -238,27 +308,44 @@ def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: i
 class BatchSlot:
     """A ring slot backed by SharedMemory whose worker downsamples and writes each batch to the store."""
 
-    def __init__(self, name: str, shape_l0: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> None:
+    def __init__(
+        self,
+        name: str,
+        shape_l0: UIVec3D,
+        max_level: ScaleLevel,
+        dtype: Dtype,
+        *,
+        bin_zyx: tuple[int, int, int] = (1, 1, 1),
+        halo_z: int = 0,
+    ) -> None:
         self.name = name
         self.shape_l0 = shape_l0
+        self.bin_zyx = bin_zyx
+        self.halo_z = halo_z
+        self.shape_l0_binned = binned_shape(shape_l0, bin_zyx)
         self.max_level = max_level
         self._dtype = dtype.dtype
         self._dtype_str = np.dtype(self._dtype).str
         self.filled_l0 = 0
+        self.halo_lead_count = 0
+        self.halo_trail_count = 0
         self.batch_idx: int | None = None
 
         self._condition = threading.Condition()
         self._active_readers = 0
-        self._stage = SlotStage.IDLE  # explicit stage while no task is in flight (IDLE / COLLECTING)
+        self._stage = SlotStage.IDLE  # explicit stage while no task is in flight (IDLE / COLLECTING / PENDING_HALO)
         self._future: Future[BatchResult] | None = None  # set by flush(); stage derives from it
 
-        # Allocate one shared-memory segment per level (L0 + pyramid), prefaulted off the capture path.
+        # Allocate one shared-memory segment per level (L0 raw, L1..Lmax binned) plus optional Z-halos.
         self._shms: dict[ScaleLevel, SharedMemory] = {}
         self._arrays: dict[ScaleLevel, np.ndarray] = {}
+        self._halo_shms: dict[str, SharedMemory] = {}
+        self._halo_arrays: dict[str, np.ndarray] = {}
         shm_layout: list[tuple[int, str, tuple[int, int, int]]] = []
+        halo_layout: list[tuple[str, str, tuple[int, int, int]]] = []
         try:
             for level in self.max_level.levels:
-                shp = level.scale(self.shape_l0)
+                shp = self.shape_l0 if level == ScaleLevel.L0 else level.scale(self.shape_l0_binned)
                 shape = (shp.z, shp.y, shp.x)
                 nbytes = int(np.prod(shape)) * self._dtype.itemsize
                 shm_name = f"{self.name}_{level.value}"
@@ -268,6 +355,17 @@ class BatchSlot:
                 self._shms[level] = shm
                 self._arrays[level] = arr
                 shm_layout.append((level.value, shm_name, shape))
+            if self.halo_z > 0:
+                halo_shape = (self.halo_z, self.shape_l0.y, self.shape_l0.x)
+                halo_nbytes = int(np.prod(halo_shape)) * self._dtype.itemsize
+                for key in ("lead", "trail"):
+                    shm_name = f"{self.name}_halo_{key}"
+                    shm = SharedMemory(name=shm_name, create=True, size=halo_nbytes, track=False)
+                    arr = np.ndarray(halo_shape, dtype=self._dtype, buffer=shm.buf)
+                    _prefault_zero(arr)
+                    self._halo_shms[key] = shm
+                    self._halo_arrays[key] = arr
+                    halo_layout.append((key, shm_name, halo_shape))
         except Exception:
             self._release_shms()
             raise
@@ -278,7 +376,7 @@ class BatchSlot:
             max_workers=1,
             mp_context=ctx,
             initializer=_worker_init,
-            initargs=(shm_layout, self._dtype_str),
+            initargs=(shm_layout, self._dtype_str, halo_layout),
         )
 
     @property
@@ -321,6 +419,44 @@ class BatchSlot:
             self._stage = SlotStage.COLLECTING
             self.batch_idx = batch_idx
             self.filled_l0 = 0
+            self.halo_lead_count = 0
+            self.halo_trail_count = 0
+
+    def set_halo_lead(self, frames: np.ndarray) -> None:
+        """Populate leading Z-halo frames (from the previous batch's tail)."""
+        n = int(frames.shape[0])
+        if n > self.halo_z:
+            raise ValueError(f"lead halo {n} exceeds slot halo_z {self.halo_z}")
+        if n > 0:
+            np.copyto(self._halo_arrays["lead"][:n], frames)
+        self.halo_lead_count = n
+
+    def set_halo_trail_frame(self, idx: int, frame: np.ndarray) -> None:
+        """Populate one trailing Z-halo frame (from the next batch's head)."""
+        if idx < 0 or idx >= self.halo_z:
+            raise IndexError(f"trail halo index {idx} out of bounds for halo_z={self.halo_z}")
+        np.copyto(self._halo_arrays["trail"][idx], frame)
+        self.halo_trail_count = max(self.halo_trail_count, idx + 1)
+
+    def mark_pending_halo(self) -> None:
+        """Park a filled slot while waiting for trailing Z-halo frames from the next batch."""
+        with self._condition:
+            if self.stage != SlotStage.COLLECTING:
+                raise RuntimeError(f"mark_pending_halo requires COLLECTING, got {self.stage.name}")
+            self._stage = SlotStage.PENDING_HALO
+
+    def tail_frames(self, count: int) -> np.ndarray:
+        """Return a copy of the last ``min(count, filled_l0)`` committed L0 frames."""
+        n = min(count, self.filled_l0)
+        if n <= 0:
+            return np.empty((0, self.shape_l0.y, self.shape_l0.x), dtype=self._dtype)
+        return self._arrays[ScaleLevel.L0][self.filled_l0 - n : self.filled_l0].copy()
+
+    def last_committed_frame(self) -> np.ndarray:
+        """Return a view of the most recently committed L0 frame."""
+        if self.filled_l0 <= 0:
+            raise RuntimeError("no frames have been committed to this slot")
+        return self._arrays[ScaleLevel.L0][self.filled_l0 - 1]
 
     def frame_array(self) -> np.ndarray:
         """Return the next writable L0 frame destination while this slot is collecting."""
@@ -371,7 +507,7 @@ class BatchSlot:
         with self._condition:
             self._condition.wait(timeout=timeout)
 
-    def flush(self) -> Future[BatchResult]:
+    def flush(self, *, sqrt_params: tuple[float, float] | None = None) -> Future[BatchResult]:
         """Flush the collected batch to the store: kick off the worker's downsample-and-write and return
         its future. **Asynchronous** — the work runs in the worker; the returned future resolves (to a
         `BatchResult`) when the batch is durably written. The slot is not reusable until it settles, so
@@ -379,7 +515,13 @@ class BatchSlot:
         if self.batch_idx is None:
             raise RuntimeError("cannot flush a slot with no batch assigned")
         self._future = self._executor.submit(
-            _worker_process_and_write, self.max_level.value, self.filled_l0, self.batch_idx
+            _worker_process_and_write,
+            self.max_level.value,
+            self.filled_l0,
+            self.batch_idx,
+            self.halo_lead_count,
+            self.halo_trail_count,
+            sqrt_params,
         )
         return self._future
 
@@ -397,7 +539,8 @@ class BatchSlot:
 
     def _release_shms(self) -> None:
         self._arrays.clear()
-        for shm in self._shms.values():
+        self._halo_arrays.clear()
+        for shm in (*self._shms.values(), *self._halo_shms.values()):
             try:
                 shm.close()
             except Exception:
@@ -409,3 +552,4 @@ class BatchSlot:
             except Exception:
                 log.debug("Error unlinking shared memory %s", shm.name, exc_info=True)
         self._shms.clear()
+        self._halo_shms.clear()

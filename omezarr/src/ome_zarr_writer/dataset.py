@@ -68,6 +68,9 @@ class ScaleLevel(IntEnum):
         return f"{self.name}(factor={self.factor})"
 
 
+CompressionShuffle = Literal["noshuffle", "shuffle", "bitshuffle"]
+
+
 class Compression(StrEnum):
     NONE = "none"
     GZIP = "gzip"
@@ -187,7 +190,10 @@ class Zarr3ArrayMeta(SparseModel):
         chunk_shape: list[int],
         dtype: Dtype,
         compression: Compression,
+        compression_level: int | None = None,
+        compression_shuffle: CompressionShuffle | None = None,
         dimension_names: list[str | None] | None = None,
+        attributes: dict[str, Any] | None = None,
     ) -> "Zarr3ArrayMeta":
         """A sharded array meta — outer (shard) chunk grid wrapping an inner
         chunk shape inside a `sharding_indexed` codec.
@@ -204,31 +210,63 @@ class Zarr3ArrayMeta(SparseModel):
                 ShardingIndexedCodec(
                     configuration=_ShardingConfig(
                         chunk_shape=chunk_shape,
-                        codecs=inner_codecs_for(compression, dtype.itemsize),
+                        codecs=inner_codecs_for(
+                            compression,
+                            dtype.itemsize,
+                            level=compression_level,
+                            shuffle=compression_shuffle,
+                        ),
                     )
                 )
             ],
             dimension_names=dimension_names,
+            attributes=attributes or {},
         )
 
 
-def inner_codecs_for(compression: Compression, typesize: int) -> list[InnerCodec]:
+def inner_codecs_for(
+    compression: Compression,
+    typesize: int,
+    *,
+    level: int | None = None,
+    shuffle: CompressionShuffle | None = None,
+) -> list[InnerCodec]:
     """Inner codec chain (applied to each inner chunk inside a shard) for one of
-    our supported `Compression` presets. Encodes our level/shuffle policy."""
+    our supported `Compression` presets. Encodes our level/shuffle policy.
+
+    `blosc.zstd` defaults to byte `shuffle` and level 1 (measured on MOBI 16-bit
+    data: matches level-3 ratio at higher throughput and avoids `bitshuffle`'s
+    entropy penalty on LUT-quantized intensities); `blosc.lz4` keeps `bitshuffle`
+    and level 3 for backward compatibility.
+    """
     codecs: list[InnerCodec] = [BytesCodec()]
     if compression == Compression.NONE:
         return codecs
     if compression == Compression.GZIP:
-        codecs.append(GzipCodec(configuration=_GzipConfig(level=3)))
+        codecs.append(GzipCodec(configuration=_GzipConfig(level=3 if level is None else level)))
     elif compression == Compression.ZSTD:
-        codecs.append(ZstdCodec(configuration=_ZstdConfig(level=3)))
+        codecs.append(ZstdCodec(configuration=_ZstdConfig(level=3 if level is None else level)))
     elif compression in (Compression.LZ4, Compression.BLOSC_LZ4):
         codecs.append(
-            BloscCodec(configuration=_BloscConfig(cname="lz4", clevel=3, shuffle="bitshuffle", typesize=typesize))
+            BloscCodec(
+                configuration=_BloscConfig(
+                    cname="lz4",
+                    clevel=3 if level is None else level,
+                    shuffle="bitshuffle" if shuffle is None else shuffle,
+                    typesize=typesize,
+                )
+            )
         )
     elif compression == Compression.BLOSC_ZSTD:
         codecs.append(
-            BloscCodec(configuration=_BloscConfig(cname="zstd", clevel=3, shuffle="bitshuffle", typesize=typesize))
+            BloscCodec(
+                configuration=_BloscConfig(
+                    cname="zstd",
+                    clevel=1 if level is None else level,
+                    shuffle="shuffle" if shuffle is None else shuffle,
+                    typesize=typesize,
+                )
+            )
         )
     else:
         raise ValueError(f"Unsupported compression: {compression}")

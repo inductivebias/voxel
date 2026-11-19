@@ -6,12 +6,13 @@ Docker or the image is unavailable, so the suite runs on any laptop. Used by the
 integration tests (e.g. `test_s3.py`).
 """
 
+import os
 import shutil
 import subprocess
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 import boto3
 import pytest
@@ -24,6 +25,7 @@ _PASSWORD = "minioadmin"  # noqa: S105 - disposable credential for the isolated 
 _ENDPOINT = "http://127.0.0.1:9000"
 _CONTAINER = "voxel-minio-test"
 _BUCKET = "voxel-test"
+_IMAGE = "ghcr.io/coollabsio/minio@sha256:a4938f37f1be1841b8e7b627ad0207b265345fd0d063e42d7410c78af0e63e68"
 
 
 @dataclass(frozen=True)
@@ -61,23 +63,29 @@ def _await_ready(server: Minio, timeout_s: float = 30.0) -> None:
             return
         except (BotoCoreError, ClientError):
             time.sleep(0.5)
-    pytest.skip("MinIO did not become ready in time")
+    _minio_unavailable("MinIO did not become ready in time")
+
+
+def _minio_unavailable(message: str) -> NoReturn:
+    if os.environ.get("VOXEL_REQUIRE_MINIO") == "1":
+        pytest.fail(message)
+    pytest.skip(message)
 
 
 @pytest.fixture(scope="module")
 def minio() -> Iterator[Minio]:
     docker = shutil.which("docker")
     if docker is None:
-        pytest.skip("docker not available")
+        _minio_unavailable("docker not available")
     subprocess.run([docker, "rm", "-f", _CONTAINER], capture_output=True, check=False)
     started = subprocess.run(
         [docker, "run", "-d", "--name", _CONTAINER, "-p", "9000:9000",
          "-e", f"MINIO_ROOT_USER={_USER}", "-e", f"MINIO_ROOT_PASSWORD={_PASSWORD}",
-         "quay.io/minio/minio", "server", "/data"],
+         _IMAGE, "server", "/data"],
         capture_output=True, text=True, check=False,
     )  # fmt: skip
     if started.returncode != 0:
-        pytest.skip(f"could not start MinIO: {started.stderr.strip()}")
+        _minio_unavailable(f"could not start MinIO: {started.stderr.strip()}")
     server = Minio(endpoint=_ENDPOINT, user=_USER, password=_PASSWORD, bucket=_BUCKET)
     try:
         _await_ready(server)

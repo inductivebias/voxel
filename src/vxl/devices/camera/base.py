@@ -10,6 +10,7 @@ from typing import Literal, cast
 
 import numpy as np
 from ome_zarr_writer import (
+    CompressionStats,
     FrameLease,
     OMEZarrWriter,
     UIVec3D,
@@ -203,6 +204,13 @@ class CameraController(DeviceController["Camera"]):
                 if len(recent) == 64:
                     break
         return list(reversed(recent))
+
+    @describe(label="Writer Compression Stats")
+    def writer_compression_stats(self) -> CompressionStats | None:
+        """Live raw-vs-compressed volume and throughput snapshot for the active (or latest) stack."""
+        if self._writer is None:
+            return None
+        return self._writer.live_compression_stats()
 
     def _on_preview_frame(self, frame: PreviewFrame) -> None:
         task = self._publish_tasks.get(frame.header.layer)
@@ -407,12 +415,13 @@ class CameraController(DeviceController["Camera"]):
             budget_bytes=budget,
             available_bytes=available,
             label=self.device.uid,
+            preprocess=config.preprocess,
         )
         log.info(
             "Sizing ring for %s: %d slots (%.2f GB/slot peak, %.2f GB share, %.2f GB free)",
             self.device.uid,
             slots,
-            per_slot_bytes(config.batch_shape, config.max_level, config.dtype) / 1e9,
+            per_slot_bytes(config.batch_shape, config.max_level, config.dtype, config.preprocess) / 1e9,
             budget / 1e9,
             available / 1e9,
         )

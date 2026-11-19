@@ -13,6 +13,7 @@ from vxlib.dtype import Dtype
 from vxlib.vector import UIVec3D
 
 from .dataset import ScaleLevel
+from .preprocess import PreprocessSpec, binned_shape, preprocess_scratch_bytes
 
 # Ring depth: at least 2, so collect overlaps downsample/flush; capped because coordination and cache
 # pressure outweigh the gains beyond it.
@@ -48,13 +49,36 @@ def _voxels(shape: UIVec3D) -> int:
     return shape.z * shape.y * shape.x
 
 
-def per_slot_bytes(batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> int:
+def _slot_shm_bytes(
+    batch_shape: UIVec3D,
+    max_level: ScaleLevel,
+    dtype: Dtype,
+    preprocess: PreprocessSpec | None = None,
+) -> int:
+    """Resident shared-memory bytes allocated for one :class:`BatchSlot`."""
+    l0_out_shape = binned_shape(batch_shape, preprocess.bin_zyx) if preprocess is not None else batch_shape
+    shm = _voxels(batch_shape) * dtype.itemsize
+    for level in max_level.levels:
+        if level != ScaleLevel.L0:
+            shm += _voxels(level.scale(l0_out_shape)) * dtype.itemsize
+    if preprocess is not None and preprocess.halo_z > 0:
+        shm += 2 * preprocess.halo_z * batch_shape.y * batch_shape.x * dtype.itemsize
+    return shm
+
+
+def per_slot_bytes(
+    batch_shape: UIVec3D,
+    max_level: ScaleLevel,
+    dtype: Dtype,
+    preprocess: PreprocessSpec | None = None,
+) -> int:
     """Peak RAM one ring slot needs, in bytes.
 
     A slot costs more than the shared memory it owns. While its worker flushes a batch it also holds
     private buffers that never live in the ring:
 
-    - shared memory — L0 plus every pyramid level at ``dtype`` (``BatchSlot.__init__``)
+    - shared memory — L0 (raw), L1..Lmax (binned) at ``dtype``, plus optional Z-halo buffers (``BatchSlot.__init__``)
+    - worker heap — preprocessing scratch for filtering, binning, and LUT output (``process_batch_l0``)
     - worker heap — L1..Lmax as float32, all live at once (``pyramids_3d_numba`` returns them together)
     - worker heap — one ``.astype()`` copy per level, largest at L1 (``_worker_process_and_write``)
 
@@ -65,25 +89,33 @@ def per_slot_bytes(batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) ->
     collects while the rest flush, so this over-reserves by at most one slot's transient — cheap next to
     crashing a run that is hours in.
     """
-    shm = 0
+    l0_out_shape = binned_shape(batch_shape, preprocess.bin_zyx) if preprocess is not None else batch_shape
+    shm = _slot_shm_bytes(batch_shape, max_level, dtype, preprocess)
     worker_pyramid = 0
     worker_cast = 0
     for level in max_level.levels:
-        voxels = _voxels(level.scale(batch_shape))
-        shm += voxels * dtype.itemsize
         if level != ScaleLevel.L0:
+            voxels = _voxels(level.scale(l0_out_shape))
             worker_pyramid += voxels * _F32_ITEMSIZE
             worker_cast = max(worker_cast, voxels * dtype.itemsize)  # one level at a time; L1 is largest
-    return shm + worker_pyramid + worker_cast
+    worker_preprocess = (
+        preprocess_scratch_bytes(batch_shape, preprocess, dtype.itemsize) if preprocess is not None else 0
+    )
+    return shm + worker_pyramid + worker_cast + worker_preprocess
 
 
-def ring_shm_bytes(slots: int, batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> int:
+def ring_shm_bytes(
+    slots: int,
+    batch_shape: UIVec3D,
+    max_level: ScaleLevel,
+    dtype: Dtype,
+    preprocess: PreprocessSpec | None = None,
+) -> int:
     """Resident shared memory a ring of ``slots`` holds — the part that stays allocated between volumes.
 
     Smaller than ``slots * per_slot_bytes(...)``, which also counts the workers' transient buffers.
     """
-    per_slot_shm = sum(_voxels(level.scale(batch_shape)) * dtype.itemsize for level in max_level.levels)
-    return slots * per_slot_shm
+    return slots * _slot_shm_bytes(batch_shape, max_level, dtype, preprocess)
 
 
 def slots_for_budget(
@@ -94,6 +126,7 @@ def slots_for_budget(
     budget_bytes: int,
     available_bytes: int | None = None,
     label: str = "",
+    preprocess: PreprocessSpec | None = None,
 ) -> int:
     """Deepest ring this geometry can fill within ``budget_bytes``, clamped to the ring-depth bounds.
 
@@ -113,7 +146,7 @@ def slots_for_budget(
             lands.
     """
     prefix = f"{label}: " if label else ""
-    slot_bytes = per_slot_bytes(batch_shape, max_level, dtype)
+    slot_bytes = per_slot_bytes(batch_shape, max_level, dtype, preprocess)
     max_slots = budget_bytes // slot_bytes if slot_bytes else 0
     if max_slots < MIN_SLOTS:
         raise RingBudgetExceededError(

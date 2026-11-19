@@ -295,6 +295,8 @@ export type TileOrder =
 
 export type ScaleLevel = 0 | 1 | 2 | 3 | 4 | 5 | 6 | 7;
 export type Compression = 'none' | 'gzip' | 'zstd' | 'lz4' | 'blosc.lz4' | 'blosc.zstd';
+export type CompressionShuffle = 'noshuffle' | 'shuffle' | 'bitshuffle';
+export type BinMode = 'mean' | 'median' | 'max' | 'sum' | 'nearest';
 export type DownscaleType = 'gaussian' | 'mean' | 'min' | 'max';
 
 /** OME-Zarr writer settings. */
@@ -303,8 +305,21 @@ export interface WriterSettings {
   shard_z_chunks: number;
   batch_z_shards: number;
   compression: Compression;
+  compression_level?: number | null;
+  compression_shuffle?: CompressionShuffle | null;
   downscale_type: DownscaleType;
   target_shard_gb: number;
+  dark_floor?: number;
+  keep_bits?: number | null;
+  lossy_sigma?: number | null;
+  noise_offset?: number | null;
+  noise_sigma_y?: number | null;
+  bin_zyx?: [number, number, number];
+  bin_mode?: BinMode;
+  median_zyx?: [number, number, number];
+  lowpass_cutoff_zyx?: [number, number, number];
+  highpass_cutoff_zyx?: [number, number, number];
+  highpass_add?: number;
 }
 
 /** Baseline fields that can live in `config.default` (mirrors `InstrumentDefaults` in src/vxl/instrument.py). */
@@ -365,8 +380,21 @@ export interface WriterPatch {
   shard_z_chunks?: number | null;
   batch_z_shards?: number | null;
   compression?: Compression | null;
+  compression_level?: number | null;
+  compression_shuffle?: CompressionShuffle | null;
   downscale_type?: DownscaleType | null;
   target_shard_gb?: number | null;
+  dark_floor?: number | null;
+  keep_bits?: number | null;
+  lossy_sigma?: number | null;
+  noise_offset?: number | null;
+  noise_sigma_y?: number | null;
+  bin_zyx?: [number, number, number] | null;
+  bin_mode?: BinMode | null;
+  median_zyx?: [number, number, number] | null;
+  lowpass_cutoff_zyx?: [number, number, number] | null;
+  highpass_cutoff_zyx?: [number, number, number] | null;
+  highpass_add?: number | null;
 }
 
 /** Edit fields on one persisted acquisition task. */
@@ -671,6 +699,10 @@ export interface ActiveAcquisition {
   volume_index: number;
   phase: AcquisitionPhase;
   frames_captured: number;
+  raw_bytes?: number;
+  written_bytes?: number;
+  raw_gb_s?: number;
+  compressed_gb_s?: number;
 }
 
 /** A command parameter's introspected signature. */

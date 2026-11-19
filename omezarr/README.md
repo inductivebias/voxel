@@ -103,8 +103,14 @@ from `WriterSettings`; the destination remains a separate storage value passed t
 | `shard_z_chunks` | `1` | Number of chunks along z in each shard |
 | `batch_z_shards` | `1` | Number of z-shards collected in each batch |
 
-Chunk edges are at least 64 voxels and otherwise follow the maximum pyramid factor. Batch depth is
-`batch_z_shards × shard_z_chunks × 2^max_level`; these settings therefore affect both throughput and ring memory.
+Chunk geometry and batch depth depend on the pyramid depth, shard settings, and Z binning. These settings affect
+both throughput and ring memory; `WriterSettings.batch_z` gives the number of raw frames in a batch.
+
+Optional preprocessing includes `lossy_sigma`, `keep_bits`, `dark_floor`, `bin_zyx`, and spatial filters. It is
+disabled by default and requires `uint16` input. Square-root quantization preserves values at or below the noise
+offset; other enabled preprocessing can still change them. Automatic noise parameters are estimated from the first
+batch and recorded in each array's `voxel_preprocessing` attributes. If those parameters cannot be recorded, the
+write fails; an incomplete dataset may remain at the target.
 
 Each dataset contains OME-NGFF group metadata, one array per scale level, and a best-effort `metrics.json` containing
 the resolved configuration and per-batch timing and byte counts.
