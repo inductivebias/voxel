@@ -16,6 +16,7 @@ from vxl.instrument import (
     Instrument,
     InstrumentConfig,
     InstrumentState,
+    JogState,
 )
 from vxl.preview import PreviewLayer, PreviewSourceEmission, VoxelPreviewPacket
 from vxl.preview.protocol import StagePosition
@@ -36,6 +37,7 @@ class FakeInstrument:
         self.preview_channels = Cell[tuple[str, ...]](())
         self.active_profile_id = Cell(next(iter(self.state.value.imaging.profiles)))
         self.history = Cell(HistoryState())
+        self.jog = Cell(JogState())
         self.device_interfaces: dict[str, DeviceInterface] = {}
         self.device_props: dict[str, DeviceProps] = {}
         self.remote_stores = {}

@@ -182,6 +182,17 @@ class ContinuousAxisController(DeviceController["ContinuousAxis"]):
     def ttl_stepping_available(self) -> bool:
         return self._ttl_stepper is not None
 
+    @property
+    @describe(label="Jog Available", desc="Whether the axis supports velocity jogging.")
+    def jog_available(self) -> bool:
+        return self.device.supports_jog
+
+    @describe(label="Jog", desc="Move continuously at a signed velocity (axis units/s); 0 stops.")
+    async def jog(self, velocity: float) -> None:
+        if self._scan_mode != ScanMode.IDLE:
+            raise RuntimeError(f"Cannot jog axis {self.device.uid} while in {self._scan_mode} mode")
+        await self._run_sync(self.device.move_vel, velocity)
+
     @describe(label="Configure TTL Stepper")
     async def configure_ttl_stepper(self, cfg: TTLStepperConfig) -> None:
         if not self._ttl_stepper:
@@ -361,6 +372,20 @@ class ContinuousAxis(Axis):
     def halt(self) -> None:
         """Emergency stop - halt all motion immediately."""
         ...
+
+    def move_vel(self, velocity: float) -> None:
+        """Move continuously at a signed velocity in axis units per second until stopped; 0 stops.
+
+        Not a wire command: callers go through ``ContinuousAxisController.jog``, which refuses while the
+        axis is TTL stepping or scanning. Drivers that support jogging override this; the hardware's own
+        travel limits must still stop the motion.
+        """
+        raise NotImplementedError(f"Axis {self.uid} does not support velocity jogging")
+
+    @property
+    def supports_jog(self) -> bool:
+        """Whether this driver overrides ``move_vel``."""
+        return type(self).move_vel is not ContinuousAxis.move_vel
 
     @describe(label="Await Movement", desc="Wait until the axis stops moving.")
     @abstractmethod
