@@ -25,6 +25,7 @@ _PASSWORD = "minioadmin"  # noqa: S105 - disposable credential for the isolated 
 _ENDPOINT = "http://127.0.0.1:9000"
 _CONTAINER = "voxel-minio-test"
 _BUCKET = "voxel-test"
+_IMAGE = "ghcr.io/coollabsio/minio@sha256:a4938f37f1be1841b8e7b627ad0207b265345fd0d063e42d7410c78af0e63e68"
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,7 @@ def minio() -> Iterator[Minio]:
     started = subprocess.run(
         [docker, "run", "-d", "--name", _CONTAINER, "-p", "9000:9000",
          "-e", f"MINIO_ROOT_USER={_USER}", "-e", f"MINIO_ROOT_PASSWORD={_PASSWORD}",
-         "quay.io/minio/minio", "server", "/data"],
+         _IMAGE, "server", "/data"],
         capture_output=True, text=True, check=False,
     )  # fmt: skip
     if started.returncode != 0:

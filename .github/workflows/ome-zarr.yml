@@ -32,5 +32,5 @@ jobs:
           VOXEL_REQUIRE_MINIO: '1'
         run: |
           docker info
-          docker pull quay.io/minio/minio
+          docker pull ghcr.io/coollabsio/minio@sha256:a4938f37f1be1841b8e7b627ad0207b265345fd0d063e42d7410c78af0e63e68
           uv run --locked pytest omezarr/tests/test_s3.py::test_s3_auto_sqrt_provenance -q -rs
