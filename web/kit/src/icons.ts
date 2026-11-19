@@ -29,6 +29,7 @@ export { default as FileCog } from '~icons/lucide/file-cog';
 export { default as Flashlight } from '~icons/lucide/flashlight';
 export { default as Focus } from '~icons/lucide/focus';
 export { default as Fullscreen } from '~icons/lucide/fullscreen';
+export { default as Gamepad } from '~icons/lucide/gamepad-2';
 export { default as GripVertical } from '~icons/lucide/grip-vertical';
 export { default as History } from '~icons/lucide/history';
 export { default as Info } from '~icons/lucide/info';

@@ -1,16 +1,21 @@
 <script lang="ts">
-  import type { Stage } from '$lib/core/model';
+  import type { Instrument, Stage } from '$lib/core/model';
   import { prefs } from '$lib/core/prefs';
   import { fromMicrometers, getSpatialUnit, toMicrometers } from '$lib/core/spatial-units';
   import { Button, SpinBox } from '@voxel/kit';
   import { cn } from '@voxel/kit/cn';
   import { reportFailure } from '@voxel/kit/failures';
 
+  import JogToggle from './JogToggle.svelte';
+
   interface Props {
     stage: Stage;
+    /** Offers the controller jog switch when given. */
+    instrument?: Instrument;
   }
 
-  let { stage }: Props = $props();
+  let { stage, instrument }: Props = $props();
+  const jogging = $derived(!!instrument?.jog.enabled && !instrument.busy);
 
   const unit = $derived(getSpatialUnit(prefs.spatialUnit.get()));
   // The step of each stage axis box, in µm, whatever unit shows.
@@ -22,7 +27,13 @@
 </script>
 
 <div
-  class="grid min-w-0 grid-cols-4 gap-2 @min-[64rem]/viewer-pane:grid-cols-[repeat(3,10rem)_auto]"
+  class={cn(
+    'grid min-w-0 gap-2 rounded-md',
+    instrument
+      ? 'grid-cols-[repeat(3,minmax(0,1fr))_auto_auto] @min-[64rem]/viewer-pane:grid-cols-[repeat(3,10rem)_auto_auto]'
+      : 'grid-cols-4 @min-[64rem]/viewer-pane:grid-cols-[repeat(3,10rem)_auto]',
+    jogging && 'outline-2 outline-offset-4 outline-success'
+  )}
   role="group"
   aria-label="Stage movement controls"
 >
@@ -48,4 +59,7 @@
   >
     Halt
   </Button>
+  {#if instrument}
+    <JogToggle {instrument} />
+  {/if}
 </div>
