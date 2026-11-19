@@ -28,7 +28,7 @@ import threading
 import time
 from collections.abc import Callable, Generator, Iterator
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cached_property
@@ -37,12 +37,13 @@ from typing import Any, Self, cast
 
 import numpy as np
 from cloudpathlib import S3Path
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from vxlib.vector import UIVec3D, UVec3D, Vec3D
 
 from ome_zarr_writer.array import ArrayWriter
 from ome_zarr_writer.dataset import (
     Compression,
+    CompressionShuffle,
     DownscaleType,
     Dtype,
     OmeZarrDataset,
@@ -51,6 +52,7 @@ from ome_zarr_writer.dataset import (
     Zarr3ArrayMeta,
     Zarr3GroupMeta,
 )
+from ome_zarr_writer.preprocess import BinMode, PreprocessSpec, binned_shape
 from ome_zarr_writer.sizing import MIN_SLOTS, RingSizingError
 from ome_zarr_writer.slot import BatchResult, BatchSlot, OutputSetup, SlotStage
 from ome_zarr_writer.storage import Local, S3Store, StagedS3, StagingConfig, Storage
@@ -83,23 +85,75 @@ class WriterSettings(BaseModel):
     batch_z_shards: int = 1
     # coherence (uniform for a consistent dataset; camera conforms)
     compression: Compression = Field(default=Compression.BLOSC_LZ4, description="Compression codec for zarr chunks")
+    compression_level: int | None = Field(default=None, ge=1, le=22, description="Codec compression level override")
+    compression_shuffle: CompressionShuffle | None = Field(
+        default=None, description="Blosc shuffle mode override (noshuffle, shuffle, bitshuffle)"
+    )
     downscale_type: DownscaleType = Field(
         default=DownscaleType.GAUSSIAN,
         description="Pyramid downsample method. Gaussian (anti-aliased) is the default for display-quality",
     )
     target_shard_gb: float = 1.0
     io_timeout_s: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    # Tunable lossy quantization (uint16 LUT, grey-level preserving)
+    dark_floor: int = Field(default=0, ge=0, le=65535)
+    keep_bits: int | None = Field(default=None, ge=1, le=16)
+    lossy_sigma: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    noise_offset: float | None = Field(default=None, allow_inf_nan=False)
+    noise_sigma_y: float | None = Field(default=None, gt=0.0, allow_inf_nan=False)
+    # Per-axis binning (optional pre-L0 spatial reduction)
+    bin_zyx: tuple[int, int, int] = (1, 1, 1)
+    bin_mode: BinMode = "mean"
+    # CPU Squish spatial filters (applied before binning + LUT)
+    median_zyx: tuple[int, int, int] = (1, 1, 1)
+    lowpass_cutoff_zyx: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    highpass_cutoff_zyx: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    highpass_add: float = Field(default=100.0, ge=0.0, le=65535.0, allow_inf_nan=False)
+
+    @model_validator(mode="after")
+    def _validate_preprocess_and_codec(self) -> Self:
+        if self.compression_level is not None and self.compression in (
+            Compression.BLOSC_LZ4,
+            Compression.BLOSC_ZSTD,
+        ) and self.compression_level > 9:
+            raise ValueError(f"Blosc compression_level must be <= 9, got {self.compression_level}")
+        spec = self.preprocess
+        if spec.halo_z > self.batch_z:
+            raise ValueError(
+                f"Filter Z halo ({spec.halo_z} planes) exceeds batch_z ({self.batch_z}); "
+                f"increase shard_z_chunks/batch_z_shards or raise the Z cutoff frequency"
+            )
+        return self
+
+    @property
+    def preprocess(self) -> PreprocessSpec:
+        """Resolved preprocessing specification (filters, binning, and LUT quantization)."""
+        return PreprocessSpec(**{name: getattr(self, name) for name in PreprocessSpec.model_fields})
 
     @property
     def chunk_shape(self) -> UIVec3D:
-        # Base (L0) chunk is a cube of edge 2^max_level, floored at MIN_CHUNK_EDGE.
+        # Base (L0) on-disk chunk edge: 2^max_level floored at MIN_CHUNK_EDGE. When Z-binning is
+        # active, scale the Z chunk down proportionally (keeping >= max_level.factor and a multiple of
+        # max_level.factor so ScaleLevel.scale stays non-zero) to avoid inflating raw batch_z.
         edge = max(MIN_CHUNK_EDGE, self.max_level.factor)
-        return UIVec3D(z=edge, y=edge, x=edge)
+        fz = self.bin_zyx[0]
+        if fz == 1:
+            cz = edge
+        else:
+            f = self.max_level.factor
+            target = max(f, MIN_CHUNK_EDGE // fz, 8)
+            cz = ((target + f - 1) // f) * f
+        return UIVec3D(z=cz, y=edge, x=edge)
+
+    @property
+    def binned_batch_z(self) -> int:
+        """Binned L0 planes written per batch (equals ``batch_z`` when ``bin_zyx[0] == 1``)."""
+        return self.batch_z_shards * self.shard_z_chunks * self.chunk_shape.z
 
     @property
     def batch_z(self) -> int:
-        # Each worker must own complete shards, including the minimum chunk-edge floor.
-        return self.batch_z_shards * self.shard_z_chunks * self.chunk_shape.z
+        # Raw frames collected per batch: each worker owns complete binned shards.
+        return self.binned_batch_z * self.bin_zyx[0]
 
 
 class WriterConfig(WriterSettings):
@@ -122,6 +176,36 @@ class WriterConfig(WriterSettings):
     channel_color: str = "FFFFFF"
 
     @cached_property
+    def binned_volume_shape(self) -> UIVec3D:
+        """On-disk L0 volume shape after ``bin_zyx`` spatial reduction."""
+        return binned_shape(self.volume_shape, self.bin_zyx)
+
+    @cached_property
+    def binned_voxel_size(self) -> UVec3D:
+        """On-disk L0 physical voxel size after ``bin_zyx`` spatial reduction."""
+        fz, fy, fx = self.bin_zyx
+        return UVec3D(z=self.voxel_size.z * fz, y=self.voxel_size.y * fy, x=self.voxel_size.x * fx)
+
+    @cached_property
+    def binned_origin(self) -> Vec3D | None:
+        """On-disk L0 physical origin shifted by the half-voxel binning center offset."""
+        if self.bin_zyx == (1, 1, 1):
+            return self.origin
+        fz, fy, fx = self.bin_zyx
+        oz, oy, ox = (self.origin.z, self.origin.y, self.origin.x) if self.origin is not None else (0.0, 0.0, 0.0)
+        return Vec3D(
+            z=oz + 0.5 * (fz - 1) * self.voxel_size.z,
+            y=oy + 0.5 * (fy - 1) * self.voxel_size.y,
+            x=ox + 0.5 * (fx - 1) * self.voxel_size.x,
+        )
+
+    @cached_property
+    def finest_axis(self) -> int:
+        """Axis (0=Z, 1=Y, 2=X) with the smallest binned voxel spacing for noise-sigma estimation."""
+        vs = (self.binned_voxel_size.z, self.binned_voxel_size.y, self.binned_voxel_size.x)
+        return int(min(range(3), key=lambda i: vs[i]))
+
+    @cached_property
     def shard_shape(self) -> UIVec3D:
         c_bytes = self.dtype.calc_nbytes(self.chunk_shape)
         c_size_z, c_size_y, c_size_x = self.chunk_shape
@@ -133,7 +217,7 @@ class WriterConfig(WriterSettings):
         yc = max(1, round(math.sqrt(per_layer)))
         xc = max(1, per_layer // yc)
 
-        v_shape = self.volume_shape
+        v_shape = self.binned_volume_shape
         return UIVec3D(
             z=min(zc, max(1, v_shape.z // c_size_z)) * c_size_z,
             y=min(yc, max(1, v_shape.y // c_size_y)) * c_size_y,
@@ -142,7 +226,7 @@ class WriterConfig(WriterSettings):
 
     @cached_property
     def batch_shape(self) -> UIVec3D:
-        """L0 shape of a single batch: one batch deep (``batch_z``) and the full frame in y/x.
+        """Raw L0 shape of a single batch: one batch deep (``batch_z``) and the full raw frame in y/x.
 
         Depends only on ``batch_z`` and the frame extent, not on ``volume_shape.z`` (which sets the
         number of batches, not their shape). A buffer ring sized to this shape therefore serves any
@@ -154,9 +238,10 @@ class WriterConfig(WriterSettings):
     @cached_property
     def dataset(self) -> OmeZarrDataset:
         """Resolve into the OME-Zarr v3 on-disk dataset description."""
+        preprocess_attrs = self.preprocess.metadata_attributes() or None
         arrays: dict[ScaleLevel, Zarr3ArrayMeta] = {}
         for level in self.max_level.levels:
-            sv = level.scale(self.volume_shape)
+            sv = level.scale(self.binned_volume_shape)
             ss = level.scale(self.shard_shape)
             sc = level.scale(self.chunk_shape)
             arrays[level] = Zarr3ArrayMeta.sharded(
@@ -165,16 +250,19 @@ class WriterConfig(WriterSettings):
                 chunk_shape=[1, sc.z, sc.y, sc.x],
                 dtype=self.dtype,
                 compression=self.compression,
+                compression_level=self.compression_level,
+                compression_shuffle=self.compression_shuffle,
                 dimension_names=["c", "z", "y", "x"],
+                attributes=preprocess_attrs,
             )
 
         group = Zarr3GroupMeta.multiscale(
-            voxel_size=self.voxel_size,
+            voxel_size=self.binned_voxel_size,
             voxel_unit=self.voxel_unit,
             max_level=self.max_level,
             downscale_type=self.downscale_type,
             dtype=self.dtype,
-            origin=self.origin,
+            origin=self.binned_origin,
             shear_xz=self.shear_xz,
             shear_yz=self.shear_yz,
             channel_label=self.channel_label,
@@ -231,11 +319,26 @@ class Timing(BaseModel):
         future.add_done_callback(_on_done)
 
 
+class CompressionStats(BaseModel):
+    """Live raw-vs-compressed volume and throughput snapshot across completed batches."""
+
+    raw_bytes: int = 0
+    written_bytes: int = 0
+    raw_gb_s: float = 0.0
+    compressed_gb_s: float = 0.0
+
+    @property
+    def compression_ratio(self) -> float:
+        return self.raw_bytes / self.written_bytes if self.written_bytes > 0 else 1.0
+
+
 class BatchMetrics(BaseModel):
     batch_idx: int
     expected_frames: int
     collected_frames: int = 0
+    raw_bytes: int = 0
     flushed_bytes: int = 0
+    written_bytes: int | None = None
     transfered_bytes: int = 0
     collecting: Timing = Field(default_factory=Timing)
     processing: Timing = Field(default_factory=Timing)
@@ -263,22 +366,61 @@ class Ring:
     batch_shape: UIVec3D
     max_level: ScaleLevel
     dtype: Dtype
+    bin_zyx: tuple[int, int, int] = (1, 1, 1)
+    halo_z: int = 0
 
     @classmethod
-    def allocate(cls, *, slots: int, prefix: str, batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> "Ring":
+    def allocate(
+        cls,
+        *,
+        slots: int,
+        prefix: str,
+        batch_shape: UIVec3D,
+        max_level: ScaleLevel,
+        dtype: Dtype,
+        bin_zyx: tuple[int, int, int] = (1, 1, 1),
+        halo_z: int = 0,
+    ) -> "Ring":
         """Allocate `slots` BatchSlots for one batch geometry, built concurrently (each spawns a worker
         and prefaults its shared memory)."""
 
         def _build(i: int) -> BatchSlot:
-            return BatchSlot(name=f"{prefix}_{i}", shape_l0=batch_shape, max_level=max_level, dtype=dtype)
+            return BatchSlot(
+                name=f"{prefix}_{i}",
+                shape_l0=batch_shape,
+                max_level=max_level,
+                dtype=dtype,
+                bin_zyx=bin_zyx,
+                halo_z=halo_z,
+            )
 
         with ThreadPoolExecutor(max_workers=min(slots, 8)) as pool:
             built = tuple(pool.map(_build, range(slots)))
-        return cls(slots=built, batch_shape=batch_shape, max_level=max_level, dtype=dtype)
+        return cls(
+            slots=built,
+            batch_shape=batch_shape,
+            max_level=max_level,
+            dtype=dtype,
+            bin_zyx=bin_zyx,
+            halo_z=halo_z,
+        )
 
-    def matches(self, batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> bool:
-        """Whether this ring's slots have the given batch shape, pyramid depth, and dtype."""
-        return self.batch_shape == batch_shape and self.max_level == max_level and self.dtype == dtype
+    def matches(
+        self,
+        batch_shape: UIVec3D,
+        max_level: ScaleLevel,
+        dtype: Dtype,
+        bin_zyx: tuple[int, int, int] = (1, 1, 1),
+        halo_z: int = 0,
+    ) -> bool:
+        """Whether this ring's slots match the given batch geometry, binning, and halo depth."""
+        return (
+            self.batch_shape == batch_shape
+            and self.max_level == max_level
+            and self.dtype == dtype
+            and self.bin_zyx == bin_zyx
+            and self.halo_z == halo_z
+        )
 
     def bind_output(self, setup: OutputSetup) -> None:
         """Point every slot's worker at the dataset described by `setup` (open its per-level writers)."""
@@ -363,10 +505,17 @@ class DatasetWriter:
         *,
         backend: ArrayWriter.Backend,
     ) -> None:
-        if not ring.matches(config.batch_shape, config.max_level, config.dtype):
+        if not ring.matches(
+            config.batch_shape,
+            config.max_level,
+            config.dtype,
+            bin_zyx=config.bin_zyx,
+            halo_z=config.preprocess.halo_z,
+        ):
             raise ValueError(
-                f"ring geometry {ring.batch_shape}/{ring.max_level}/{ring.dtype} does not match writer "
-                f"config {config.batch_shape}/{config.max_level}/{config.dtype}"
+                f"ring geometry {ring.batch_shape}/{ring.max_level}/{ring.dtype}/bin={ring.bin_zyx}/halo={ring.halo_z} "
+                f"does not match writer config {config.batch_shape}/{config.max_level}/{config.dtype}"
+                f"/bin={config.bin_zyx}/halo={config.preprocess.halo_z}"
             )
         if len(ring) < 2:
             raise ValueError(f"ring needs at least 2 slots, got {len(ring)}")
@@ -378,9 +527,14 @@ class DatasetWriter:
 
         self._channel = config.channel_index
         self._volume_z = config.volume_shape.z
+        self._binned_volume_z = config.binned_volume_shape.z
         self._levels = list(config.dataset.arrays)
         self._shard_z = config.dataset.shard_shape.z
         self._batch_z = config.batch_z
+        self._binned_batch_z = config.binned_batch_z
+        self._frame_nbytes = config.volume_shape.y * config.volume_shape.x * config.dtype.itemsize
+        self._preprocess = config.preprocess
+        self._halo_z = self._preprocess.halo_z
         self._staging = storage.tuning if isinstance(storage, StagedS3) else None  # upload tuning, iff staged
         self._store: S3Store | None = None if isinstance(storage, Local) else storage.store  # S3 connection, iff remote
         self._target = _as_ome_zarr(storage.target)  # concrete dataset location: base target + .ome.zarr
@@ -392,6 +546,7 @@ class DatasetWriter:
         if scratch is not None:
             config.dataset.write_metadata(scratch)
         author_root = scratch if scratch is not None else self._target
+        self._author_root = author_root
 
         # Point every slot's worker at this dataset's arrays. The worker does the downsample AND the
         # write, so the main process opens no array writers of its own.
@@ -405,8 +560,15 @@ class DatasetWriter:
                 batch_z=self._batch_z,
                 volume_z=self._volume_z,
                 reduction=config.downscale_type,
+                preprocess=self._preprocess,
+                binned_batch_z=self._binned_batch_z,
+                binned_volume_z=self._binned_volume_z,
+                finest_axis=config.finest_axis,
             )
         )
+
+        # Batch-0 auto-calibrated Anscombe (offset, sigma_y); workers build and cache their own 128 KB LUT.
+        self._resolved_sqrt: tuple[float, float] | None = None
 
         # Staged upload (main-side): the worker writes shards to scratch; the main process uploads them
         # per batch (s5cmd) as each flush completes. A semaphore bounds in-flight uploads so scratch
@@ -424,6 +586,9 @@ class DatasetWriter:
         # promotes one reusable slot from IDLE to COLLECTING (see new_frame).
         self._frames_added = 0
         self._current_slot: int | None = None
+        self._pending_halo_slot: int | None = None
+        self._prev_tail: np.ndarray | None = None
+        self._batch0_slot: int | None = None
         self._next_slot_hint = 0
         self._frame_open = False
         self._latest_slot: BatchSlot | None = None
@@ -516,6 +681,9 @@ class DatasetWriter:
                     self._harvest(slot_idx)  # completed future: record metrics before reassigning its memory
                 batch_idx = self._frames_added // self._batch_z
                 slot.assign_batch(batch_idx)
+                if self._halo_z > 0 and self._prev_tail is not None:
+                    slot.set_halo_lead(self._prev_tail)
+                    self._prev_tail = None
                 self._batches[batch_idx].collecting.begin()
                 self._current_slot = slot_idx
                 self._next_slot_hint = (slot_idx + 1) % self._slot_count
@@ -550,8 +718,25 @@ class DatasetWriter:
         self._frame_open = False
 
         try:
+            # Feed trailing Z-halo frames to the previous batch and flush it as soon as its halo is full.
+            if self._pending_halo_slot is not None:
+                pending_slot = self._ring[self._pending_halo_slot]
+                trail_idx = slot.filled_l0 - 1
+                if trail_idx < self._halo_z:
+                    pending_slot.set_halo_trail_frame(trail_idx, slot.last_committed_frame())
+                if pending_slot.halo_trail_count >= self._halo_z:
+                    p_idx = self._pending_halo_slot
+                    self._pending_halo_slot = None
+                    self._submit_slot_flush(p_idx)
+
             if slot.filled_l0 == self._batch_z and self._frames_added < self._volume_z:
-                self._flush_current()
+                self._batches[slot.batch_idx].collecting.complete()
+                if self._halo_z > 0:
+                    self._prev_tail = slot.tail_frames(self._halo_z)
+                    slot.mark_pending_halo()
+                    self._pending_halo_slot = self._current_slot
+                else:
+                    self._submit_slot_flush(self._current_slot)
                 self._current_slot = None
                 self._reap()
                 if self._staging is not None:
@@ -586,11 +771,19 @@ class DatasetWriter:
         if self._frame_open:
             raise RuntimeError("cannot close writer while a frame is open")
         flush_error = self._failure
+        if self._pending_halo_slot is not None:
+            p_idx = self._pending_halo_slot
+            self._pending_halo_slot = None
+            try:
+                self._submit_slot_flush(p_idx)
+            except Exception as exc:
+                self._failure = self._failure or exc
+                flush_error = flush_error or exc
         if self._current_slot is not None:
             slot = self._ring[self._current_slot]
             try:
                 if slot.filled_l0 > 0 and slot.stage == SlotStage.COLLECTING:  # the final partial batch
-                    self._flush_current()
+                    self._complete_and_flush_slot(self._current_slot)
             except Exception as exc:
                 self._failure = self._failure or exc
                 flush_error = flush_error or exc
@@ -605,6 +798,8 @@ class DatasetWriter:
                 flush_error = flush_error or exc
         upload_error = self._drain_uploads()
         self._upload_pool.shutdown(wait=True)
+        if self._preprocess.needs_auto_sqrt and self._resolved_sqrt is not None:
+            self._patch_resolved_sqrt_metadata()
         self._log_timing_summary()
         self._write_batch_metrics()
         error = flush_error or upload_error
@@ -629,23 +824,50 @@ class DatasetWriter:
         except Exception:
             log.warning("Failed to write batch metrics for %s", self._target, exc_info=True)
 
-    def _flush_current(self) -> None:
-        """Close the current batch's `collecting` span and hand it to its slot's worker to downsample and
-        write; track the flush future (by slot) for reuse/harvest."""
-        if self._current_slot is None:
-            raise RuntimeError("cannot flush without a collecting slot")
-        slot = self._ring[self._current_slot]
-        if slot.batch_idx is None:  # narrowing: the slot has been collecting a batch
+    def _complete_and_flush_slot(self, slot_idx: int) -> None:
+        slot = self._ring[slot_idx]
+        if slot.batch_idx is None:
             raise RuntimeError("cannot flush a slot with no batch assigned")
         self._batches[slot.batch_idx].collecting.complete()
-        self._inflight[self._current_slot] = (slot.batch_idx, slot.flush())
+        self._submit_slot_flush(slot_idx)
+
+    def _submit_slot_flush(self, slot_idx: int) -> None:
+        """Hand a ready slot to its worker to preprocess, downsample, and write; track its future."""
+        slot = self._ring[slot_idx]
+        if slot.batch_idx is None:  # narrowing: the slot has been collecting a batch
+            raise RuntimeError("cannot flush a slot with no batch assigned")
+        batch_idx = slot.batch_idx
+        if (
+            self._preprocess.needs_auto_sqrt
+            and self._resolved_sqrt is None
+            and batch_idx > 0
+            and self._batch0_slot is not None
+            and self._batch0_slot in self._inflight
+        ):
+            # Ensure batch 0's auto-calibrated (offset, sigma_y) is resolved so all batches share one LUT.
+            self._harvest(self._batch0_slot)
+        fut = slot.flush() if self._resolved_sqrt is None else slot.flush(sqrt_params=self._resolved_sqrt)
+        self._inflight[slot_idx] = (batch_idx, fut)
+        if batch_idx == 0 and self._preprocess.needs_auto_sqrt:
+            self._batch0_slot = slot_idx
 
     def _harvest(self, slot_idx: int) -> None:
         """Wait for a slot's flush, record its metrics, and (when staging) queue its upload. Blocks until
         the worker's downsample+write is durable, after which the slot is IDLE (reusable)."""
         batch_idx, future = self._inflight.pop(slot_idx)
         try:
-            self._record(batch_idx, future.result())  # raises if the worker's downsample/write failed
+            result = future.result()  # raises if the worker's downsample/write failed
+            self._record(batch_idx, result)
+            if (
+                batch_idx == 0
+                and self._preprocess.needs_auto_sqrt
+                and self._resolved_sqrt is None
+                and result.resolved_offset is not None
+                and result.resolved_sigma_y is not None
+            ):
+                self._resolved_sqrt = (result.resolved_offset, result.resolved_sigma_y)
+            if isinstance(self._author_root, Path):
+                self._batches[batch_idx].written_bytes = self._measure_batch_written_bytes(batch_idx)
             if self._staging is not None:
                 self._queue_upload(batch_idx)
         except Exception as exc:
@@ -664,7 +886,76 @@ class DatasetWriter:
         batch = self._batches[batch_idx]
         batch.processing.started, batch.processing.ended = result.process_started, result.process_ended
         batch.flushing.started, batch.flushing.ended = result.flush_started, result.flush_ended
+        batch.raw_bytes = batch.collected_frames * self._frame_nbytes
         batch.flushed_bytes = result.flushed_bytes
+
+    def _batch_z_shards(self, batch_idx: int) -> range:
+        """L0 (binned) Z-shard index range owned by ``batch_idx``."""
+        z_start = batch_idx * self._binned_batch_z
+        z_end = min(z_start + self._binned_batch_z, self._binned_volume_z)
+        if z_end <= z_start:
+            return range(0)
+        return range(z_start // self._shard_z, math.ceil(z_end / self._shard_z))
+
+    def _measure_batch_written_bytes(self, batch_idx: int) -> int:
+        """Sum exact on-disk shard sizes written for ``batch_idx`` across all pyramid levels."""
+        if not isinstance(self._author_root, Path):
+            return 0
+        z_shards = self._batch_z_shards(batch_idx)
+        if not z_shards:
+            return 0
+        total = 0
+        for shard in self._config.dataset.shards(channels=[self._channel], z_range=z_shards):
+            with suppress(FileNotFoundError):
+                total += shard.at(self._author_root).stat().st_size
+        return total
+
+    def _patch_resolved_sqrt_metadata(self) -> None:
+        """Record batch-0 auto-calibrated ``noise_offset`` and ``noise_sigma_y`` in array metadata (best-effort)."""
+        if self._resolved_sqrt is None:
+            return
+        attrs = self._preprocess.metadata_attributes(
+            resolved_offset=self._resolved_sqrt[0],
+            resolved_sigma_y=self._resolved_sqrt[1],
+        )
+        if not attrs:
+            return
+        for level in self._levels:
+            meta_path = self._target / str(level.value) / "zarr.json"
+            try:
+                doc = json.loads(meta_path.read_text())
+                existing = doc.get("attributes") if isinstance(doc.get("attributes"), dict) else {}
+                existing.update(attrs)
+                doc["attributes"] = existing
+                meta_path.write_text(json.dumps(doc, indent=2))
+            except Exception:
+                log.debug("Failed to update resolved sqrt metadata at %s", meta_path, exc_info=True)
+
+    def live_compression_stats(self) -> CompressionStats | None:
+        """Aggregate raw vs on-disk compressed bytes and recent throughput across completed batches."""
+        completed = [b for b in self._batches if b.written_bytes is not None and b.raw_bytes > 0]
+        if not completed:
+            return None
+        raw_bytes = sum(b.raw_bytes for b in completed)
+        written_bytes = sum(b.written_bytes for b in completed if b.written_bytes is not None)
+        window = completed[-4:]
+        t0 = window[0].collecting.started
+        t1 = window[-1].flushing.ended
+        if t0 is not None and t1 is not None:
+            dt = max((t1 - t0).total_seconds(), 1e-6)
+            win_raw = sum(b.raw_bytes for b in window)
+            win_written = sum(b.written_bytes for b in window if b.written_bytes is not None)
+            raw_gb_s = win_raw / 1e9 / dt
+            compressed_gb_s = win_written / 1e9 / dt
+        else:
+            raw_gb_s = 0.0
+            compressed_gb_s = 0.0
+        return CompressionStats(
+            raw_bytes=raw_bytes,
+            written_bytes=written_bytes,
+            raw_gb_s=raw_gb_s,
+            compressed_gb_s=compressed_gb_s,
+        )
 
     def _queue_upload(self, batch_idx: int) -> None:
         """Queue the s5cmd upload of a written batch's shards (staged only). Blocks if max_pending uploads
@@ -672,20 +963,18 @@ class DatasetWriter:
         tuning = self._staging
         if tuning is None:
             return
-        z_start = batch_idx * self._batch_z
-        z_end = min(z_start + self._batch_z, self._volume_z)
-        jobs = self._transfer_jobs(z_start, z_end)
+        jobs = self._transfer_jobs(batch_idx)
         if not self._upload_slots.acquire(timeout=self._config.io_timeout_s):
             raise TimeoutError("Uploads did not release staging capacity before the I/O deadline")
         batch = self._batches[batch_idx]
         self._uploads.append(self._upload_pool.submit(self._upload_and_evict, jobs, batch, tuning))
 
-    def _transfer_jobs(self, z_start: int, z_end: int) -> list[TransferJob]:
+    def _transfer_jobs(self, batch_idx: int) -> list[TransferJob]:
         """The batch's shards as upload jobs: scratch source → S3 target, across every pyramid level
-        (`dataset.shards` enumerates them; z is in L0 shard indices). Empty for a non-staged storage."""
+        (`dataset.shards` enumerates them; z is in binned L0 shard indices). Empty for non-staged storage."""
         if not isinstance(self._storage, StagedS3):  # nothing to upload
             return []
-        z_shards = range(z_start // self._shard_z, math.ceil(z_end / self._shard_z))
+        z_shards = self._batch_z_shards(batch_idx)
         dest_root = cast("S3Path", self._target)  # staged ⇒ target is an S3Path (see StagedS3)
         return [
             TransferJob(src=shard.at(self._storage.scratch), dest=shard.at(dest_root))
@@ -794,6 +1083,7 @@ class OMEZarrWriter:
         self._ring: Ring | None = None
         self._active: DatasetWriter | None = None
         self._ring_failed = False
+        self._last_compression_stats: CompressionStats | None = None
 
     @property
     def ready_for_batch(self) -> bool:
@@ -811,6 +1101,12 @@ class OMEZarrWriter:
     def batches(self) -> list[BatchMetrics]:
         """The per-batch metrics of the open dataset, or an empty list when none is open."""
         return self._active.batches if self._active is not None else []
+
+    def live_compression_stats(self) -> CompressionStats | None:
+        """Live compression stats for the open stack, or the most recently ended stack."""
+        if self._active is not None:
+            return self._active.live_compression_stats()
+        return self._last_compression_stats
 
     @property
     def target(self) -> Path | S3Path | None:
@@ -836,10 +1132,17 @@ class OMEZarrWriter:
         """
         if self._active is not None:
             raise RuntimeError("stack already open; call end_stack() first")
+        self._last_compression_stats = None
         if (
             self._ring is None
             or self._ring_failed
-            or not self._ring.matches(config.batch_shape, config.max_level, config.dtype)
+            or not self._ring.matches(
+                config.batch_shape,
+                config.max_level,
+                config.dtype,
+                bin_zyx=config.bin_zyx,
+                halo_z=config.preprocess.halo_z,
+            )
         ):
             self._drop_ring()
             slots = sizer(config) if sizer is not None else self._slots
@@ -851,6 +1154,8 @@ class OMEZarrWriter:
                 batch_shape=config.batch_shape,
                 max_level=config.max_level,
                 dtype=config.dtype,
+                bin_zyx=config.bin_zyx,
+                halo_z=config.preprocess.halo_z,
             )
         self._active = DatasetWriter(config, storage, self._ring, backend=self._backend)
         return self._active
@@ -881,6 +1186,7 @@ class OMEZarrWriter:
             self._ring_failed = True
             raise
         finally:
+            self._last_compression_stats = self._active.live_compression_stats()
             self._active = None
 
     def close(self) -> None:
@@ -890,6 +1196,7 @@ class OMEZarrWriter:
                 self._active.close()
         finally:
             self._active = None
+            self._last_compression_stats = None
             self._drop_ring()
 
     def _drop_ring(self) -> None:

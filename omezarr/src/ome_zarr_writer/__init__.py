@@ -43,6 +43,7 @@ from vxlib.vector import UIVec2D, UIVec3D, UVec3D, Vec3D
 from .dataset import (
     AffineTransform,
     Compression,
+    CompressionShuffle,
     CoordinateSystem,
     DownscaleType,
     Dtype,
@@ -61,13 +62,17 @@ from .deskew import (
     shear_factor_from_angle,
     shear_xz_from_angle,
 )
+from .preprocess import BinMode, PreprocessSpec
 from .storage import DirectS3, Local, S3Store, StagedS3, StagingConfig, Storage
-from .writer import BatchMetrics, FrameLease, OMEZarrWriter, WriterConfig, WriterSettings
+from .writer import BatchMetrics, CompressionStats, FrameLease, OMEZarrWriter, WriterConfig, WriterSettings
 
 __all__ = [
     "AffineTransform",
     "BatchMetrics",
+    "BinMode",
     "Compression",
+    "CompressionShuffle",
+    "CompressionStats",
     "CoordinateSystem",
     "DirectS3",
     "DownscaleType",
@@ -79,6 +84,7 @@ __all__ = [
     "Omero",
     "OmeroChannel",
     "OmeroWindow",
+    "PreprocessSpec",
     "S3Store",
     "ScaleLevel",
     "SequenceTransform",

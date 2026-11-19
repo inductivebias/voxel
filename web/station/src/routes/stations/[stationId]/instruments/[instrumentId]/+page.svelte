@@ -8,7 +8,9 @@
     type AcquisitionManifest,
     type AcquisitionStatus,
     type AcquisitionTask,
+    type BinMode,
     type Compression,
+    type CompressionShuffle,
     createAreaTask,
     createLineTask,
     createPositionTask,
@@ -20,6 +22,8 @@
     planningFov,
     type ScaleLevel,
     type VolumeStatus,
+    type WriterPatch,
+    type WriterSettings,
     type XYDefinition
   } from '$lib/core/model';
   import { planOverlap, prefs } from '$lib/core/prefs';
@@ -45,9 +49,14 @@
 
   const TASK_ROUTE = '/stations/[stationId]/instruments/[instrumentId]/(open)/run/[taskId]';
   const LOCAL_STORE = '__local__';
+  const AUTO_SHUFFLE = '__auto__';
   const COMPRESSIONS: Compression[] = ['blosc.lz4', 'blosc.zstd', 'zstd', 'lz4', 'gzip', 'none'];
+  const SHUFFLES: (CompressionShuffle | typeof AUTO_SHUFFLE)[] = [AUTO_SHUFFLE, 'noshuffle', 'shuffle', 'bitshuffle'];
+  const BIN_MODES: BinMode[] = ['mean', 'median', 'max', 'sum', 'nearest'];
+  const MEDIAN_SIZES = [1, 3, 5, 7, 9];
   const DOWNSCALE_TYPES: DownscaleType[] = ['gaussian', 'mean', 'min', 'max'];
   const PYRAMID_LEVELS: ScaleLevel[] = [0, 1, 2, 3, 4, 5, 6, 7];
+  const AXES = ['Z', 'Y', 'X'] as const;
   const TASK_TYPES: Record<XYDefinition['mode'], string> = {
     explicit_points: 'Positions',
     bounding_box: 'Area',
@@ -186,6 +195,7 @@
   let sampleOpen = $state(false);
   let destinationOpen = $state(false);
   let formatOpen = $state(false);
+  let preprocessOpen = $state(false);
   let checksOpen = $state(true);
 
   const missing = $derived(
@@ -212,6 +222,36 @@
 
   function chunkEdge(level: ScaleLevel): number {
     return Math.max(64, 1 << level);
+  }
+
+  function formatBytes(bytes: number): string {
+    if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(2)} GB`;
+    if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(1)} MB`;
+    return `${(bytes / 1e3).toFixed(0)} KB`;
+  }
+
+  function formatSummary(out: WriterSettings): string {
+    const parts = [out.compression, `pyramid L${out.max_level}`];
+    if (out.lossy_sigma) parts.push(`σ=${out.lossy_sigma}`);
+    if (out.keep_bits && out.keep_bits < 16) parts.push(`${out.keep_bits}-bit`);
+    const bin = out.bin_zyx ?? [1, 1, 1];
+    if (bin.some((v) => v > 1)) parts.push(`bin ${bin.join('×')}`);
+    const hasFilter =
+      (out.median_zyx ?? [1, 1, 1]).some((v) => v > 1) ||
+      (out.lowpass_cutoff_zyx ?? [0, 0, 0]).some((v) => v > 0) ||
+      (out.highpass_cutoff_zyx ?? [0, 0, 0]).some((v) => v > 0);
+    if (hasFilter) parts.push('squish');
+    return parts.join(', ');
+  }
+
+  function replaceAxis(tuple: [number, number, number], axis: number, value: number): [number, number, number] {
+    const next: [number, number, number] = [...tuple];
+    next[axis] = value;
+    return next;
+  }
+
+  function patchOutput(inst: Instrument, patch: WriterPatch): void {
+    reportFailure(inst.updateOutput(patch));
   }
 
   function framesOf(item: PlannedVolume): number {
@@ -576,7 +616,7 @@
 
         <CollapsibleSection heading="Format" bind:open={formatOpen}>
           {#snippet trailing()}
-            <span class="truncate text-sm text-fg-muted">{output.compression}, pyramid L{output.max_level}</span>
+            <span class="truncate text-sm text-fg-muted">{formatSummary(output)}</span>
           {/snippet}
           <fieldset class="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-3" disabled={Boolean(capture)}>
             <Field label="Compression">
@@ -584,6 +624,31 @@
                 value={output.compression}
                 options={COMPRESSIONS}
                 onChange={(compression) => reportFailure(instrument.updateOutput({ compression }))}
+              />
+            </Field>
+            <Field label="Compression level">
+              <SpinBox
+                value={output.compression_level ?? 0}
+                onChange={(value) =>
+                  reportFailure(instrument.updateOutput({ compression_level: value > 0 ? value : null }))}
+                onEditStart={() => instrument.edits.hold()}
+                min={0}
+                max={output.compression.startsWith('blosc') ? 9 : 22}
+                step={1}
+                size="sm"
+              />
+            </Field>
+            <Field label="Blosc shuffle">
+              <Select
+                value={output.compression_shuffle ?? AUTO_SHUFFLE}
+                options={SHUFFLES}
+                formatLabel={(value) => (value === AUTO_SHUFFLE ? 'Auto' : displayName(value))}
+                onChange={(value) =>
+                  reportFailure(
+                    instrument.updateOutput({
+                      compression_shuffle: value === AUTO_SHUFFLE ? null : value
+                    })
+                  )}
               />
             </Field>
             <Field label="Downscale">
@@ -609,7 +674,7 @@
             <Field label="Shard Z chunks">
               <SpinBox
                 value={output.shard_z_chunks}
-                onChange={(value) => instrument.updateOutput({ shard_z_chunks: value })}
+                onChange={(value) => reportFailure(instrument.updateOutput({ shard_z_chunks: value }))}
                 onEditStart={() => instrument.edits.hold()}
                 min={1}
                 step={1}
@@ -619,7 +684,7 @@
             <Field label="Batch Z shards">
               <SpinBox
                 value={output.batch_z_shards}
-                onChange={(value) => instrument.updateOutput({ batch_z_shards: value })}
+                onChange={(value) => reportFailure(instrument.updateOutput({ batch_z_shards: value }))}
                 onEditStart={() => instrument.edits.hold()}
                 min={1}
                 step={1}
@@ -629,7 +694,7 @@
             <Field label="Target shard">
               <SpinBox
                 value={output.target_shard_gb}
-                onChange={(value) => instrument.updateOutput({ target_shard_gb: value })}
+                onChange={(value) => reportFailure(instrument.updateOutput({ target_shard_gb: value }))}
                 onEditStart={() => instrument.edits.hold()}
                 min={0.1}
                 step={0.05}
@@ -640,6 +705,172 @@
               />
             </Field>
           </fieldset>
+
+          {@const binZyx = output.bin_zyx ?? [1, 1, 1]}
+          {@const medianZyx = output.median_zyx ?? [1, 1, 1]}
+          {@const lpZyx = output.lowpass_cutoff_zyx ?? [0, 0, 0]}
+          {@const hpZyx = output.highpass_cutoff_zyx ?? [0, 0, 0]}
+          {@const manualSqrt = output.noise_offset != null || output.noise_sigma_y != null}
+          <div class="border-border/60 mt-3 border-t pt-3">
+            {#snippet axisSpins(
+              label: string,
+              values: [number, number, number],
+              key: 'bin_zyx' | 'lowpass_cutoff_zyx' | 'highpass_cutoff_zyx',
+              min: number,
+              max: number,
+              step: number,
+              decimals?: number,
+              suffix?: string
+            )}
+              {#each AXES as axis, idx (axis)}
+                <Field label={`${label} ${axis}`}>
+                  <SpinBox
+                    value={values[idx]}
+                    onChange={(value) => patchOutput(instrument, { [key]: replaceAxis(values, idx, value) })}
+                    onEditStart={() => instrument.edits.hold()}
+                    {min}
+                    {max}
+                    {step}
+                    {decimals}
+                    {suffix}
+                    size="sm"
+                  />
+                </Field>
+              {/each}
+            {/snippet}
+            <CollapsibleSection heading="Lossy quantization & Squish" bind:open={preprocessOpen}>
+              <fieldset class="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-3" disabled={Boolean(capture)}>
+                <Field label="Lossy σ (sqrt)">
+                  <SpinBox
+                    value={output.lossy_sigma ?? 0}
+                    onChange={(value) => patchOutput(instrument, { lossy_sigma: value > 0 ? value : null })}
+                    onEditStart={() => instrument.edits.hold()}
+                    min={0}
+                    max={5}
+                    step={0.25}
+                    decimals={2}
+                    size="sm"
+                  />
+                </Field>
+                <Field label="Keep bits">
+                  <SpinBox
+                    value={output.keep_bits ?? 16}
+                    onChange={(value) => patchOutput(instrument, { keep_bits: value < 16 ? value : null })}
+                    onEditStart={() => instrument.edits.hold()}
+                    min={1}
+                    max={16}
+                    step={1}
+                    size="sm"
+                  />
+                </Field>
+                <Field label="Dark floor">
+                  <SpinBox
+                    value={output.dark_floor ?? 0}
+                    onChange={(value) => patchOutput(instrument, { dark_floor: value })}
+                    onEditStart={() => instrument.edits.hold()}
+                    min={0}
+                    max={65535}
+                    step={5}
+                    size="sm"
+                  />
+                </Field>
+
+                {#if output.lossy_sigma}
+                  <div class="flex items-end sm:col-span-1">
+                    <label
+                      class="flex h-ui-sm items-center gap-2 text-sm whitespace-nowrap text-fg"
+                      title="Leave unchecked to auto-estimate camera offset and noise sigma on batch 0"
+                    >
+                      <Checkbox
+                        value={manualSqrt}
+                        onChange={(checked) =>
+                          patchOutput(
+                            instrument,
+                            checked
+                              ? {
+                                  noise_offset: output.noise_offset ?? 100,
+                                  noise_sigma_y: output.noise_sigma_y ?? 1.0
+                                }
+                              : { noise_offset: null, noise_sigma_y: null }
+                          )}
+                      />
+                      Manual noise fit
+                    </label>
+                  </div>
+                  {#if manualSqrt}
+                    <Field label="Noise offset">
+                      <SpinBox
+                        value={output.noise_offset ?? 100}
+                        onChange={(value) =>
+                          patchOutput(instrument, {
+                            noise_offset: value,
+                            noise_sigma_y: output.noise_sigma_y ?? 1.0
+                          })}
+                        onEditStart={() => instrument.edits.hold()}
+                        min={0}
+                        max={65535}
+                        step={5}
+                        decimals={1}
+                        size="sm"
+                      />
+                    </Field>
+                    <Field label="Noise σ_y">
+                      <SpinBox
+                        value={output.noise_sigma_y ?? 1.0}
+                        onChange={(value) =>
+                          patchOutput(instrument, {
+                            noise_offset: output.noise_offset ?? 100,
+                            noise_sigma_y: value
+                          })}
+                        onEditStart={() => instrument.edits.hold()}
+                        min={0.01}
+                        max={100}
+                        step={0.1}
+                        decimals={2}
+                        size="sm"
+                      />
+                    </Field>
+                  {/if}
+                {/if}
+
+                {@render axisSpins('Bin', binZyx, 'bin_zyx', 1, 16, 1)}
+                <Field label="Bin mode">
+                  <Select
+                    value={output.bin_mode ?? 'mean'}
+                    options={BIN_MODES}
+                    formatLabel={displayName}
+                    onChange={(bin_mode) => patchOutput(instrument, { bin_mode })}
+                  />
+                </Field>
+                <Field label="High-pass offset">
+                  <SpinBox
+                    value={output.highpass_add ?? 100}
+                    onChange={(value) => patchOutput(instrument, { highpass_add: value })}
+                    onEditStart={() => instrument.edits.hold()}
+                    min={0}
+                    max={65535}
+                    step={10}
+                    size="sm"
+                  />
+                </Field>
+                <div></div>
+
+                {#each AXES as axis, idx (axis)}
+                  <Field label={`Median ${axis}`}>
+                    <Select
+                      value={medianZyx[idx]}
+                      options={MEDIAN_SIZES}
+                      formatLabel={(v) => (v === 1 ? 'Off' : String(v))}
+                      onChange={(value) => patchOutput(instrument, { median_zyx: replaceAxis(medianZyx, idx, value) })}
+                    />
+                  </Field>
+                {/each}
+
+                {@render axisSpins('Low-pass', lpZyx, 'lowpass_cutoff_zyx', 0, 50, 0.5, 1, 'vx')}
+                {@render axisSpins('High-pass', hpZyx, 'highpass_cutoff_zyx', 0, 500, 5, 0, 'vx')}
+              </fieldset>
+            </CollapsibleSection>
+          </div>
         </CollapsibleSection>
       </Section>
     {/if}
@@ -669,6 +900,20 @@
             <dd>{taskAndProfile(manifest, volume)}</dd>
             <dt>Frames</dt>
             <dd class="font-mono tabular-nums">{active.frames_captured} / {framesTotal}</dd>
+            {#if active.raw_bytes && active.written_bytes}
+              {@const ratio = active.raw_bytes / active.written_bytes}
+              {@const bpv = 16 / ratio}
+              <dt>Throughput</dt>
+              <dd class="font-mono tabular-nums">
+                {(active.raw_gb_s ?? 0).toFixed(2)} → {(active.compressed_gb_s ?? 0).toFixed(2)} GB/s
+              </dd>
+              <dt>Compression</dt>
+              <dd class="font-mono tabular-nums">
+                {formatBytes(active.raw_bytes)} → {formatBytes(active.written_bytes)} ({ratio.toFixed(1)}× · {bpv.toFixed(
+                  1
+                )} bpv)
+              </dd>
+            {/if}
             <dt>Position</dt>
             <dd class="font-mono tabular-nums">
               {stage.qualifiedLabel('x')}

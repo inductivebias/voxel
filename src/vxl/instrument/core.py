@@ -14,6 +14,7 @@ from pathlib import Path, PurePosixPath
 from typing import Annotated, Any, Literal, Self
 
 from cloudpathlib import S3Path
+from ome_zarr_writer import CompressionStats, WriterSettings
 from pydantic import BaseModel, Field, ValidationError
 from vxl_records import (
     AcquisitionManifest,
@@ -151,6 +152,10 @@ class ActiveAcquisition(FrozenModel):
     volume_index: int = Field(ge=0)
     phase: AcquisitionPhase
     frames_captured: int = Field(default=0, ge=0)
+    raw_bytes: int = Field(default=0, ge=0)
+    written_bytes: int = Field(default=0, ge=0)
+    raw_gb_s: float = Field(default=0.0, ge=0.0)
+    compressed_gb_s: float = Field(default=0.0, ge=0.0)
 
 
 class IdleActivity(FrozenModel):
@@ -1539,8 +1544,13 @@ class Instrument:
         return Change(before=before, after=after)
 
     async def _write_output(self, patch: WriterPatch) -> Change[WriterPatch]:
-        before = WriterPatch.model_validate(self._store.value.output.model_dump(include=patch.model_fields_set))
-        await self._store.update(output=self._store.value.output.model_copy(update=patch.changes()))
+        current = self._store.value.output
+        before = WriterPatch.model_validate(current.model_dump(include=patch.model_fields_set))
+        try:
+            validated = WriterSettings.model_validate({**current.model_dump(), **patch.changes()})
+        except ValidationError as e:
+            raise OperationRejectedError("; ".join(err["msg"] for err in e.errors())) from e
+        await self._store.update(output=validated)
         after = WriterPatch.model_validate(self._store.value.output.model_dump(include=patch.model_fields_set))
         return Change(before=before, after=after)
 
@@ -1690,6 +1700,8 @@ class Instrument:
         volume_index: int | None = None,
         phase: AcquisitionPhase | None = None,
         frames_captured: int | None = None,
+        compression: CompressionStats | None = None,
+        reset_compression: bool = False,
     ) -> ActiveAcquisition:
         capture = self._capture_activity()
         current = capture.acquisition
@@ -1697,15 +1709,48 @@ class Instrument:
             raise RuntimeError("cannot update acquisition state when no run is active")
         if current.id != manifest.id:
             raise RuntimeError("active acquisition does not match the running manifest")
+        if reset_compression:
+            raw_bytes, written_bytes, raw_gb_s, compressed_gb_s = 0, 0, 0.0, 0.0
+        elif compression is not None:
+            raw_bytes = compression.raw_bytes
+            written_bytes = compression.written_bytes
+            raw_gb_s = compression.raw_gb_s
+            compressed_gb_s = compression.compressed_gb_s
+        else:
+            raw_bytes = current.raw_bytes
+            written_bytes = current.written_bytes
+            raw_gb_s = current.raw_gb_s
+            compressed_gb_s = current.compressed_gb_s
         updated = ActiveAcquisition(
             id=current.id,
             manifest_revision=manifest.revision,
             volume_index=current.volume_index if volume_index is None else volume_index,
             phase=current.phase if phase is None else phase,
             frames_captured=current.frames_captured if frames_captured is None else frames_captured,
+            raw_bytes=raw_bytes,
+            written_bytes=written_bytes,
+            raw_gb_s=raw_gb_s,
+            compressed_gb_s=compressed_gb_s,
         )
         await self._activity.set(capture.model_copy(update={"acquisition": updated}))
         return updated
+
+    async def _writer_compression_stats(self, channels: Mapping[str, Channel]) -> CompressionStats | None:
+        """Aggregate live raw-vs-compressed metrics across the active cameras for the current volume."""
+        try:
+            per_cam = await asyncio.gather(*(ch.camera.writer_compression_stats() for ch in channels.values()))
+        except Exception:
+            logger.debug("Failed to query writer compression stats", exc_info=True)
+            return None
+        present = [s for s in per_cam if s is not None]
+        if not present:
+            return None
+        return CompressionStats(
+            raw_bytes=sum(s.raw_bytes for s in present),
+            written_bytes=sum(s.written_bytes for s in present),
+            raw_gb_s=sum(s.raw_gb_s for s in present),
+            compressed_gb_s=sum(s.compressed_gb_s for s in present),
+        )
 
     def _capture_activity(self) -> CaptureActivity:
         activity = self._activity.value
@@ -1789,6 +1834,7 @@ class Instrument:
             volume_index=volume_index,
             phase=AcquisitionPhase.CONFIGURING,
             frames_captured=0,
+            reset_compression=True,
         )
         settings = self._store.value.output
         channels = {uid: self._channels[uid] for uid in self._store.value.imaging.profiles[volume.profile].channels}
@@ -1855,7 +1901,8 @@ class Instrument:
             manifest = await self._records.acquisitions.complete_volume(
                 manifest.id, volume_index=volume_index, warnings=capture_warnings
             )
-            await self._update_acquisition(manifest)
+            stats = await self._writer_compression_stats(channels)
+            await self._update_acquisition(manifest, compression=stats)
             logger.info("Captured %d frames: task %s / profile %s", num_frames, volume.task, volume.profile)
             return manifest
 
@@ -1898,6 +1945,7 @@ class Instrument:
     ) -> int:
         signals = self._store.value.imaging.profiles[volume.profile].sync.values()
         period = max((float(s.duration) + float(s.rest_time) for s in signals), default=1.0)
+        loop = asyncio.get_running_loop()
         for batch_idx in range(math.ceil(volume.frames_total / batch_z)):
             frames = min(batch_z, volume.frames_total - batch_idx * batch_z)
             await _gather_hardware(*(ch.camera.begin_batch(frames) for ch in channels.values()))
@@ -1909,17 +1957,26 @@ class Instrument:
                     )
                 )
             await self._start_signal_generators(repeat=frames)
+            next_stats = loop.time() + 0.5
             try:
                 async with asyncio.timeout(30.0 + 2 * frames * period):
                     while True:
                         states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
                         if all(state is CaptureState.DONE for state in states):
                             break
+                        if loop.time() >= next_stats:
+                            stats = await self._writer_compression_stats(channels)
+                            if stats is not None:
+                                await self._update_acquisition(manifest, compression=stats)
+                            next_stats = loop.time() + 0.5
                         await asyncio.sleep(0.05)
             finally:
                 await self._stop_signal_generators()
+            stats = await self._writer_compression_stats(channels)
             await self._update_acquisition(
-                manifest, frames_captured=min((batch_idx + 1) * batch_z, volume.frames_total)
+                manifest,
+                frames_captured=min((batch_idx + 1) * batch_z, volume.frames_total),
+                compression=stats,
             )
         return volume.frames_total
 
@@ -2291,14 +2348,26 @@ class Instrument:
         stopped_at: float | None = None
         progress_camera = next(iter(channels.values())).camera
         next_progress = 0.0
+        next_stats = 0.0
         last_count = -1
+        last_stats: CompressionStats | None = None
+        stats_fn = getattr(self, "_writer_compression_stats", None)
         while True:
-            if loop.time() >= next_progress:
+            now = loop.time()
+            if now >= next_progress:
                 count = min(planned.division.cycles, await progress_camera.captured_frames())
-                if count != last_count:
-                    await self._update_acquisition(manifest, frames_captured=count)
+                stats = last_stats
+                if stats_fn is not None and now >= next_stats:
+                    stats = await stats_fn(channels)
+                    next_stats = now + 0.4
+                if count != last_count or stats != last_stats:
+                    if stats is not None:
+                        await self._update_acquisition(manifest, frames_captured=count, compression=stats)
+                    else:
+                        await self._update_acquisition(manifest, frames_captured=count)
                     last_count = count
-                next_progress = loop.time() + 0.2
+                    last_stats = stats
+                next_progress = now + 0.2
             states = await asyncio.gather(*(ch.camera.capture_state() for ch in channels.values()))
             moving = await axis.continuous_scan_moving()
             if not moving and all(state is CaptureState.DONE for state in states):

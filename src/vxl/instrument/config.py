@@ -3,7 +3,7 @@ from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
 
-from ome_zarr_writer import Compression, DownscaleType, ScaleLevel, WriterSettings
+from ome_zarr_writer import BinMode, Compression, CompressionShuffle, DownscaleType, ScaleLevel, WriterSettings
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from vxl_records import LineScan
 from vxlib.schema import FrozenModel, identifier
@@ -490,8 +490,21 @@ class WriterPatch(Patch):
     shard_z_chunks: Annotated[int, Field(ge=1)] | None = None
     batch_z_shards: Annotated[int, Field(ge=1)] | None = None
     compression: Compression | None = None
+    compression_level: Annotated[int, Field(ge=1, le=22)] | None = None
+    compression_shuffle: CompressionShuffle | None = None
     downscale_type: DownscaleType | None = None
     target_shard_gb: Annotated[float, Field(gt=0)] | None = None
+    dark_floor: Annotated[int, Field(ge=0, le=65535)] | None = None
+    keep_bits: Annotated[int, Field(ge=1, le=16)] | None = None
+    lossy_sigma: Annotated[float, Field(gt=0.0, allow_inf_nan=False)] | None = None
+    noise_offset: Annotated[float, Field(allow_inf_nan=False)] | None = None
+    noise_sigma_y: Annotated[float, Field(gt=0.0, allow_inf_nan=False)] | None = None
+    bin_zyx: tuple[int, int, int] | None = None
+    bin_mode: BinMode | None = None
+    median_zyx: tuple[int, int, int] | None = None
+    lowpass_cutoff_zyx: tuple[float, float, float] | None = None
+    highpass_cutoff_zyx: tuple[float, float, float] | None = None
+    highpass_add: Annotated[float, Field(ge=0.0, le=65535.0, allow_inf_nan=False)] | None = None
 
 
 class InstrumentDefaults(FrozenModel):  # everything that can live in config.default

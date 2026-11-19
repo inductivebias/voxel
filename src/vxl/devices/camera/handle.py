@@ -3,7 +3,7 @@
 from pathlib import PurePosixPath
 from typing import TYPE_CHECKING, cast
 
-from ome_zarr_writer import WriterSettings
+from ome_zarr_writer import CompressionStats, WriterSettings
 from pydantic import TypeAdapter
 from rigup.device.handle import Adapter, DeviceProperty
 from vxl_records import DatasetLocation, StorageSpec
@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 
 _DATASET_LOCATION_ADAPTER = TypeAdapter(DatasetLocation)
 _REMOTE_STORES_ADAPTER = TypeAdapter(dict[str, str])
+_COMPRESSION_STATS_ADAPTER = TypeAdapter(CompressionStats | None)
 
 
 class CameraHandle(DeviceHandle[Camera]):
@@ -155,6 +156,11 @@ class CameraHandle(DeviceHandle[Camera]):
         """Lifecycle of the most recent begin_batch/close_stack. Raises if the task failed."""
         result = await self.call("capture_state")
         return CaptureState(result)
+
+    async def writer_compression_stats(self) -> CompressionStats | None:
+        """Live raw-vs-compressed volume and throughput snapshot for the active (or latest) stack."""
+        result = await self.call("writer_compression_stats")
+        return _COMPRESSION_STATS_ADAPTER.validate_python(result)
 
     async def update_roi(self, roi: SensorROI) -> SensorROI:
         """Set sensor ROI. Returns the actual applied ROI (may differ due to alignment)."""
