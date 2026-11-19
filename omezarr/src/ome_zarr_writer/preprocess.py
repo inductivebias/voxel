@@ -196,9 +196,9 @@ class PreprocessSpec(BaseModel):
             offset = self.noise_offset if resolved_offset is None else resolved_offset
             sigma_y = self.noise_sigma_y if resolved_sigma_y is None else resolved_sigma_y
             if offset is not None:
-                info["noise_offset"] = round(float(offset), 4)
+                info["noise_offset"] = float(offset)
             if sigma_y is not None:
-                info["noise_sigma_y"] = round(float(sigma_y), 6)
+                info["noise_sigma_y"] = float(sigma_y)
         return {"voxel_preprocessing": info}
 
 
@@ -270,7 +270,7 @@ def build_uint16_lut(
     """Build a 65,536-entry ``uint16`` quantization lookup table preserving original grey-level units.
 
     Order when multiple options are combined:
-    1. Anscombe ``sqrt`` noise-bounded rounding (if ``lossy_sigma`` is set)
+    1. Anscombe ``sqrt`` rounding above the offset (values at or below it are unchanged)
     2. Uniform ``keep_bits`` bit-rounding (if ``keep_bits`` is set and ``< 16``)
     3. ``dark_floor`` zero clamp (values originally ``<= dark_floor`` map to ``0``)
     """
@@ -284,6 +284,7 @@ def build_uint16_lut(
         yq = np.rint(y / step) * step
         xq = np.square(yq * 0.5) - 0.375 + offset
         q = np.clip(np.rint(xq), 0, 65535).astype(np.uint32)
+        q = np.where(x <= offset, raw, q)
 
     if keep_bits is not None and keep_bits < 16:
         shift = max(0, 16 - keep_bits)
@@ -807,6 +808,8 @@ def process_batch_l0(
     """
     if not spec.is_active:
         return core, None, None
+    if core.dtype != np.uint16:
+        raise ValueError("preprocessing requires uint16 input")
 
     # Pre-resolve LUT when it doesn't depend on the filtered/binned batch output (enables fused single-pass write).
     fused_lut: np.ndarray | None = None

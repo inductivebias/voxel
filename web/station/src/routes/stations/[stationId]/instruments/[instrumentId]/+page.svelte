@@ -739,6 +739,10 @@
               {/each}
             {/snippet}
             <CollapsibleSection heading="Lossy quantization & Squish" bind:open={preprocessOpen}>
+              <p class="text-sm text-fg-muted">
+                Sqrt quantization preserves values at or below the noise offset; other enabled settings can change them.
+                Automatic noise parameters are estimated from the first batch.
+              </p>
               <fieldset class="grid min-w-0 grid-cols-1 gap-3 sm:grid-cols-3" disabled={Boolean(capture)}>
                 <Field label="Lossy σ (sqrt)">
                   <SpinBox

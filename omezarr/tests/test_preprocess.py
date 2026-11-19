@@ -6,7 +6,7 @@ import math
 
 import numpy as np
 import pytest
-from ome_zarr_writer import Compression, ScaleLevel, WriterSettings
+from ome_zarr_writer import Compression, ScaleLevel, WriterConfig, WriterSettings
 from ome_zarr_writer.preprocess import (
     PreprocessSpec,
     apply_lut_u16,
@@ -19,7 +19,8 @@ from ome_zarr_writer.preprocess import (
     process_batch_l0,
 )
 from pydantic import ValidationError
-from vxlib.vector import UIVec3D
+from vxlib.dtype import Dtype
+from vxlib.vector import UIVec3D, UVec3D
 
 
 def _mirror_idx(i: int, n: int) -> int:
@@ -116,6 +117,23 @@ def test_lut_sqrt_noise_bounded_rmse_and_auto_estimation() -> None:
     assert abs(float(dst.mean()) - float(vol.mean())) < 2.0
 
 
+def test_sqrt_lut_preserves_values_at_and_below_offset() -> None:
+    lut = build_uint16_lut(lossy_sigma=1.0, offset=100.0, sigma_y=1.0)
+    np.testing.assert_array_equal(lut[:101], np.arange(101, dtype=np.uint16))
+
+
+def test_preprocessing_rejects_non_uint16() -> None:
+    with pytest.raises(ValueError, match="requires uint16"):
+        process_batch_l0(np.ones((1, 2, 2), dtype=np.uint8), PreprocessSpec(dark_floor=2))
+    with pytest.raises(ValueError, match="requires uint16"):
+        process_batch_l0(np.ones((1, 2, 2), dtype=np.float32), PreprocessSpec(bin_zyx=(1, 2, 2)))
+    with pytest.raises(ValidationError, match="requires uint16"):
+        WriterConfig(
+            volume_shape=UIVec3D(z=1, y=2, x=2), voxel_size=UVec3D(z=1, y=1, x=1), dtype=Dtype.UINT8, dark_floor=2
+        )
+    WriterConfig(volume_shape=UIVec3D(z=1, y=2, x=2), voxel_size=UVec3D(z=1, y=1, x=1), dtype=Dtype.UINT8)
+
+
 @pytest.mark.parametrize("mode", ["mean", "median", "max", "sum", "nearest"])
 def test_bin_3d_numba_modes_and_partial_edges(mode: str) -> None:
     rng = np.random.default_rng(7)
@@ -206,8 +224,13 @@ def test_preprocess_and_writer_settings_validation() -> None:
         PreprocessSpec(lowpass_cutoff_zyx=(-1.0, 0.0, 0.0))
     with pytest.raises(ValidationError, match="both be set"):
         PreprocessSpec(noise_offset=100.0)
-    with pytest.raises(ValidationError, match="Blosc compression_level"):
+    with pytest.raises(ValidationError, match="compression_level must be <= 9"):
         WriterSettings(compression=Compression.BLOSC_ZSTD, compression_level=15)
+    for codec in (Compression.GZIP, Compression.LZ4, Compression.BLOSC_LZ4, Compression.BLOSC_ZSTD):
+        WriterSettings(compression=codec, compression_level=9)
+        with pytest.raises(ValidationError, match="compression_level must be <= 9"):
+            WriterSettings(compression=codec, compression_level=10)
+    WriterSettings(compression=Compression.ZSTD, compression_level=22)
     # Very large Z wavelength produces halo_z > batch_z (64 for L0) -> rejected cleanly
     with pytest.raises(ValidationError, match="Filter Z halo"):
         WriterSettings(max_level=ScaleLevel.L0, highpass_cutoff_zyx=(200.0, 0.0, 0.0))

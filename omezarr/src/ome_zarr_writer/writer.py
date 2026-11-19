@@ -112,11 +112,19 @@ class WriterSettings(BaseModel):
 
     @model_validator(mode="after")
     def _validate_preprocess_and_codec(self) -> Self:
-        if self.compression_level is not None and self.compression in (
-            Compression.BLOSC_LZ4,
-            Compression.BLOSC_ZSTD,
-        ) and self.compression_level > 9:
-            raise ValueError(f"Blosc compression_level must be <= 9, got {self.compression_level}")
+        if (
+            self.compression_level is not None
+            and self.compression
+            in (
+                Compression.GZIP,
+                Compression.LZ4,
+                Compression.BLOSC_LZ4,
+                Compression.BLOSC_ZSTD,
+            )
+            and self.compression_level > 9
+        ):
+            codec = "gzip" if self.compression == Compression.GZIP else "Blosc"
+            raise ValueError(f"{codec} compression_level must be <= 9, got {self.compression_level}")
         spec = self.preprocess
         if spec.halo_z > self.batch_z:
             raise ValueError(
@@ -174,6 +182,12 @@ class WriterConfig(WriterSettings):
     shear_yz: float = 0.0
     channel_label: str = "channel 0"
     channel_color: str = "FFFFFF"
+
+    @model_validator(mode="after")
+    def _validate_preprocessing_dtype(self) -> Self:
+        if self.preprocess.is_active and self.dtype != Dtype.UINT16:
+            raise ValueError("preprocessing requires uint16 input")
+        return self
 
     @cached_property
     def binned_volume_shape(self) -> UIVec3D:
@@ -798,8 +812,6 @@ class DatasetWriter:
                 flush_error = flush_error or exc
         upload_error = self._drain_uploads()
         self._upload_pool.shutdown(wait=True)
-        if self._preprocess.needs_auto_sqrt and self._resolved_sqrt is not None:
-            self._patch_resolved_sqrt_metadata()
         self._log_timing_summary()
         self._write_batch_metrics()
         error = flush_error or upload_error
@@ -858,14 +870,11 @@ class DatasetWriter:
         try:
             result = future.result()  # raises if the worker's downsample/write failed
             self._record(batch_idx, result)
-            if (
-                batch_idx == 0
-                and self._preprocess.needs_auto_sqrt
-                and self._resolved_sqrt is None
-                and result.resolved_offset is not None
-                and result.resolved_sigma_y is not None
-            ):
+            if batch_idx == 0 and self._preprocess.needs_auto_sqrt and self._resolved_sqrt is None:
+                if result.resolved_offset is None or result.resolved_sigma_y is None:
+                    raise RuntimeError("Batch 0 did not return quantization calibration")  # noqa: TRY301
                 self._resolved_sqrt = (result.resolved_offset, result.resolved_sigma_y)
+                self._patch_resolved_sqrt_metadata()
             if isinstance(self._author_root, Path):
                 self._batches[batch_idx].written_bytes = self._measure_batch_written_bytes(batch_idx)
             if self._staging is not None:
@@ -911,7 +920,7 @@ class DatasetWriter:
         return total
 
     def _patch_resolved_sqrt_metadata(self) -> None:
-        """Record batch-0 auto-calibrated ``noise_offset`` and ``noise_sigma_y`` in array metadata (best-effort)."""
+        """Record resolved calibration before accepting further batches; propagate any storage failure."""
         if self._resolved_sqrt is None:
             return
         attrs = self._preprocess.metadata_attributes(
@@ -928,8 +937,8 @@ class DatasetWriter:
                 existing.update(attrs)
                 doc["attributes"] = existing
                 meta_path.write_text(json.dumps(doc, indent=2))
-            except Exception:
-                log.debug("Failed to update resolved sqrt metadata at %s", meta_path, exc_info=True)
+            except Exception as exc:
+                raise RuntimeError(f"Failed to save quantization calibration to {meta_path}") from exc
 
     def live_compression_stats(self) -> CompressionStats | None:
         """Aggregate raw vs on-disk compressed bytes and recent throughput across completed batches."""

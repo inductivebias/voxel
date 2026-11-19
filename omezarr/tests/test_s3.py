@@ -8,6 +8,7 @@ writer from a real one (Vast, AWS), so a green run here validates the whole path
 Marked `slow` — excluded from pre-push, run in CI; skips when Docker is unavailable (see conftest).
 """
 
+import json
 from pathlib import Path
 
 import pytest
@@ -25,6 +26,7 @@ from ome_zarr_writer import (
 )
 from ome_zarr_writer.array import ArrayWriter
 from ome_zarr_writer.array.ts import TSArrayReader
+from ome_zarr_writer.preprocess import build_uint16_lut
 
 pytestmark = pytest.mark.slow
 
@@ -70,6 +72,35 @@ def test_s3_roundtrip(minio: Minio, kind: str, tmp_path: Path, monkeypatch: pyte
     assert arr.shape == (z, y, x)
     assert int(arr[0].max()) == 1
     assert int(arr[z - 1].max()) == z
+
+
+@pytest.mark.parametrize("kind", ["direct", "staged"])
+def test_s3_auto_sqrt_provenance(minio: Minio, kind: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AWS_ACCESS_KEY_ID", minio.user)
+    monkeypatch.setenv("AWS_SECRET_ACCESS_KEY", minio.password)
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    cfg = WriterConfig(
+        volume_shape=UIVec3D(z=4, y=64, x=64),
+        voxel_size=UVec3D(z=1, y=1, x=1),
+        max_level=ScaleLevel.L0,
+        lossy_sigma=1.0,
+    )
+    writer = OMEZarrWriter(slots=2)
+    try:
+        writer.begin_stack(cfg, _storage(kind, tmp_path, minio))
+        for i in range(4):
+            with writer.new_frame() as frame:
+                frame.fill(100 + i * 10)
+        writer.end_stack()
+    finally:
+        writer.close()
+
+    obj = minio.client().get_object(Bucket=minio.bucket, Key=f"{kind}.ome.zarr/0/zarr.json")
+    pp = json.loads(obj["Body"].read())["attributes"]["voxel_preprocessing"]
+    lut = build_uint16_lut(lossy_sigma=1.0, offset=pp["noise_offset"], sigma_y=pp["noise_sigma_y"])
+    arr = TSArrayReader(S3Path(f"s3://{minio.bucket}/{kind}.ome.zarr/0"), minio.store()).read_3d(z0=0, n=4)
+    for i in range(4):
+        assert (arr[i] == lut[100 + i * 10]).all()
 
 
 def test_s3_roundtrip_zarrs_backend(

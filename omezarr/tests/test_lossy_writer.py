@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from typing import TYPE_CHECKING
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -20,9 +20,6 @@ from ome_zarr_writer.preprocess import PreprocessSpec, build_uint16_lut, process
 from ome_zarr_writer.sizing import RingBudgetExceededError, per_slot_bytes, ring_shm_bytes, slots_for_budget
 from vxlib.dtype import Dtype
 from vxlib.vector import UIVec3D, UVec3D, Vec3D
-
-if TYPE_CHECKING:
-    from pathlib import Path
 
 
 def _read_l0(dataset_dir: Path) -> np.ndarray:
@@ -210,6 +207,35 @@ def test_auto_sqrt_batch0_consistency_and_compression_gain(tmp_path: Path) -> No
     )
     written = _read_l0(tmp_path / "lossy.ome.zarr")
     np.testing.assert_array_equal(written, lut[vol])
+
+
+@pytest.mark.slow
+def test_auto_sqrt_metadata_failure_fails_write(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cfg = WriterConfig(
+        volume_shape=UIVec3D(z=2, y=16, x=16),
+        voxel_size=UVec3D(z=1, y=1, x=1),
+        max_level=ScaleLevel.L0,
+        lossy_sigma=1.0,
+    )
+    writer = OMEZarrWriter(slots=2)
+    try:
+        writer.begin_stack(cfg, Local(target=tmp_path / "metadata_failure"))
+        for value in (10, 20):
+            with writer.new_frame() as frame:
+                frame.fill(value)
+
+        original_write_text = Path.write_text
+
+        def fail_metadata(path: Path, data: str, *args: object, **kwargs: object) -> int:
+            if path.name == "zarr.json":
+                raise OSError("metadata unavailable")
+            return original_write_text(path, data, *args, **kwargs)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(Path, "write_text", fail_metadata)
+        with pytest.raises(RuntimeError, match="Failed to save quantization calibration"):
+            writer.end_stack()
+    finally:
+        writer.close()
 
 
 def test_binned_ome_metadata_and_oblique_shear_coordinates() -> None:
