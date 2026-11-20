@@ -49,3 +49,8 @@ test('diagonals keep their direction and never exceed full speed', () => {
   assert.ok(Math.abs(x - y) < 1e-12);
   assert.ok(Math.hypot(x, y) <= 1 + 1e-12);
 });
+
+test('missing axes default to zero instead of producing NaN', () => {
+  assert.deepEqual(jog([]), [0, 0, 0]);
+  assert.deepEqual(jog([1]), [1, 0, 0]);
+});

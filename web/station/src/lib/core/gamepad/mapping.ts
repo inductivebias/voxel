@@ -50,8 +50,8 @@ export function shapeStick(x: number, y: number): [number, number] {
  * drawn (Voxel draws +Y upward), and right stick up drives +Z, each honouring the stage orientation signs.
  */
 export function jogVector(axes: readonly number[], signs: AxisSigns): JogVector {
-  const [x, y] = shapeStick(axes[STICK.leftX], axes[STICK.leftY]);
-  const z = shapeAxis(axes[STICK.rightY]);
+  const [x, y] = shapeStick(axes[STICK.leftX] ?? 0, axes[STICK.leftY] ?? 0);
+  const z = shapeAxis(axes[STICK.rightY] ?? 0);
   return [x * signs.x, -y * signs.y, -z * signs.z];
 }
 

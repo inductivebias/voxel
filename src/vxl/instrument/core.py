@@ -67,7 +67,7 @@ from .errors import (
     Violation,
     ViolationLoc,
 )
-from .jog import JogState, StageJog
+from .jog import StageJog
 from .metadata import ExperimentMetadata, resolve_metadata_class
 from .planning import resolve_xy, resolve_z
 from .scanning import ContinuousPass, plan_continuous_pass
@@ -327,11 +327,6 @@ class Instrument:
         return self._busy
 
     @property
-    def jog(self) -> Readable[JogState]:
-        """Whether handheld-controller stage jogging is available, enabled, and moving."""
-        return self._jog.state
-
-    @property
     def preview_channels(self) -> Readable[tuple[str, ...]]:
         """Active-profile channels that preview runs, in profile order."""
         return self._preview_channels
@@ -412,7 +407,7 @@ class Instrument:
 
     async def close(self) -> None:
         """Stop preview, close hardware, and clear history while retaining the selected profile."""
-        await self._jog.lockout("the instrument is closing")
+        await self._jog.stop()
         await self.stop_acquisition()
         self._preview_source_ids.clear()
         self._preview_positions.clear()
@@ -533,16 +528,12 @@ class Instrument:
             ]
             await asyncio.gather(*moves)
 
-    async def set_jog_enabled(self, enabled: bool) -> None:
-        """Arm or disarm handheld-controller jogging; arming is refused during a capture."""
-        await self._jog.set_enabled(enabled)
-
-    async def jog_stage(self, client: str, seq: int, velocity: tuple[float, float, float]) -> None:
+    async def jog_stage(self, client: str, velocity: tuple[float, float, float]) -> None:
         """Apply one controller update: x, y, z as fractions of full jog speed in ``[-1, 1]``."""
-        await self._jog.command(client, seq, velocity)
+        await self._jog.command(client, velocity)
 
     async def release_jog_client(self, client: str) -> None:
-        """Stop and disable jogging if ``client`` was driving the stage."""
+        """Halt jogging if ``client`` was driving the stage."""
         await self._jog.release(client)
 
     async def set_routing_rule(
@@ -802,7 +793,7 @@ class Instrument:
             await self._stop_preview()
             await self._activity.set(CaptureActivity())
             # Manual jogging must never move the stage once a capture owns it.
-            await self._jog.lockout("an acquisition started")
+            await self._jog.stop()
         try:
             # Preflight: every camera in the plan must be able to write `storage`, tested on its own node
             # (round-trip write). Any failure raises here — before a manifest, motion, or capture.

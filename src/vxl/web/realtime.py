@@ -32,13 +32,11 @@ class PreviewViewportUpdate(FrozenModel):
 class StageJogUpdate(FrozenModel):
     """Latest handheld-controller stick deflections for the expected instrument session.
 
-    ``velocity`` holds the logical x, y and z components as fractions of full jog speed in ``[-1, 1]``;
-    ``seq`` increases with every update from one connection so reordered updates are dropped.
+    ``velocity`` holds the logical x, y and z components as fractions of full jog speed in ``[-1, 1]``.
     """
 
     action: Literal["stage.jog"]
     session_id: UUID
-    seq: int = Field(ge=0)
     velocity: tuple[FiniteFloat, FiniteFloat, FiniteFloat]
 
 
@@ -140,13 +138,10 @@ class Realtime:
         await websocket.accept()
         self._state_clients.add(websocket)
         client_id = uuid4().hex
-        jog_sessions: set[UUID] = set()
         try:
             async with self._station.feed.connect() as connection:
                 sender = asyncio.create_task(self._send_state(websocket, connection), name="station-state-send")
-                receiver = asyncio.create_task(
-                    self._receive(websocket, client_id, jog_sessions), name="station-state-receive"
-                )
+                receiver = asyncio.create_task(self._receive(websocket, client_id), name="station-state-receive")
                 done, pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
                     task.cancel()
@@ -160,9 +155,9 @@ class Realtime:
         finally:
             self._state_clients.discard(websocket)
             # A closed tab or dropped connection must stop any jog it was driving, without waiting for the watchdog.
-            for session_id in jog_sessions:
-                with suppress(RuntimeError):  # The session already closed.
-                    async with self._station.instrument(session_id) as instrument:
+            if (session := self._station.state.value.session) is not None:
+                with suppress(RuntimeError):  # The session closed concurrently.
+                    async with self._station.instrument(session.info.id) as instrument:
                         await instrument.release_jog_client(client_id)
             with suppress(Exception):
                 await websocket.close()
@@ -219,7 +214,7 @@ class Realtime:
     async def _send_view(websocket: WebSocket, view: StationFeedView) -> None:
         await websocket.send_bytes(cast("bytes", pack(view)))
 
-    async def _receive(self, websocket: WebSocket, client_id: str, jog_sessions: set[UUID]) -> None:
+    async def _receive(self, websocket: WebSocket, client_id: str) -> None:
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
@@ -239,8 +234,7 @@ class Realtime:
                         case PreviewViewportUpdate():
                             instrument.update_viewport(update.viewport)
                         case StageJogUpdate():
-                            jog_sessions.add(update.session_id)
-                            await instrument.jog_stage(client_id, update.seq, update.velocity)
+                            await instrument.jog_stage(client_id, update.velocity)
             except RuntimeError as error:
                 log.debug("Ignoring a control message for an unavailable session: %s", error)
 

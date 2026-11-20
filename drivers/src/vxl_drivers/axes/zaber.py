@@ -1120,6 +1120,8 @@ class ZaberLinearAxis(ContinuousAxis):
 
         The controller stops a velocity move at ``limit.min``/``limit.max``, so a jog cannot pass the soft limits.
         """
+        if not math.isfinite(velocity):
+            raise ValueError(f"velocity must be finite, got {velocity}")
         if velocity == 0:
             self.halt()
             return

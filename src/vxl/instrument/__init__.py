@@ -24,7 +24,6 @@ from .core import (
     PreviewActivity,
 )
 from .errors import InstrumentBusyError, InstrumentError, OperationRejectedError, StartupError, Violation
-from .jog import JogState
 from .metadata import ExaspimMetadata, ExperimentMetadata, annotation
 from .store import InstrumentInspection, InstrumentStore
 
@@ -48,7 +47,6 @@ __all__ = [
     "InstrumentState",
     "InstrumentStore",
     "IterationOrder",
-    "JogState",
     "OperationRejectedError",
     "Point2D",
     "PreviewActivity",
