@@ -4,7 +4,7 @@ import asyncio
 import logging
 from contextlib import suppress
 from typing import TYPE_CHECKING, Annotated, Literal, cast
-from uuid import UUID, uuid4
+from uuid import UUID
 
 from fastapi import WebSocket, WebSocketDisconnect
 from pydantic import Field, FiniteFloat, TypeAdapter
@@ -137,11 +137,10 @@ class Realtime:
         """Send one atomic initial StationFeed view followed by every later complete view."""
         await websocket.accept()
         self._state_clients.add(websocket)
-        client_id = uuid4().hex
         try:
             async with self._station.feed.connect() as connection:
                 sender = asyncio.create_task(self._send_state(websocket, connection), name="station-state-send")
-                receiver = asyncio.create_task(self._receive(websocket, client_id), name="station-state-receive")
+                receiver = asyncio.create_task(self._receive(websocket), name="station-state-receive")
                 done, pending = await asyncio.wait({sender, receiver}, return_when=asyncio.FIRST_COMPLETED)
                 for task in pending:
                     task.cancel()
@@ -154,11 +153,6 @@ class Realtime:
             pass
         finally:
             self._state_clients.discard(websocket)
-            # A closed tab or dropped connection must stop any jog it was driving, without waiting for the watchdog.
-            if (session := self._station.state.value.session) is not None:
-                with suppress(RuntimeError):  # The session closed concurrently.
-                    async with self._station.instrument(session.info.id) as instrument:
-                        await instrument.release_jog_client(client_id)
             with suppress(Exception):
                 await websocket.close()
 
@@ -214,7 +208,7 @@ class Realtime:
     async def _send_view(websocket: WebSocket, view: StationFeedView) -> None:
         await websocket.send_bytes(cast("bytes", pack(view)))
 
-    async def _receive(self, websocket: WebSocket, client_id: str) -> None:
+    async def _receive(self, websocket: WebSocket) -> None:
         while True:
             message = await websocket.receive()
             if message["type"] == "websocket.disconnect":
@@ -234,7 +228,7 @@ class Realtime:
                         case PreviewViewportUpdate():
                             instrument.update_viewport(update.viewport)
                         case StageJogUpdate():
-                            await instrument.jog_stage(client_id, update.velocity)
+                            await instrument.jog_stage(update.velocity)
             except RuntimeError as error:
                 log.debug("Ignoring a control message for an unavailable session: %s", error)
 

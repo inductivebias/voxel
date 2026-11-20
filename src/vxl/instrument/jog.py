@@ -1,15 +1,8 @@
-"""Velocity jogging of the stage from a handheld controller, guarded by a speed cap and a dead-man watchdog.
-
-A client (the web UI reading a gamepad) streams stick deflections in ``[-1, 1]`` for the logical ``x``, ``y`` and
-``z`` axes. ``StageJog`` scales them to at most ``max_speed_um_s`` and drives each axis with a velocity move.
-Motion stops when the sticks are released, updates stop arriving (the watchdog), the driving client disconnects,
-an axis errors, an acquisition starts, or the instrument closes.
-"""
+"""Guarded velocity jogging of the stage: hard speed cap, unit conversion, busy lockout, and dead-man watchdog."""
 
 import asyncio
 import logging
 from collections.abc import Callable, Mapping
-from typing import Literal
 
 from vxlib.reactivity import Readable
 
@@ -17,24 +10,19 @@ from vxl.devices.axes import ContinuousAxisHandle
 
 logger = logging.getLogger(__name__)
 
-type JogAxis = Literal["x", "y", "z"]
-JOG_AXES: tuple[JogAxis, ...] = ("x", "y", "z")
-
-#: Full-stick speed.
+JOG_AXES = ("x", "y", "z")
 MAX_JOG_SPEED_UM_S = 2000.0
-#: Halt when no update arrives for this long while any axis is jogging.
 JOG_WATCHDOG_S = 0.3
-#: Re-command a moving axis only when its velocity changes by more than this fraction of full speed.
 _RECOMMAND_FRACTION = 0.02
 _UM_PER_UNIT = {"nm": 1e-3, "um": 1.0, "mm": 1e3}
 
 
 class StageJog:
-    """Turns streamed stick deflections into guarded stage velocity moves."""
+    """Turns streamed stick deflections in ``[-1, 1]`` into capped, watchdog-guarded stage velocity moves."""
 
     def __init__(
         self,
-        axes: Callable[[], Mapping[JogAxis, ContinuousAxisHandle]],
+        axes: Callable[[], Mapping[str, ContinuousAxisHandle]],
         *,
         busy: Readable[bool],
         max_speed_um_s: float = MAX_JOG_SPEED_UM_S,
@@ -45,62 +33,43 @@ class StageJog:
         self._max_speed = max_speed_um_s
         self._watchdog_s = watchdog_s
         self._lock = asyncio.Lock()
-        self._available = False
-        self._um_per_unit: dict[JogAxis, float] = {}
-        self._commanded: dict[JogAxis, float] = dict.fromkeys(JOG_AXES, 0.0)  # µm/s last sent
-        self._owner: str | None = None
+        self._um_per_unit: dict[str, float] = {}
+        self._commanded: dict[str, float] = dict.fromkeys(JOG_AXES, 0.0)
         self._watchdog: asyncio.Task[None] | None = None
 
-    async def open(self) -> None:
-        """Discover whether every stage axis can jog, and the axes' units."""
-        axes = self._axes()
-        for name in JOG_AXES:
-            self._um_per_unit[name] = _UM_PER_UNIT[await axes[name].get_units()]
-        self._available = all(await asyncio.gather(*(axes[name].jog_available() for name in JOG_AXES)))
-
     async def stop(self) -> None:
-        """Halt any active jog, e.g. when an acquisition starts or the instrument closes."""
+        """Halt any active jog (acquisition start or instrument close)."""
         async with self._lock:
             await self._stop()
 
-    async def release(self, client: str) -> None:
-        """Halt any jog driven by a disconnected client."""
+    async def command(self, velocity: tuple[float, float, float]) -> None:
+        """Apply one stick update: logical x, y, z as fractions of full jog speed, clamped to ``[-1, 1]``."""
         async with self._lock:
-            if self._owner == client:
-                logger.warning("Stopping stage jog: controlling client disconnected")
-                await self._stop()
-
-    async def command(self, client: str, velocity: tuple[float, float, float]) -> None:
-        """Apply one stick update: each component is a fraction of full jog speed, clamped to ``[-1, 1]``."""
-        async with self._lock:
-            if not self._available or self._busy.value:
+            if self._busy.value:
                 await self._stop()
                 return
-            if self._owner not in (None, client):
-                return  # Another client is driving.
 
-            targets: dict[JogAxis, float] = {
+            axes = self._axes()
+            targets = {
                 name: max(-1.0, min(1.0, v)) * self._max_speed for name, v in zip(JOG_AXES, velocity, strict=True)
             }
-            changed: list[JogAxis] = [
-                name for name in JOG_AXES if self._needs_command(self._commanded[name], targets[name])
-            ]
-            self._commanded.update({name: targets[name] for name in changed})
-            axes = self._axes()
+            changed = [name for name in JOG_AXES if self._needs_command(self._commanded[name], targets[name])]
             try:
+                if not self._um_per_unit:
+                    for name in JOG_AXES:
+                        self._um_per_unit[name] = _UM_PER_UNIT[await axes[name].get_units()]
+                self._commanded.update({name: targets[name] for name in changed})
                 await asyncio.gather(*(axes[n].jog(targets[n] / self._um_per_unit[n]) for n in changed))
             except Exception as error:
                 logger.warning("Stopping stage jog after axis error: %s", error)
                 await self._stop()
                 return
 
-            moving = any(self._commanded.values())
-            self._owner = client if moving else None
-            self._reset_watchdog(moving)
+            self._reset_watchdog(any(self._commanded.values()))
 
     def _needs_command(self, current: float, target: float) -> bool:
         if target == 0 or current == 0:
-            return target != current  # Always honour starts and stops.
+            return target != current
         return abs(target - current) > _RECOMMAND_FRACTION * self._max_speed
 
     def _reset_watchdog(self, moving: bool) -> None:
@@ -116,11 +85,9 @@ class StageJog:
                 await self._stop()
 
     async def _stop(self) -> None:
-        """Halt every axis this jog set moving, isolating failures so one broken axis cannot block the rest."""
         self._reset_watchdog(False)
-        moving: list[JogAxis] = [name for name in JOG_AXES if self._commanded[name]]
+        moving = [name for name in JOG_AXES if self._commanded[name]]
         self._commanded = dict.fromkeys(JOG_AXES, 0.0)
-        self._owner = None
         if not moving:
             return
         axes = self._axes()
