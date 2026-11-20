@@ -397,7 +397,6 @@ class Instrument:
                     await self._subscribe_camera(cam_id, camera)
                 await self.profile_fovs.refresh()
                 await self.planned_volumes.refresh()
-                await self._jog.open()
         except BaseException:
             try:
                 await self.close()
@@ -528,13 +527,9 @@ class Instrument:
             ]
             await asyncio.gather(*moves)
 
-    async def jog_stage(self, client: str, velocity: tuple[float, float, float]) -> None:
+    async def jog_stage(self, velocity: tuple[float, float, float]) -> None:
         """Apply one controller update: x, y, z as fractions of full jog speed in ``[-1, 1]``."""
-        await self._jog.command(client, velocity)
-
-    async def release_jog_client(self, client: str) -> None:
-        """Halt jogging if ``client`` was driving the stage."""
-        await self._jog.release(client)
+        await self._jog.command(velocity)
 
     async def set_routing_rule(
         self,
