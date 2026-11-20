@@ -76,7 +76,7 @@ class ContinuousAxisHandle(DeviceHandle[ContinuousAxis]):
         await self._poll_until_idle(timeout_s)
 
     async def jog_available(self) -> bool:
-        return bool(await self.props.get_value("jog_available"))
+        return await self.props.get_value("jog_available")
 
     async def jog(self, velocity: float) -> None:
         """Move continuously at ``velocity`` (axis units/s); 0 stops. Refused while stepping or scanning."""

@@ -741,7 +741,7 @@ export interface InstrumentView extends InstrumentState {
   devices: Record<string, DeviceState>;
   history: HistoryState;
   remote_stores: Record<string, Remote>;
-  jog?: JogState;
+  jog: JogState;
 }
 
 /** Handheld-controller stage jogging: off until enabled, refused and switched off by a capture. */

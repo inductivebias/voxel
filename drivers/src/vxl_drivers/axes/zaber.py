@@ -1118,11 +1118,8 @@ class ZaberLinearAxis(ContinuousAxis):
     def move_vel(self, velocity: float) -> None:
         """Jog at a signed velocity (axis units/s) until stopped; 0 decelerates to a stop.
 
-        Uses the controller's velocity move (``move vel``) at the configured acceleration. The controller
-        stops the axis at ``limit.min``/``limit.max``, so a jog cannot drive past the soft limits.
+        The controller stops a velocity move at ``limit.min``/``limit.max``, so a jog cannot pass the soft limits.
         """
-        if not math.isfinite(velocity):
-            raise ValueError(f"velocity must be finite, got {velocity}")
         if velocity == 0:
             self.halt()
             return

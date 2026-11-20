@@ -42,10 +42,7 @@ import type {
   TaskPatch,
   WriterPatch
 } from './types';
-import { DEFAULT_STAGE_ORIENTATION, type JogState } from './types';
-
-/** Jog state for a server that does not publish one: unavailable. */
-const NO_JOG: JogState = { available: false, enabled: false, active: false, max_speed_um_s: 0, message: null };
+import { DEFAULT_STAGE_ORIENTATION } from './types';
 
 /** A filter wheel and the filter that a channel sets on it. */
 export interface FilterSetting {
@@ -344,7 +341,7 @@ export class Instrument {
       profile_fovs: session.instrument.profile_fovs,
       planned_volumes: session.instrument.planned_volumes,
       history: session.instrument.history,
-      jog: session.instrument.jog ?? NO_JOG
+      jog: session.instrument.jog
     };
   }
 

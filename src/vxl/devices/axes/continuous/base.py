@@ -374,11 +374,10 @@ class ContinuousAxis(Axis):
         ...
 
     def move_vel(self, velocity: float) -> None:
-        """Move continuously at a signed velocity in axis units per second until stopped; 0 stops.
+        """Move continuously at a signed velocity (axis units/s) until stopped; 0 stops.
 
-        Not a wire command: callers go through ``ContinuousAxisController.jog``, which refuses while the
-        axis is TTL stepping or scanning. Drivers that support jogging override this; the hardware's own
-        travel limits must still stop the motion.
+        Drivers that support jogging override this, and the hardware's travel limits must stop the motion.
+        Callers go through ``ContinuousAxisController.jog``, which refuses while stepping or scanning.
         """
         raise NotImplementedError(f"Axis {self.uid} does not support velocity jogging")
 

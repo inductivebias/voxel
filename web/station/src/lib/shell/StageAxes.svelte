@@ -1,5 +1,5 @@
 <script lang="ts">
-  import type { Instrument, Stage } from '$lib/core/model';
+  import type { Instrument } from '$lib/core/model';
   import { prefs } from '$lib/core/prefs';
   import { fromMicrometers, getSpatialUnit, toMicrometers } from '$lib/core/spatial-units';
   import { Button, SpinBox } from '@voxel/kit';
@@ -9,13 +9,12 @@
   import JogToggle from './JogToggle.svelte';
 
   interface Props {
-    stage: Stage;
-    /** Offers the controller jog switch when given. */
-    instrument?: Instrument;
+    instrument: Instrument;
   }
 
-  let { stage, instrument }: Props = $props();
-  const jogging = $derived(!!instrument?.jog.enabled && !instrument.busy);
+  let { instrument }: Props = $props();
+  const stage = $derived(instrument.stage);
+  const jogging = $derived(instrument.jog.enabled && !instrument.busy);
 
   const unit = $derived(getSpatialUnit(prefs.spatialUnit.get()));
   // The step of each stage axis box, in µm, whatever unit shows.
@@ -28,10 +27,8 @@
 
 <div
   class={cn(
-    'grid min-w-0 gap-2 rounded-md',
-    instrument
-      ? 'grid-cols-[repeat(3,minmax(0,1fr))_auto_auto] @min-[64rem]/viewer-pane:grid-cols-[repeat(3,10rem)_auto_auto]'
-      : 'grid-cols-4 @min-[64rem]/viewer-pane:grid-cols-[repeat(3,10rem)_auto]',
+    'grid min-w-0 grid-cols-[repeat(3,minmax(0,1fr))_auto_auto] gap-2 rounded-md',
+    '@min-[64rem]/viewer-pane:grid-cols-[repeat(3,10rem)_auto_auto]',
     jogging && 'outline-2 outline-offset-4 outline-success'
   )}
   role="group"
@@ -59,7 +56,5 @@
   >
     Halt
   </Button>
-  {#if instrument}
-    <JogToggle {instrument} />
-  {/if}
+  <JogToggle {instrument} />
 </div>

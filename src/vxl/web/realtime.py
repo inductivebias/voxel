@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, cast
 from uuid import UUID, uuid4
 
 from fastapi import WebSocket, WebSocketDisconnect
-from pydantic import Field, TypeAdapter
+from pydantic import Field, FiniteFloat, TypeAdapter
 from rigup.wire import pack, unpack
 from vxl_records import LogEntry
 from vxlib.schema import FrozenModel
@@ -39,7 +39,7 @@ class StageJogUpdate(FrozenModel):
     action: Literal["stage.jog"]
     session_id: UUID
     seq: int = Field(ge=0)
-    velocity: tuple[float, float, float]
+    velocity: tuple[FiniteFloat, FiniteFloat, FiniteFloat]
 
 
 type StationControlMessage = Annotated[PreviewViewportUpdate | StageJogUpdate, Field(discriminator="action")]
@@ -161,7 +161,7 @@ class Realtime:
             self._state_clients.discard(websocket)
             # A closed tab or dropped connection must stop any jog it was driving, without waiting for the watchdog.
             for session_id in jog_sessions:
-                with suppress(Exception):
+                with suppress(RuntimeError):  # The session already closed.
                     async with self._station.instrument(session_id) as instrument:
                         await instrument.release_jog_client(client_id)
             with suppress(Exception):
@@ -243,8 +243,6 @@ class Realtime:
                             await instrument.jog_stage(client_id, update.seq, update.velocity)
             except RuntimeError as error:
                 log.debug("Ignoring a control message for an unavailable session: %s", error)
-            except Exception as error:
-                log.warning("Rejected a stage jog update: %s", error)
 
     @staticmethod
     async def _close_websocket(websocket: WebSocket) -> None:

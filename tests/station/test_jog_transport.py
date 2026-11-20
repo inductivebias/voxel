@@ -49,6 +49,7 @@ async def test_jog_updates_are_routed_and_invalid_ones_ignored() -> None:
         [
             {"action": "stage.jog", "session_id": str(session_id), "seq": 1, "velocity": [0.5, 0.0, -1.0]},
             {"action": "stage.jog", "session_id": str(session_id), "seq": 2, "velocity": [0.5, 0.0]},
+            {"action": "stage.jog", "session_id": str(session_id), "seq": 3, "velocity": [float("nan"), 0.0, 0.0]},
             {"action": "stage.jog", "session_id": str(uuid4()), "seq": 3, "velocity": [1.0, 0.0, 0.0]},
         ]
     )
