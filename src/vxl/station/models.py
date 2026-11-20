@@ -10,7 +10,7 @@ from vxlib.history import HistoryState
 from vxlib.schema import FrozenModel
 
 from rigup import DeviceInterface, PropertyModel
-from vxl.instrument import Activity, Bounds, InstrumentConfig, InstrumentState, JogState
+from vxl.instrument import Activity, Bounds, InstrumentConfig, InstrumentState
 from vxl.preview import StreamCursor
 from vxl.system import Remote, StationInfo
 
@@ -56,7 +56,6 @@ class InstrumentView(InstrumentState):
     devices: dict[str, DeviceState]
     history: HistoryState
     remote_stores: dict[str, Remote]
-    jog: JogState = JogState()
 
 
 class SessionView(FrozenModel):

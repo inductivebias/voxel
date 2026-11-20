@@ -14,7 +14,7 @@
 
   let { instrument }: Props = $props();
   const stage = $derived(instrument.stage);
-  const jogging = $derived(instrument.jog.enabled && !instrument.busy);
+  let jogging = $state(false);
 
   const unit = $derived(getSpatialUnit(prefs.spatialUnit.get()));
   // The step of each stage axis box, in µm, whatever unit shows.
@@ -56,5 +56,5 @@
   >
     Halt
   </Button>
-  <JogToggle {instrument} />
+  <JogToggle {instrument} bind:armed={jogging} />
 </div>

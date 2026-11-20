@@ -614,16 +614,6 @@ async def execute_device_command(
         raise HTTPException(status_code=404, detail=str(error.args[0])) from error
 
 
-class _JogEnabled(BaseModel):
-    enabled: bool
-
-
-@instrument_router.post("/stage/jog", status_code=204)
-async def set_stage_jog(body: _JogEnabled, instrument: InstrumentDep) -> None:
-    """Arm or disarm handheld-controller jogging; stick updates arrive on the state WebSocket."""
-    await instrument.set_jog_enabled(body.enabled)
-
-
 @instrument_router.get("/acquisition/options")
 async def get_acquisition_options(instrument: InstrumentDep) -> _AcquisitionOptions:
     return _AcquisitionOptions(continue_on_error=instrument.continue_on_error_next)

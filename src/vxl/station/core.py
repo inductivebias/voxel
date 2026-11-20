@@ -177,7 +177,6 @@ class Station:
                 self._session_teardowns.append(instrument.fov.subscribe(self._refresh_session_view))
                 self._session_teardowns.append(instrument.state.subscribe(self._refresh_session_view))
                 self._session_teardowns.append(instrument.history.subscribe(self._refresh_session_view))
-                self._session_teardowns.append(instrument.jog.subscribe(self._refresh_session_view))
                 self._session_teardowns.append(instrument.profile_fovs.subscribe(self._refresh_session_view))
                 self._session_teardowns.append(instrument.planned_volumes.subscribe(self._refresh_session_view))
                 self._session_teardowns.append(instrument.default.subscribe(self._refresh_session_view))
@@ -384,7 +383,6 @@ class Station:
                     },
                     "history": instrument.history.value,
                     "remote_stores": dict(instrument.remote_stores),
-                    "jog": instrument.jog.value,
                 }
             ),
         )

@@ -12,10 +12,10 @@ from vxl.web.realtime import Realtime
 
 class FakeInstrument:
     def __init__(self) -> None:
-        self.jogs: list[tuple[str, int, tuple[float, float, float]]] = []
+        self.jogs: list[tuple[str, tuple[float, float, float]]] = []
 
-    async def jog_stage(self, client: str, seq: int, velocity: tuple[float, float, float]) -> None:
-        self.jogs.append((client, seq, velocity))
+    async def jog_stage(self, client: str, velocity: tuple[float, float, float]) -> None:
+        self.jogs.append((client, velocity))
 
 
 class FakeStation:
@@ -44,17 +44,15 @@ async def test_jog_updates_are_routed_and_invalid_ones_ignored() -> None:
     instrument = FakeInstrument()
     realtime = Realtime.__new__(Realtime)
     realtime._station = FakeStation(session_id, instrument)  # type: ignore[assignment]
-    sessions: set[UUID] = set()
     websocket = FakeWebSocket(
         [
-            {"action": "stage.jog", "session_id": str(session_id), "seq": 1, "velocity": [0.5, 0.0, -1.0]},
-            {"action": "stage.jog", "session_id": str(session_id), "seq": 2, "velocity": [0.5, 0.0]},
-            {"action": "stage.jog", "session_id": str(session_id), "seq": 3, "velocity": [float("nan"), 0.0, 0.0]},
-            {"action": "stage.jog", "session_id": str(uuid4()), "seq": 3, "velocity": [1.0, 0.0, 0.0]},
+            {"action": "stage.jog", "session_id": str(session_id), "velocity": [0.5, 0.0, -1.0]},
+            {"action": "stage.jog", "session_id": str(session_id), "velocity": [0.5, 0.0]},
+            {"action": "stage.jog", "session_id": str(session_id), "velocity": [float("nan"), 0.0, 0.0]},
+            {"action": "stage.jog", "session_id": str(uuid4()), "velocity": [1.0, 0.0, 0.0]},
         ]
     )
 
-    await realtime._receive(websocket, "client-1", sessions)  # type: ignore[arg-type]
+    await realtime._receive(websocket, "client-1")  # type: ignore[arg-type]
 
-    assert instrument.jogs == [("client-1", 1, (0.5, 0.0, -1.0))]
-    assert session_id in sessions
+    assert instrument.jogs == [("client-1", (0.5, 0.0, -1.0))]

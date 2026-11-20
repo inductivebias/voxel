@@ -172,6 +172,7 @@ export class AxisHandle extends DeviceHandle {
   lowerLimit = $derived.by(() => this.typedProp('lower_limit', NumericModel));
   upperLimit = $derived.by(() => this.typedProp('upper_limit', NumericModel));
   isMoving = $derived.by(() => this.typedProp('is_moving', BoolModel));
+  jogAvailable = $derived.by(() => this.typedProp('jog_available', BoolModel));
   range = $derived((this.upperLimit?.value ?? 100) - (this.lowerLimit?.value ?? 0));
 
   /** Move to an absolute position, clamped to soft limits. */

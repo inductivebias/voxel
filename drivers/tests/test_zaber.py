@@ -568,6 +568,11 @@ def test_zaber_axis_jogs_at_velocity_and_stops_on_zero(
     assert sdk_axis.stop_calls == [False]
     assert len(sdk_axis.move_velocity_calls) == 1
 
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="velocity must be finite"):
+            axis.move_vel(bad)
+    assert len(sdk_axis.move_velocity_calls) == 1
+
     axis.close()
     hub.close()
 

@@ -130,8 +130,6 @@ export class Instrument {
   readonly profileFovs = $derived(this.status.profile_fovs);
   readonly plannedVolumes = $derived(this.status.planned_volumes);
   readonly history = $derived(this.status.history);
-  /** Handheld-controller jogging: whether it is available, armed, and moving the stage. */
-  readonly jog = $derived(this.status.jog);
   readonly edits = createEditQueue();
   readonly imaging = $derived(this.state.imaging);
   readonly activeProfileId = $derived(this.status.active_profile_id);
@@ -340,8 +338,7 @@ export class Instrument {
       },
       profile_fovs: session.instrument.profile_fovs,
       planned_volumes: session.instrument.planned_volumes,
-      history: session.instrument.history,
-      jog: session.instrument.jog
+      history: session.instrument.history
     };
   }
 
@@ -487,14 +484,9 @@ export class Instrument {
     return manifest;
   }
 
-  /** Arm or disarm controller jogging; the server refuses arming during a capture. */
-  setJogEnabled(enabled: boolean): Promise<void> {
-    return this.#client.post(`${this.#base}/stage/jog`, { enabled });
-  }
-
   /** Stream stick deflections (fractions of full jog speed); false if the state socket is down. */
-  sendJog(seq: number, velocity: [number, number, number]): boolean {
-    return this.#client.sendJog({ action: 'stage.jog', session_id: this.sessionId, seq, velocity });
+  sendJog(velocity: [number, number, number]): boolean {
+    return this.#client.sendJog({ action: 'stage.jog', session_id: this.sessionId, velocity });
   }
 
   stopAcquisition(): Promise<void> {
