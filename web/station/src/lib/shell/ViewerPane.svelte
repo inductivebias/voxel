@@ -192,7 +192,7 @@
             </button>
           {/each}
         </div>
-        <StageAxes stage={instrument.stage} />
+        <StageAxes {instrument} />
       </footer>
     </div>
   {:else}

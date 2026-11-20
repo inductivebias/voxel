@@ -784,6 +784,13 @@ export interface LogEntry {
   exception: LogException | null;
 }
 
+/** Latest stick deflections: logical x, y, z as fractions of full jog speed in [-1, 1]. */
+export interface StageJogUpdate {
+  action: 'stage.jog';
+  session_id: string;
+  velocity: [number, number, number];
+}
+
 export interface PreviewViewportUpdate {
   action: 'preview.viewport.update';
   session_id: string;
