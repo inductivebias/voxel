@@ -538,10 +538,7 @@ class Instrument:
         await self._jog.set_enabled(enabled)
 
     async def jog_stage(self, client: str, seq: int, velocity: tuple[float, float, float]) -> None:
-        """Apply one controller update: x, y, z as fractions of full jog speed in ``[-1, 1]``.
-
-        Ignored unless jogging is enabled and no capture is running; the axes halt if updates stop.
-        """
+        """Apply one controller update: x, y, z as fractions of full jog speed in ``[-1, 1]``."""
         await self._jog.command(client, seq, velocity)
 
     async def release_jog_client(self, client: str) -> None:

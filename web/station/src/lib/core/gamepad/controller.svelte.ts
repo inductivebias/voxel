@@ -1,4 +1,3 @@
-import type { Instrument } from '$lib/core/model';
 /**
  * Reads an Xbox-style controller with the browser Gamepad API and streams stage jog updates.
  *
@@ -6,10 +5,11 @@ import type { Instrument } from '$lib/core/model';
  * - Left stick moves X/Y, right stick (vertical) moves Z; deflection sets speed. Releasing the sticks stops.
  * - B halts the stage.
  *
- * Updates go out at most every SEND_INTERVAL_MS and are repeated every KEEPALIVE_MS while a stick is held, inside the
- * server's dead-man watchdog. The page stops sending (and sends a stop) when it is hidden, loses focus, the controller
- * disconnects, jogging is switched off, or a capture starts; if a stop is lost, the server watchdog halts the stage.
+ * Updates go out at most every SEND_INTERVAL_MS and repeat every KEEPALIVE_MS while a stick is held, inside the
+ * server's dead-man watchdog. The page sends a stop when it is hidden, loses focus, the controller disconnects,
+ * jogging is switched off, or a capture starts; if a stop is lost, the server watchdog halts the stage.
  */
+import type { Instrument } from '$lib/core/model';
 import { reportFailure } from '@voxel/kit/failures';
 
 import { BUTTON, isRest, jogVector, type JogVector } from './mapping';
@@ -20,42 +20,33 @@ const RESEND_DELTA = 0.01;
 const ZERO: JogVector = [0, 0, 0];
 
 export class GamepadJog {
-  /** A controller is plugged in and visible to this page. */
-  connected = $state(false);
-  /** The controller's name as the browser reports it. */
+  /** Gamepads are only exposed in a secure context such as localhost or HTTPS. */
+  static readonly supported = 'getGamepads' in navigator;
+
+  /** The connected controller's name, or null when none is plugged in. */
   name = $state<string | null>(null);
   /** The sticks are deflected and this page is driving the stage. */
   driving = $state(false);
 
-  readonly #getInstrument: () => Instrument | undefined;
+  readonly #instrument: () => Instrument;
+  readonly #listeners = new AbortController();
   #frame = 0;
   #seq = 0;
   #sent: JogVector = ZERO;
   #sentAt = 0;
-  #pressed = new Set<number>();
-  #disposers: (() => void)[] = [];
+  #held = new Set<number>();
 
-  constructor(getInstrument: () => Instrument | undefined) {
-    this.#getInstrument = getInstrument;
-  }
-
-  /** Whether this browser exposes the Gamepad API (it requires a secure context such as localhost or HTTPS). */
-  static get supported(): boolean {
-    return typeof navigator !== 'undefined' && typeof navigator.getGamepads === 'function';
+  constructor(instrument: () => Instrument) {
+    this.#instrument = instrument;
   }
 
   start(): void {
-    if (!GamepadJog.supported || this.#frame) return;
-    const stop = () => this.#stopDriving();
-    const onVisibility = () => document.hidden && stop();
-    window.addEventListener('blur', stop);
-    document.addEventListener('visibilitychange', onVisibility);
-    window.addEventListener('gamepaddisconnected', stop);
-    this.#disposers.push(
-      () => window.removeEventListener('blur', stop),
-      () => document.removeEventListener('visibilitychange', onVisibility),
-      () => window.removeEventListener('gamepaddisconnected', stop)
-    );
+    if (!GamepadJog.supported) return;
+    const stop = () => this.#stop();
+    const { signal } = this.#listeners;
+    window.addEventListener('blur', stop, { signal });
+    window.addEventListener('gamepaddisconnected', stop, { signal });
+    document.addEventListener('visibilitychange', stop, { signal });
     const loop = (now: number) => {
       this.#tick(now);
       this.#frame = requestAnimationFrame(loop);
@@ -64,75 +55,53 @@ export class GamepadJog {
   }
 
   dispose(): void {
-    this.#stopDriving();
-    if (this.#frame) cancelAnimationFrame(this.#frame);
-    this.#frame = 0;
-    for (const dispose of this.#disposers.splice(0)) dispose();
+    this.#stop();
+    cancelAnimationFrame(this.#frame);
+    this.#listeners.abort();
   }
 
   #tick(now: number): void {
-    const pad = navigator.getGamepads().find((candidate) => candidate?.connected) ?? null;
-    this.connected = pad !== null;
+    const pad = navigator.getGamepads().find((p) => p?.connected) ?? null;
     this.name = pad?.id ?? null;
-    const instrument = this.#getInstrument();
-    if (!pad || !instrument) {
-      this.#pressed.clear();
-      this.#stopDriving();
-      return;
-    }
+    if (!pad) return this.#stop();
 
-    if (this.#pressedNow(pad, BUTTON.leftBumper)) {
-      const jog = instrument.jog;
-      if (jog.available) reportFailure(instrument.setJogEnabled(!jog.enabled));
-    }
-    if (this.#pressedNow(pad, BUTTON.b)) {
-      this.#stopDriving();
+    const instrument = this.#instrument();
+    const { jog } = instrument;
+    if (this.#pressed(pad, BUTTON.leftBumper) && jog.available) reportFailure(instrument.setJogEnabled(!jog.enabled));
+    if (this.#pressed(pad, BUTTON.b)) {
+      this.#stop();
       reportFailure(instrument.stage.halt());
     }
 
-    const jog = instrument.jog;
-    if (!jog.enabled || instrument.busy || document.hidden || !document.hasFocus()) {
-      this.#stopDriving();
-      return;
-    }
-
     const velocity = jogVector(pad.axes, instrument.stage.orientation);
-    if (isRest(velocity)) {
-      this.#stopDriving();
-      return;
+    if (!jog.enabled || instrument.busy || document.hidden || !document.hasFocus() || isRest(velocity)) {
+      return this.#stop();
     }
     const changed = velocity.some((v, i) => Math.abs(v - this.#sent[i]) > RESEND_DELTA);
     const elapsed = now - this.#sentAt;
-    if ((changed && elapsed >= SEND_INTERVAL_MS) || elapsed >= KEEPALIVE_MS) this.#send(instrument, velocity, now);
+    if ((changed && elapsed >= SEND_INTERVAL_MS) || elapsed >= KEEPALIVE_MS) this.#send(velocity, now);
   }
 
   /** True only on the frame a button goes down. */
-  #pressedNow(pad: Gamepad, index: number): boolean {
-    const down = pad.buttons[index]?.pressed ?? false;
-    const was = this.#pressed.has(index);
-    if (down) this.#pressed.add(index);
-    else this.#pressed.delete(index);
+  #pressed(pad: Gamepad, index: number): boolean {
+    const down = pad.buttons[index].pressed;
+    const was = this.#held.has(index);
+    if (down) this.#held.add(index);
+    else this.#held.delete(index);
     return down && !was;
   }
 
-  #send(instrument: Instrument, velocity: JogVector, now: number): void {
-    if (instrument.sendJog(++this.#seq, velocity)) {
-      this.#sent = velocity;
-      this.#sentAt = now;
-      this.driving = !isRest(velocity);
-    } else {
-      this.#sent = ZERO; // Socket down: the server watchdog has halted, so start over when it returns.
-      this.driving = false;
-    }
+  #send(velocity: JogVector, now: number): void {
+    // If the socket is down the server watchdog has halted, so start over from rest when it returns.
+    const sent = this.#instrument().sendJog(++this.#seq, velocity);
+    this.#sent = sent ? velocity : ZERO;
+    this.#sentAt = now;
+    this.driving = sent && !isRest(velocity);
   }
 
   /** Send one stop if this page was driving. */
-  #stopDriving(): void {
+  #stop(): void {
     if (isRest(this.#sent)) return;
-    const instrument = this.#getInstrument();
-    if (instrument) instrument.sendJog(++this.#seq, ZERO);
-    this.#sent = ZERO;
-    this.#sentAt = 0;
-    this.driving = false;
+    this.#send(ZERO, 0);
   }
 }

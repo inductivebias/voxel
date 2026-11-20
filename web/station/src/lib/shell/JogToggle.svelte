@@ -24,7 +24,9 @@
 
   const jog = $derived(instrument.jog);
   const locked = $derived(instrument.busy);
+  const on = $derived(jog.enabled && !locked);
   const moving = $derived(jog.active || gamepad.driving);
+  const connected = $derived(gamepad.name !== null);
   const speed = $derived(`${(jog.max_speed_um_s / 1000).toLocaleString(undefined, { maximumFractionDigits: 2 })} mm/s`);
 
   // Tell the operator when the server switched jogging off (capture started, client lost, axis error).
@@ -35,13 +37,13 @@
     lastMessage = message;
   });
 
-  const label = $derived(locked ? 'Jog locked' : jog.enabled ? 'Jog ON' : 'Jog OFF');
+  const label = $derived(locked ? 'Jog locked' : on ? 'Jog ON' : 'Jog OFF');
   const title = $derived.by(() => {
     if (!jog.available) return 'This stage does not support controller jogging';
     if (locked) return 'Controller jogging is disabled while an acquisition runs';
     const pad = !GamepadJog.supported
       ? 'This browser blocks controllers here: open the station on localhost or over HTTPS'
-      : gamepad.connected
+      : connected
         ? `Controller: ${gamepad.name}`
         : 'No controller detected: plug it in by USB and press any button';
     const state = jog.enabled
@@ -52,24 +54,24 @@
 </script>
 
 <Button
-  variant={jog.enabled && !locked ? 'success' : 'secondary'}
+  variant={on ? 'success' : 'secondary'}
   class={cn(
     'w-full min-w-24 gap-1.5 whitespace-nowrap disabled:opacity-60',
-    jog.enabled && !locked && 'ring-2 ring-success/60 ring-offset-1 ring-offset-shell'
+    on && 'ring-2 ring-success/60 ring-offset-1 ring-offset-shell'
   )}
   aria-pressed={jog.enabled}
   disabled={!jog.available || locked}
   {title}
   onclick={() => reportFailure(instrument.setJogEnabled(!jog.enabled))}
 >
-  <Gamepad class={cn('size-4 shrink-0', !gamepad.connected && 'opacity-50')} aria-hidden="true" />
+  <Gamepad class={cn('size-4 shrink-0', !connected && 'opacity-50')} aria-hidden="true" />
   {label}
   <span
     class={cn(
       'size-2 shrink-0 rounded-full',
-      moving ? 'animate-pulse bg-on-success' : jog.enabled && !locked ? 'bg-on-success/50' : 'bg-fg-muted/40'
+      moving ? 'animate-pulse bg-on-success' : on ? 'bg-on-success/50' : 'bg-fg-muted/40'
     )}
     aria-hidden="true"
   ></span>
-  <span class="sr-only">{moving ? ', moving' : ''}{gamepad.connected ? '' : ', no controller connected'}</span>
+  <span class="sr-only">{moving ? ', moving' : ''}{connected ? '' : ', no controller connected'}</span>
 </Button>

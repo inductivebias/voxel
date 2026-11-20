@@ -232,33 +232,26 @@ class SimulatedContinuousAxis(ContinuousAxis):
 
     def move_vel(self, velocity: float) -> None:
         """Jog at a signed velocity until stopped, halting at the soft limits like a real controller."""
-        if not math.isfinite(velocity):
-            raise ValueError(f"velocity must be finite, got {velocity}")
         if velocity == 0:
             self.halt()
             return
         self._jog_velocity = velocity
-        if self._jogging and self._movement_thread is not None and self._movement_thread.is_alive():
+        if self._jogging:
             return  # The running jog loop picks up the new velocity.
-        if self._is_moving:
-            self.halt()
+        self.halt()
         self._stop_event.clear()
-        self._is_moving = True
-        self._jogging = True
+        self._is_moving = self._jogging = True
 
         def simulate_jog() -> None:
-            interval = 1.0 / 30
             last = time.monotonic()
-            while not self._stop_event.is_set():
-                time.sleep(interval)
+            while not self._stop_event.wait(1 / 30):
                 now = time.monotonic()
                 target = self._position + self._jog_velocity * (now - last)
                 last = now
                 self._position = min(self._upper_limit, max(self._lower_limit, target))
                 if self._position != target:
                     break  # Reached a limit.
-            self._jogging = False
-            self._is_moving = False
+            self._is_moving = self._jogging = False
 
         self._movement_thread = Thread(target=simulate_jog, daemon=True)
         self._movement_thread.start()

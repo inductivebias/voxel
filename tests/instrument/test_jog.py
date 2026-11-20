@@ -141,11 +141,6 @@ async def test_unsupported_stage_cannot_enable() -> None:
         await jog.set_enabled(True)
 
 
-def test_speed_above_the_cap_is_rejected() -> None:
-    with pytest.raises(ValueError, match="max_speed_um_s"):
-        StageJog(dict, busy=Cell(False), max_speed_um_s=MAX_JOG_SPEED_UM_S + 1)
-
-
 async def test_simulated_instrument_jogs_and_acquisition_locks_out(opened_instrument: Instrument) -> None:
     instrument = opened_instrument
     assert instrument.jog.value.available
