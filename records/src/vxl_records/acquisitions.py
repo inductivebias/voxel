@@ -36,6 +36,8 @@ from .models import (
 if TYPE_CHECKING:
     from sqlite3 import Connection, Row
 
+    from pydantic import JsonValue
+
     from ._sqlite import SQLiteDatabase
 
 type StorageRootResolver = Callable[[StorageSpec], Path | S3Path]
@@ -188,6 +190,20 @@ class AcquisitionCatalog:
 
         def edit(manifest: AcquisitionManifest) -> AcquisitionManifest:
             return manifest.register_datasets(volume_index, datasets)
+
+        return await self._commit(acquisition_id, edit)
+
+    async def set_volume_darkfield(
+        self,
+        acquisition_id: UUID,
+        *,
+        volume_index: int,
+        darkfield: Mapping[str, JsonValue],
+    ) -> AcquisitionManifest:
+        """Attach or update darkfield calibration metadata for one volume."""
+
+        def edit(manifest: AcquisitionManifest) -> AcquisitionManifest:
+            return manifest.set_volume_darkfield(volume_index, darkfield)
 
         return await self._commit(acquisition_id, edit)
 

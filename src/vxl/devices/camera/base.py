@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import shutil
 import time
@@ -6,7 +7,7 @@ from abc import abstractmethod
 from contextlib import suppress
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Literal, cast
+from typing import Any, Literal, cast
 
 import numpy as np
 from ome_zarr_writer import (
@@ -318,11 +319,13 @@ class CameraController(DeviceController["Camera"]):
         storage: StorageSpec,
         subpath: PurePosixPath,
         settings: WriterSettings,
+        voxel_size_yx: tuple[float, float] | None = None,
         origin: Vec3D | None = None,
         shear_xz: float = 0.0,
         shear_yz: float = 0.0,
         channel_label: str = "channel 0",
         channel_color: str = "FFFFFF",
+        darkfield: dict[str, Any] | None = None,
     ) -> DatasetLocation:
         """Prepare the camera + writer for a stack and return its durable dataset location.
 
@@ -355,16 +358,18 @@ class CameraController(DeviceController["Camera"]):
         dest = self._system.resolve_storage(storage, subpath)
         frame = self.device.frame_size_px
         eff_px = self.device.effective_pixel_size_um(magnification)
+        vy, vx = voxel_size_yx if voxel_size_yx is not None else (eff_px.y, eff_px.x)
         cfg = WriterConfig(
             **settings.model_dump(),
             volume_shape=UIVec3D(z=num_frames, y=frame.y, x=frame.x),
-            voxel_size=UVec3D(z=z_step, y=eff_px.y, x=eff_px.x),
+            voxel_size=UVec3D(z=z_step, y=vy, x=vx),
             dtype=self.device.pixel_type,
             origin=origin,
             shear_xz=shear_xz,
             shear_yz=shear_yz,
             channel_label=channel_label,
             channel_color=channel_color,
+            darkfield=darkfield,
         )
 
         # The coordinator persists across volumes so its ring is reused. Ring sizing happens inside
@@ -390,6 +395,29 @@ class CameraController(DeviceController["Camera"]):
         if target is None:
             raise RuntimeError("writer did not expose a dataset target")
         return self._system.describe_dataset_location(storage, target)
+
+    @describe(label="Update Dataset Darkfield Metadata")
+    async def update_dataset_darkfield(
+        self,
+        *,
+        storage: StorageSpec,
+        subpath: PurePosixPath,
+        darkfield: dict[str, Any],
+    ) -> None:
+        """Update ``attributes.darkfield`` in the root ``zarr.json`` of ``<subpath>.ome.zarr``."""
+
+        def _update() -> None:
+            target = self._system.resolve_storage(storage, subpath).target
+            if not target.name.endswith(".ome.zarr"):
+                target = target.with_name(f"{target.name}.ome.zarr")
+            zarr_json = target / "zarr.json"
+            if not zarr_json.exists():
+                return
+            raw = json.loads(zarr_json.read_text(encoding="utf-8"))
+            raw.setdefault("attributes", {})["darkfield"] = darkfield
+            zarr_json.write_text(f"{json.dumps(raw, indent=2)}\n", encoding="utf-8")
+
+        await self._run_sync(_update)
 
     def _size_ring(self, config: WriterConfig) -> int:
         """Choose the depth of a ring the writer is about to allocate.

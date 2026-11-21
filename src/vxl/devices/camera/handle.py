@@ -1,7 +1,7 @@
 """Camera device handle with typed methods."""
 
 from pathlib import PurePosixPath
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 from ome_zarr_writer import WriterSettings
 from pydantic import TypeAdapter
@@ -106,18 +106,21 @@ class CameraHandle(DeviceHandle[Camera]):
         z_step: float,
         magnification: float,
         settings: WriterSettings,
+        voxel_size_yx: tuple[float, float] | None = None,
         origin: Vec3D | None = None,
         shear_xz: float = 0.0,
         shear_yz: float = 0.0,
         channel_label: str = "channel 0",
         channel_color: str = "FFFFFF",
+        darkfield: dict[str, Any] | None = None,
     ) -> DatasetLocation:
         """Prepare camera and writer for a stack acquisition; return its durable dataset location.
 
         ``storage`` is the run's logical destination and ``subpath`` the dataset's relative location
         under it (the node resolves it against machine-local storage); ``settings`` are the broadcast
         output-format knobs. ``magnification`` converts the sensor-space pixel size into the
-        sample-space lateral voxel size. OME-Zarr metadata remains authoritative for dataset geometry.
+        sample-space lateral voxel size unless overridden by ``voxel_size_yx``. OME-Zarr metadata
+        remains authoritative for dataset geometry.
         """
         result = await self.call(
             "open_stack",
@@ -127,13 +130,25 @@ class CameraHandle(DeviceHandle[Camera]):
             z_step=z_step,
             magnification=magnification,
             settings=settings,
+            voxel_size_yx=voxel_size_yx,
             origin=origin,
             shear_xz=shear_xz,
             shear_yz=shear_yz,
             channel_label=channel_label,
             channel_color=channel_color,
+            darkfield=darkfield,
         )
         return _DATASET_LOCATION_ADAPTER.validate_python(result)
+
+    async def update_dataset_darkfield(
+        self,
+        *,
+        storage: StorageSpec,
+        subpath: PurePosixPath,
+        darkfield: dict[str, Any],
+    ) -> None:
+        """Update ``attributes.darkfield`` in the root ``zarr.json`` of ``<subpath>.ome.zarr``."""
+        await self.call("update_dataset_darkfield", storage=storage, subpath=subpath, darkfield=darkfield)
 
     async def close_stack(self) -> None:
         """Start draining and closing the writer in the background. Poll capture_state until CLOSED."""

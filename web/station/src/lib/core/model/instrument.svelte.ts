@@ -489,6 +489,14 @@ export class Instrument {
     return this.#client.sendJog({ action: 'stage.jog', session_id: this.sessionId, velocity });
   }
 
+  pauseAcquisition(): Promise<void> {
+    return this.#client.post(`${this.#base}/acquisition/pause`);
+  }
+
+  resumeAcquisition(): Promise<void> {
+    return this.#client.post(`${this.#base}/acquisition/resume`);
+  }
+
   stopAcquisition(): Promise<void> {
     return this.#client.post(`${this.#base}/acquisition/stop`);
   }

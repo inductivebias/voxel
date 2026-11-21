@@ -6,9 +6,11 @@ from .acquisition import (
     AcquisitionOrigin,
     AcquisitionStatus,
     AcquisitionVolume,
+    CameraSamplingYZ,
     LineScan,
     PlannedVolume,
     VolumeStatus,
+    default_camera_sampling_yz,
 )
 from .dataset import Dataset, DatasetFormat, DatasetStatus
 from .location import DatasetLocation, LocalLocation, LocationRole, LocationStatus, ObjectLocation
@@ -22,6 +24,7 @@ __all__ = [
     "AcquisitionOrigin",
     "AcquisitionStatus",
     "AcquisitionVolume",
+    "CameraSamplingYZ",
     "Dataset",
     "DatasetFormat",
     "DatasetLocation",
@@ -38,4 +41,5 @@ __all__ = [
     "RemoteTarget",
     "StorageSpec",
     "VolumeStatus",
+    "default_camera_sampling_yz",
 ]

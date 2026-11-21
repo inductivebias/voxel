@@ -4,10 +4,11 @@ import getpass
 import json
 import logging
 import math
+import time
 import uuid
 from collections.abc import AsyncIterator, Awaitable, Callable, Collection, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import StrEnum
 from functools import partial
 from pathlib import Path, PurePosixPath
@@ -87,6 +88,68 @@ async def _gather_hardware[T](*calls: Awaitable[T]) -> list[T]:
 # How long a continuous pass may sit stopped short of its frames before it fails.
 _PASS_STOP_GRACE_S = 1.0
 _RECORDER_FINISH_TIMEOUT_S = 5.0
+DEFAULT_DARK_FRAME_POST_SCAN_THRESHOLD_S = 600.0
+
+
+@dataclass
+class _DarkfieldTracker:
+    """Tracks before/after dark-frame state for one ``(task, profile)`` group."""
+
+    first_volume_index: int
+    frames: int
+    before_acquired_at: str
+    threshold_s: float
+    scan_started_mono: float = field(default_factory=time.monotonic)
+    after_acquired_at: str | None = None
+    task_scan_duration_s: float | None = None
+    completed_volumes: list[int] = field(default_factory=list)
+
+    def _paths(self, volume_index: int, profile_id: str, channel_id: str, tag: str) -> tuple[str, str]:
+        vol_dir = f"{self.first_volume_index + 1:06d}"
+        acq = f"volumes/{vol_dir}/{profile_id}/{channel_id}.ome.zarr/dark/{tag}.ome.zarr"
+        rel = (
+            f"dark/{tag}.ome.zarr"
+            if volume_index == self.first_volume_index
+            else f"../../../{vol_dir}/{profile_id}/{channel_id}.ome.zarr/dark/{tag}.ome.zarr"
+        )
+        return rel, acq
+
+    def channel_meta(self, volume_index: int, profile_id: str, channel_id: str) -> dict[str, Any]:
+        rel_before, acq_before = self._paths(volume_index, profile_id, channel_id, "before")
+        rel_after, acq_after = (
+            self._paths(volume_index, profile_id, channel_id, "after")
+            if self.after_acquired_at is not None
+            else (None, None)
+        )
+        return {
+            "enabled": True,
+            "frames": self.frames,
+            "lasers_off": True,
+            "post_scan_threshold_s": self.threshold_s,
+            "task_scan_duration_s": self.task_scan_duration_s,
+            "before": rel_before,
+            "before_acquired_at": self.before_acquired_at,
+            "acquisition_before": acq_before,
+            "after": rel_after,
+            "after_acquired_at": self.after_acquired_at,
+            "acquisition_after": acq_after,
+        }
+
+    def volume_meta(self, volume_index: int, profile_id: str, channel_ids: Sequence[str]) -> dict[str, Any]:
+        per_channel = {ch_id: self.channel_meta(volume_index, profile_id, ch_id) for ch_id in channel_ids}
+        first_ch = next(iter(per_channel.values()), {})
+        return {
+            "enabled": True,
+            "frames": self.frames,
+            "lasers_off": True,
+            "post_scan_threshold_s": self.threshold_s,
+            "task_scan_duration_s": self.task_scan_duration_s,
+            "before": first_ch.get("before"),
+            "before_acquired_at": self.before_acquired_at,
+            "after": first_ch.get("after"),
+            "after_acquired_at": self.after_acquired_at,
+            "channels": per_channel,
+        }
 
 
 @dataclass
@@ -132,6 +195,8 @@ class AcquisitionRequest(BaseModel):
     task_ids: list[str] | None = None
     operator: str | None = None
     continue_on_error: bool | None = None
+    acquire_dark_frames: bool | None = None
+    dark_frame_count: int | None = Field(default=None, ge=1, le=4096)
 
 
 class AcquisitionPhase(StrEnum):
@@ -141,6 +206,7 @@ class AcquisitionPhase(StrEnum):
     CONFIGURING = "configuring"
     CAPTURING = "capturing"
     FINALIZING = "finalizing"
+    PAUSED = "paused"
     STOPPING = "stopping"
 
 
@@ -151,6 +217,7 @@ class ActiveAcquisition(FrozenModel):
     manifest_revision: int = Field(ge=1)
     volume_index: int = Field(ge=0)
     phase: AcquisitionPhase
+    pause_requested: bool = False
     frames_captured: int = Field(default=0, ge=0)
 
 
@@ -250,11 +317,15 @@ class Instrument:
         self._lock = asyncio.Lock()  # Serializes the hardware-driving state machine(s)
         self._history = UndoHistory()
         self._acq_task: asyncio.Task[None] | None = None  # the in-flight acquisition run, if any
+        self._pause_requested = False
+        self._resume_event = asyncio.Event()
+        self._resume_event.set()
         self._continue_on_error_next = False
         self._jog = StageJog(
             lambda: {"x": self._hal.stage.x, "y": self._hal.stage.y, "z": self._hal.stage.z},
             busy=self._busy,
         )
+        self._dark_frame_post_scan_threshold_s = DEFAULT_DARK_FRAME_POST_SCAN_THRESHOLD_S
         self.fov: ReactiveQuery[tuple[float, float]] = ReactiveQuery(fn=self._compute_current_fov)
         self.profile_fovs = Computed[dict[str, dict[str, Bounds]]](
             self._store,
@@ -777,7 +848,21 @@ class Instrument:
             if selected is not None and (unknown := selected - known):
                 raise OperationRejectedError("; ".join(f"No such task '{task_id}'" for task_id in sorted(unknown)))
             volumes = [
-                AcquisitionVolume.model_validate(volume.model_dump())
+                AcquisitionVolume.model_validate(
+                    {
+                        **volume.model_dump(),
+                        **(
+                            {"acquire_dark_frames": request.acquire_dark_frames}
+                            if request.acquire_dark_frames is not None
+                            else {}
+                        ),
+                        **(
+                            {"dark_frame_count": request.dark_frame_count}
+                            if request.dark_frame_count is not None
+                            else {}
+                        ),
+                    }
+                )
                 for volume in self.planned_volumes.value
                 if selected is None or volume.task in selected
             ]
@@ -826,6 +911,8 @@ class Instrument:
             await self._activity.set(IdleActivity())
             raise
 
+        self._pause_requested = False
+        self._resume_event.set()
         acquisition = ActiveAcquisition(
             id=manifest.id,
             manifest_revision=manifest.revision,
@@ -836,18 +923,52 @@ class Instrument:
         self._acq_task = asyncio.create_task(self._execute_acquisition(manifest))
         return manifest
 
+    def _running_acquisition(self) -> tuple[CaptureActivity, ActiveAcquisition]:
+        if (task := self._acq_task) is None or task.done():
+            raise OperationRejectedError("No acquisition is running")
+        activity = self._activity.value
+        if not isinstance(activity, CaptureActivity) or activity.acquisition is None:
+            raise OperationRejectedError("No acquisition is running")
+        return activity, activity.acquisition
+
+    async def pause_acquisition(self) -> None:
+        """Pause the active acquisition after the current volume finishes."""
+        activity, acquisition = self._running_acquisition()
+        if acquisition.phase in (AcquisitionPhase.STOPPING, AcquisitionPhase.PAUSED):
+            raise OperationRejectedError("Acquisition cannot be paused in its current state")
+        self._pause_requested = True
+        self._resume_event.clear()
+        if not acquisition.pause_requested:
+            updated = acquisition.model_copy(update={"pause_requested": True})
+            await self._activity.set(activity.model_copy(update={"acquisition": updated}))
+
+    async def resume_acquisition(self) -> None:
+        """Resume a paused acquisition or cancel a pending pause request."""
+        activity, acquisition = self._running_acquisition()
+        if acquisition.phase is AcquisitionPhase.STOPPING or (
+            acquisition.phase is not AcquisitionPhase.PAUSED and not acquisition.pause_requested
+        ):
+            raise OperationRejectedError("Acquisition is not paused")
+        self._pause_requested = False
+        self._resume_event.set()
+        if acquisition.pause_requested:
+            updated = acquisition.model_copy(update={"pause_requested": False})
+            await self._activity.set(activity.model_copy(update={"acquisition": updated}))
+
     async def stop_acquisition(self) -> None:
         """Cancel the active acquisition and await its cleanup."""
         if (task := self._acq_task) is not None and not task.done():
+            self._pause_requested = False
             activity = self._activity.value
             if (
                 isinstance(activity, CaptureActivity)
                 and (acquisition := activity.acquisition) is not None
                 and acquisition.phase is not AcquisitionPhase.STOPPING
             ):
-                stopping = acquisition.model_copy(update={"phase": AcquisitionPhase.STOPPING})
+                stopping = acquisition.model_copy(update={"phase": AcquisitionPhase.STOPPING, "pause_requested": False})
                 await self._activity.set(activity.model_copy(update={"acquisition": stopping}))
                 task.cancel()
+            self._resume_event.set()
             with suppress(asyncio.CancelledError):
                 await settle(task)
 
@@ -1690,6 +1811,8 @@ class Instrument:
                     scan=task.scan,
                     z_end=z.end,
                     routes=routes,
+                    acquire_dark_frames=task.acquire_dark_frames,
+                    dark_frame_count=task.dark_frame_count,
                 )
                 for point, z, routes, profile in ordered
             )
@@ -1701,6 +1824,7 @@ class Instrument:
         *,
         volume_index: int | None = None,
         phase: AcquisitionPhase | None = None,
+        pause_requested: bool | None = None,
         frames_captured: int | None = None,
     ) -> ActiveAcquisition:
         capture = self._capture_activity()
@@ -1714,6 +1838,7 @@ class Instrument:
             manifest_revision=manifest.revision,
             volume_index=current.volume_index if volume_index is None else volume_index,
             phase=current.phase if phase is None else phase,
+            pause_requested=current.pause_requested if pause_requested is None else pause_requested,
             frames_captured=current.frames_captured if frames_captured is None else frames_captured,
         )
         await self._activity.set(capture.model_copy(update={"acquisition": updated}))
@@ -1725,13 +1850,80 @@ class Instrument:
             raise RuntimeError("no capture is running")
         return activity
 
+    def _voxel_size_yx(self, volume: PlannedVolume, camera_id: str) -> tuple[float, float] | None:
+        if volume.scan is None:
+            return None
+        detection_ids = list(self._hal.topology.detection)
+        cam_idx = detection_ids.index(camera_id) if camera_id in detection_ids else 0
+        sampling = volume.scan.resolve_camera_sampling_yz(camera_id, cam_idx)
+        return (sampling.z, sampling.y)
+
+    async def _await_pause_if_requested(self, manifest: AcquisitionManifest, volume_index: int) -> None:
+        if not self._pause_requested or volume_index + 1 >= len(manifest.volumes):
+            return
+        vol = manifest.volumes[volume_index]
+        if self._uses_continuous(vol):
+            with suppress(Exception):
+                await self._volume_scan_axis(vol).reset_continuous_scan()
+        self._pause_requested = False
+        await self._update_acquisition(manifest, phase=AcquisitionPhase.PAUSED, pause_requested=False)
+        logger.info("Acquisition paused after strip %d of %d", volume_index + 1, len(manifest.volumes))
+        await self._resume_event.wait()
+        logger.info("Acquisition resumed at strip %d of %d", volume_index + 2, len(manifest.volumes))
+
+    async def _ensure_darkfield_started(
+        self,
+        manifest: AcquisitionManifest,
+        volume: PlannedVolume,
+        first_volume_index: int,
+        trackers: dict[tuple[str, str], _DarkfieldTracker],
+    ) -> _DarkfieldTracker | None:
+        key = (volume.task, volume.profile)
+        if not volume.acquire_dark_frames:
+            return None
+        if key not in trackers:
+            before_ts = await self._capture_dark_frames(
+                manifest, volume, first_volume_index=first_volume_index, phase_tag="before"
+            )
+            trackers[key] = _DarkfieldTracker(
+                first_volume_index=first_volume_index,
+                frames=volume.dark_frame_count,
+                before_acquired_at=before_ts,
+                threshold_s=self._dark_frame_post_scan_threshold_s,
+            )
+        return trackers[key]
+
+    async def _finish_darkfield_group(
+        self,
+        manifest: AcquisitionManifest,
+        volume: PlannedVolume,
+        tracker: _DarkfieldTracker,
+    ) -> AcquisitionManifest:
+        tracker.task_scan_duration_s = round(time.monotonic() - tracker.scan_started_mono, 3)
+        if tracker.task_scan_duration_s >= self._dark_frame_post_scan_threshold_s and not self._cleanup_errors:
+            tracker.after_acquired_at = await self._capture_dark_frames(
+                manifest, volume, first_volume_index=tracker.first_volume_index, phase_tag="after"
+            )
+        return await self._finalize_darkfield_metadata(manifest, volume.profile, tracker)
+
     async def _execute_acquisition(self, manifest: AcquisitionManifest) -> None:
         """Execute every volume in a running manifest and finalize the acquisition."""
         diagnostics: list[dict[str, Any]] = []
+        first_vol: dict[tuple[str, str], int] = {}
+        last_vol: dict[tuple[str, str], int] = {}
+        for idx, vol in enumerate(manifest.volumes):
+            key = (vol.task, vol.profile)
+            first_vol.setdefault(key, idx)
+            last_vol[key] = idx
+        trackers: dict[tuple[str, str], _DarkfieldTracker] = {}
         try:
-            for volume_index in range(len(manifest.volumes)):
+            for volume_index, vol in enumerate(manifest.volumes):
+                key = (vol.task, vol.profile)
+                tracker = await self._ensure_darkfield_started(manifest, vol, first_vol[key], trackers)
                 try:
-                    manifest = await self._execute_volume(manifest, volume_index)
+                    manifest = await self._execute_volume(manifest, volume_index, darkfield=tracker)
+                    if tracker is not None:
+                        tracker.completed_volumes.append(volume_index)
                 except Exception as error:
                     if not manifest.continue_on_error or self._cleanup_errors:
                         raise
@@ -1755,6 +1947,9 @@ class Instrument:
                         "Diagnostic acquisition: strip %d failed; cleanup succeeded, continuing to the next strip",
                         volume_index + 1,
                     )
+                if key in trackers and volume_index == last_vol[key]:
+                    manifest = await self._finish_darkfield_group(manifest, vol, trackers[key])
+                await self._await_pause_if_requested(manifest, volume_index)
             manifest = await self._records.acquisitions.complete_acquisition(manifest.id)
             await self._update_acquisition(manifest)
             logger.info(
@@ -1782,14 +1977,130 @@ class Instrument:
             if not self._cleanup_errors:
                 await self._activity.set(IdleActivity())
             else:
-                await self._update_acquisition(manifest, phase=AcquisitionPhase.STOPPING)
+                await self._update_acquisition(manifest, phase=AcquisitionPhase.STOPPING, pause_requested=False)
+            self._pause_requested = False
+            self._resume_event.set()
             self._acq_task = None
             try:
                 await self._records.logs.close_acquisition_window(manifest.id)
             except Exception:
                 logger.exception("Failed to close the log window for acquisition %s", manifest.id)
 
-    async def _execute_volume(self, manifest: AcquisitionManifest, volume_index: int) -> AcquisitionManifest:
+    async def _capture_dark_frames(
+        self,
+        manifest: AcquisitionManifest,
+        volume: PlannedVolume,
+        *,
+        first_volume_index: int,
+        phase_tag: Literal["before", "after"],
+    ) -> str:
+        """Collect ``volume.dark_frame_count`` dark frames (all lasers off) into ``dark/<phase_tag>.ome.zarr``."""
+        num_frames = volume.dark_frame_count
+        channels = {uid: self._channels[uid] for uid in self._store.value.imaging.profiles[volume.profile].channels}
+        dark_settings = self._store.value.output
+        base_subpath = PurePosixPath("volumes", f"{first_volume_index + 1:06d}", volume.profile)
+        logger.info(
+            "Capturing %d %s-scan dark frames (all lasers off) for task %s / profile %s",
+            num_frames,
+            phase_tag,
+            volume.task,
+            volume.profile,
+        )
+        await self._update_acquisition(
+            manifest, volume_index=first_volume_index, phase=AcquisitionPhase.CONFIGURING, frames_captured=0
+        )
+        capture_error: BaseException | None = None
+        try:
+            await self._inhibit_laser_outputs()
+            await self._apply_profile(volume.profile)
+            async with self._lock:
+                await self._ensure_routes(volume.routes)
+            await self._inhibit_laser_outputs()
+            await _gather_hardware(
+                *(
+                    ch.camera.open_stack(
+                        storage=manifest.storage,
+                        subpath=base_subpath / f"{ch_id}.ome.zarr" / "dark" / phase_tag,
+                        num_frames=num_frames,
+                        z_step=volume.z_step,
+                        magnification=self._hal.topology.detection[self._channel_config(ch_id).detection].magnification,
+                        settings=dark_settings,
+                        voxel_size_yx=self._voxel_size_yx(volume, self._channel_config(ch_id).detection),
+                        channel_label=f"{self._channel_config(ch_id).label or ch_id} (dark {phase_tag})",
+                        channel_color="FFFFFF",
+                    )
+                    for ch_id, ch in channels.items()
+                )
+            )
+            await self._capture_batches(
+                manifest,
+                volume,
+                channels,
+                dark_settings.batch_z,
+                num_frames=num_frames,
+                enable_lasers=False,
+                report_progress=False,
+            )
+        except BaseException as error:
+            capture_error = error
+        finally:
+            with suppress(Exception):
+                await self._inhibit_laser_outputs()
+            with suppress(Exception):
+                await self._stop_signal_generators()
+            close_errors = await self._close_stacks(list(channels.values()))
+            self._cleanup_errors.extend(close_errors)
+        if capture_error is not None:
+            raise capture_error
+        if close_errors:
+            raise ExceptionGroup(
+                f"dark-frame ({phase_tag}) stack close failed for task {volume.task} / profile {volume.profile}",
+                close_errors,
+            )
+        return datetime.datetime.now(tz=datetime.UTC).isoformat()
+
+    async def _finalize_darkfield_metadata(
+        self,
+        manifest: AcquisitionManifest,
+        profile_id: str,
+        tracker: _DarkfieldTracker,
+    ) -> AcquisitionManifest:
+        """Persist final before/after darkfield metadata into OME-Zarr, ``scan.json``, and manifest records."""
+        channels = {uid: self._channels[uid] for uid in self._store.value.imaging.profiles[profile_id].channels}
+        for vol_idx in tracker.completed_volumes:
+            vol_subpath = PurePosixPath("volumes", f"{vol_idx + 1:06d}", profile_id)
+            await _gather_hardware(
+                *(
+                    ch.camera.update_dataset_darkfield(
+                        storage=manifest.storage,
+                        subpath=vol_subpath / ch_id,
+                        darkfield=tracker.channel_meta(vol_idx, profile_id, ch_id),
+                    )
+                    for ch_id, ch in channels.items()
+                )
+            )
+            vol_darkfield = tracker.volume_meta(vol_idx, profile_id, list(channels))
+            scan_json = self._system.resolve_storage(manifest.storage, vol_subpath).target / "scan.json"
+            if scan_json.exists():
+                def _patch_scan_json(p: Path | S3Path = scan_json, df: dict[str, Any] = vol_darkfield) -> None:
+                    raw = json.loads(p.read_text(encoding="utf-8"))
+                    raw["darkfield"] = df
+                    _write_json(p, raw)
+
+                await asyncio.to_thread(_patch_scan_json)
+            manifest = await self._records.acquisitions.set_volume_darkfield(
+                manifest.id, volume_index=vol_idx, darkfield=vol_darkfield
+            )
+        await self._update_acquisition(manifest)
+        return manifest
+
+    async def _execute_volume(
+        self,
+        manifest: AcquisitionManifest,
+        volume_index: int,
+        *,
+        darkfield: _DarkfieldTracker | None = None,
+    ) -> AcquisitionManifest:
         """Execute and persist the complete lifecycle of one manifest volume.
 
         Cleanup inhibits laser output, stops DAQ generation, resets the stepper, and finalizes writers.
@@ -1832,12 +2143,19 @@ class Instrument:
             if planned is None and num_frames > 1:
                 await scanning_axis.configure_ttl_stepper(TTLStepperConfig(step_mode=StepMode.RELATIVE))
                 await scanning_axis.queue_relative_move(volume.z_step)
-            manifest = await self._open_stacks(manifest, volume_index, subpath, channels)
+            manifest = await self._open_stacks(manifest, volume_index, subpath, channels, darkfield=darkfield)
             await self._update_acquisition(manifest, phase=AcquisitionPhase.CAPTURING)
 
             if planned is not None and progress is not None:
                 capture_warnings = await self._capture_continuous(
-                    manifest, volume, subpath, channels, planned, progress
+                    manifest,
+                    volume,
+                    subpath,
+                    channels,
+                    planned,
+                    progress,
+                    darkfield=darkfield,
+                    volume_index=volume_index,
                 )
                 frames_done = num_frames
                 await self._update_acquisition(manifest, frames_captured=num_frames)
@@ -1906,14 +2224,23 @@ class Instrument:
         )
 
     async def _capture_batches(
-        self, manifest: AcquisitionManifest, volume: PlannedVolume, channels: Mapping[str, Channel], batch_z: int
+        self,
+        manifest: AcquisitionManifest,
+        volume: PlannedVolume,
+        channels: Mapping[str, Channel],
+        batch_z: int,
+        *,
+        num_frames: int | None = None,
+        enable_lasers: bool = True,
+        report_progress: bool = True,
     ) -> int:
+        total = volume.frames_total if num_frames is None else num_frames
         signals = self._store.value.imaging.profiles[volume.profile].sync.values()
         period = max((float(s.duration) + float(s.rest_time) for s in signals), default=1.0)
-        for batch_idx in range(math.ceil(volume.frames_total / batch_z)):
-            frames = min(batch_z, volume.frames_total - batch_idx * batch_z)
+        for batch_idx in range(math.ceil(total / batch_z)):
+            frames = min(batch_z, total - batch_idx * batch_z)
             await _gather_hardware(*(ch.camera.begin_batch(frames) for ch in channels.values()))
-            if batch_idx == 0:
+            if batch_idx == 0 and enable_lasers:
                 await _gather_hardware(
                     *(
                         ch.enable_laser_output()
@@ -1930,10 +2257,9 @@ class Instrument:
                         await asyncio.sleep(0.05)
             finally:
                 await self._stop_signal_generators()
-            await self._update_acquisition(
-                manifest, frames_captured=min((batch_idx + 1) * batch_z, volume.frames_total)
-            )
-        return volume.frames_total
+            if report_progress:
+                await self._update_acquisition(manifest, frames_captured=min((batch_idx + 1) * batch_z, total))
+        return total
 
     async def _open_stacks(
         self,
@@ -1941,6 +2267,8 @@ class Instrument:
         volume_index: int,
         subpath: PurePosixPath,
         channels: Mapping[str, Channel],
+        *,
+        darkfield: _DarkfieldTracker | None = None,
     ) -> AcquisitionManifest:
         """Open every channel's dataset for the volume and register where each is written."""
         volume = manifest.volumes[volume_index]
@@ -1953,6 +2281,10 @@ class Instrument:
                 "channel_label": channel.label or ch_id,
                 "channel_color": "FFFFFF" if channel.colormap == "white" else channel.colormap.lstrip("#").upper(),
             }
+            if (vyx := self._voxel_size_yx(volume, channel.detection)) is not None:
+                kwargs["voxel_size_yx"] = vyx
+            if darkfield is not None:
+                kwargs["darkfield"] = darkfield.channel_meta(volume_index, volume.profile, ch_id)
             if geometry is not None:
                 scan_axis = volume.scan.axis if volume.scan else "z"
                 if geometry.stage_axes[0] != scan_axis:
@@ -2176,6 +2508,9 @@ class Instrument:
         channels: Mapping[str, Channel],
         planned: ContinuousPass,
         progress: "_PassProgress",
+        *,
+        darkfield: _DarkfieldTracker | None = None,
+        volume_index: int = 0,
     ) -> list[str]:
         """Capture every frame of the volume in one constant-speed pass and record where each was taken.
 
@@ -2234,12 +2569,12 @@ class Instrument:
                 "pacing": pacing,
                 "prepared": prepared,
             }
+            await _disable_lasers_and_halt(self._all_lasers(), axis, halt=True)
             try:
                 await axis.disarm_scan_window()
             except Exception:
                 logger.exception("Could not close scan window; teardown will retry")
             try:
-                await _disable_lasers_and_halt(self._all_lasers(), axis, halt=True)
                 await self._stop_signal_generators()
                 try:
                     recorded = await recorder.finish(_RECORDER_FINISH_TIMEOUT_S)
@@ -2256,16 +2591,33 @@ class Instrument:
                 logger.exception("Could not save continuous scan failure diagnostics")
             raise
 
+        # Inhibit emission before potentially waiting for serial retries while closing the window.
+        await _gather_hardware(*(ch.disable_laser_output() for ch in self._all_lasers()))
         await axis.disarm_scan_window()
         recorded = await recorder.finish(_RECORDER_FINISH_TIMEOUT_S)
         progress.recording = False
         final = await axis.finish_continuous_scan(planned.end)
         progress.finished = True
+        detection_ids = list(self._hal.topology.detection)
+        camera_sampling_yz = (
+            {
+                cam_id: volume.scan.resolve_camera_sampling_yz(cam_id, idx).model_dump()
+                for idx, cam_id in enumerate(detection_ids)
+            }
+            if volume.scan is not None
+            else None
+        )
         record = {
             "task": volume.task,
             "profile": volume.profile,
             "axis": getattr(self._hal.topology.stage, volume.scan.axis if volume.scan else "z"),
             "line_scan": volume.scan.model_dump() if volume.scan else None,
+            "camera_sampling_yz": camera_sampling_yz,
+            "darkfield": (
+                darkfield.volume_meta(volume_index, volume.profile, list(channels))
+                if darkfield is not None
+                else None
+            ),
             "plan": {
                 "window": planned.window,
                 "z_start": volume.z_start,
@@ -2371,16 +2723,16 @@ class Instrument:
 
         unfinished = progress is not None and not progress.finished
         halt = unfinished and progress is not None and progress.moving
+        laser_chans = self._all_lasers()
+        laser_results, errors = await _disable_lasers_and_halt(laser_chans, scanning_axis, halt=halt)
         window_errors: list[Exception] = []
         if progress is not None:
             try:
-                # This must precede waits for motion, DAQ, recorder or writers.
+                # Lasers are inhibited and halt was attempted before serial retries.
                 await scanning_axis.disarm_scan_window()
             except Exception as error:
                 logger.exception("cleanup: closing the scan window failed")
                 window_errors.append(error)
-        laser_chans = self._all_lasers()
-        laser_results, errors = await _disable_lasers_and_halt(laser_chans, scanning_axis, halt=halt)
         errors[:0] = window_errors
         errors[:0] = _report("disable_laser_output", laser_chans, laser_results, collect=True)
         if progress is not None and progress.moving_y:

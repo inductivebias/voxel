@@ -632,6 +632,16 @@ async def start_acquisition(body: AcquisitionRequest, instrument: InstrumentDep)
         raise HTTPException(status_code=422, detail=f"destination not writable: {error}") from error
 
 
+@instrument_router.post("/acquisition/pause", status_code=204)
+async def pause_acquisition(instrument: InstrumentDep) -> None:
+    await instrument.pause_acquisition()
+
+
+@instrument_router.post("/acquisition/resume", status_code=204)
+async def resume_acquisition(instrument: InstrumentDep) -> None:
+    await instrument.resume_acquisition()
+
+
 @instrument_router.post("/acquisition/stop", status_code=204)
 async def stop_acquisition(instrument: InstrumentDep) -> None:
     await instrument.stop_acquisition()

@@ -16,9 +16,9 @@
   const stage = $derived(instrument.stage);
   const unit = $derived(getSpatialUnit(prefs.spatialUnit.get()));
   const AXIS_SPINS = [
-    ['x', 10],
-    ['y', 10],
-    ['z', 10]
+    ['x', 100],
+    ['y', 100],
+    ['z', 100]
   ] as const;
 
   let armed = $state(false);

@@ -42,12 +42,15 @@ class _Writer:
         self._closing = False
         self.released = False
         self.opened_kwargs: list[dict[str, object]] = []
+        self.opened_subpaths: list[PurePosixPath] = []
+        self.updated_darkfield: list[tuple[PurePosixPath, dict[str, object]]] = []
 
     async def check_writable(self, _storage: StorageSpec) -> None:
         return
 
     async def open_stack(self, *, storage: StorageSpec, subpath: PurePosixPath, **_kwargs: object) -> LocalLocation:
         self._closing = False
+        self.opened_subpaths.append(subpath)
         self.opened_kwargs.append(_kwargs)
         target = self._root / storage.path.as_posix() / f"{subpath.as_posix()}.ome.zarr"
         return LocalLocation(
@@ -56,6 +59,16 @@ class _Writer:
             host="camera-1",
             path=str(target),
         )
+
+    async def update_dataset_darkfield(
+        self,
+        *,
+        storage: StorageSpec,
+        subpath: PurePosixPath,
+        darkfield: dict[str, object],
+    ) -> None:
+        _ = storage
+        self.updated_darkfield.append((subpath, darkfield))
 
     async def begin_batch(self, _num_frames: int) -> None:
         return
@@ -77,7 +90,15 @@ async def writer(opened_instrument: Instrument, tmp_path: Path, monkeypatch: pyt
     instrument = opened_instrument
     writer = _Writer(tmp_path / "data")
     camera = instrument._hal.cameras["camera_1"]
-    for name in ("check_writable", "open_stack", "begin_batch", "capture_state", "close_stack", "release_writer"):
+    for name in (
+        "check_writable",
+        "open_stack",
+        "update_dataset_darkfield",
+        "begin_batch",
+        "capture_state",
+        "close_stack",
+        "release_writer",
+    ):
         monkeypatch.setattr(camera, name, getattr(writer, name))
     await instrument.add_task(
         AcquisitionTask(
@@ -332,3 +353,43 @@ async def test_stepped_batch_capture_starts_signal_generators_with_finite_batch_
         ("stop", None),
         ("stop", None),
     ]
+
+
+@pytest.mark.parametrize(("threshold_s", "count", "expect_after"), [(600.0, 256, False), (0.0, 200, True)])
+async def test_dark_frame_acquisition_before_and_conditional_after(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+    threshold_s: float,
+    count: int,
+    expect_after: bool,
+) -> None:
+    instrument = opened_instrument
+    instrument._dark_frame_post_scan_threshold_s = threshold_s
+    await instrument.update_task("task", TaskPatch(acquire_dark_frames=True, dark_frame_count=count))
+
+    started = await instrument.start_acquisition(
+        AcquisitionRequest(storage=StorageSpec(path=PurePosixPath("dark-run")))
+    )
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=5)
+    persisted = await records.acquisitions.get(started.id)
+    assert persisted.status is AcquisitionStatus.COMPLETED
+
+    expected_subpaths = [
+        PurePosixPath("volumes/000001/single_gfp/gfp.ome.zarr/dark/before"),
+        PurePosixPath("volumes/000001/single_gfp/gfp"),
+    ]
+    if expect_after:
+        expected_subpaths.append(PurePosixPath("volumes/000001/single_gfp/gfp.ome.zarr/dark/after"))
+    assert writer.opened_subpaths == expected_subpaths
+    assert writer.opened_kwargs[0]["num_frames"] == count
+
+    vol_df = persisted.volumes[0].darkfield
+    assert vol_df is not None
+    assert vol_df["enabled"] is True
+    assert vol_df["frames"] == count
+    assert vol_df["before"] == "dark/before.ome.zarr"
+    assert vol_df["after"] == ("dark/after.ome.zarr" if expect_after else None)
+    assert len(writer.updated_darkfield) == 1
+    assert writer.updated_darkfield[0][0] == PurePosixPath("volumes/000001/single_gfp/gfp")
+    assert writer.updated_darkfield[0][1]["after"] == ("dark/after.ome.zarr" if expect_after else None)

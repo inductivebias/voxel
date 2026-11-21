@@ -86,6 +86,9 @@ class FakeTrigger:
             raise RuntimeError("trigger disable failed")
         self.enabled = False
 
+    def get_enabled_state(self) -> SimpleNamespace:
+        return SimpleNamespace(enabled=self.enabled)
+
     def enable(self, count: int = 0) -> None:
         self.count = count
         self.enabled = True
@@ -1499,3 +1502,76 @@ def test_zaber_setting_and_command_accessors(controller):
     assert axis.command("get pos") == "250000"
     axis.close()
     hub.close()
+
+
+def _armed_window(controller, monkeypatch):
+    hub, _, sdk, _ = controller
+    axis, scanner = scan_axis(hub, monkeypatch, scan_window_output=2, scan_window_triggers=(3, 4, 5))
+    scanner.prepare(start=SCAN_START, speed=2000)
+    scanner.arm_window(26000, 29000)
+    sdk.device.io.digital_outputs[2] = zaber.DigitalOutputAction.ON
+    return sdk, axis, scanner
+
+
+@pytest.mark.parametrize(
+    "operation", ["disable", "clear_action", "get_enabled_state", "set_digital_output", "get_digital_output"]
+)
+@pytest.mark.parametrize("lost_reply", [False, True])
+def test_window_cleanup_retries_timeout_and_verifies_safe_state(controller, monkeypatch, operation, lost_reply):
+    sdk, axis, scanner = _armed_window(controller, monkeypatch)
+    target = sdk.device.io if "digital_output" in operation else sdk.device.triggers.by_number[3]
+    original = getattr(target, operation)
+    calls = 0
+
+    def flaky(*args):
+        nonlocal calls
+        calls += 1
+        if calls <= 2:
+            if lost_reply:
+                original(*args)
+            raise RequestTimeoutException("lost reply")
+        return original(*args)
+
+    with monkeypatch.context() as m:
+        m.setattr(target, operation, flaky)
+        scanner.disarm_window()
+        assert calls == 3
+    assert not scanner._window_armed
+    assert not any(t.enabled for t in sdk.device.triggers.by_number.values())
+    assert all(not sdk.device.triggers.by_number[n].actions for n in (3, 4, 5))
+    assert sdk.device.io.get_digital_output(2) == 0
+    axis.close()
+
+
+def test_window_cleanup_persistent_timeout_is_bounded_and_still_forces_low(controller, monkeypatch):
+    sdk, axis, scanner = _armed_window(controller, monkeypatch)
+    calls = 0
+
+    def timeout():
+        nonlocal calls
+        calls += 1
+        raise RequestTimeoutException("lost reply")
+
+    with monkeypatch.context() as m:
+        m.setattr(sdk.device.triggers.by_number[3], "disable", timeout)
+        with pytest.raises(ExceptionGroup, match="Could not disable scan window"):
+            scanner.disarm_window()
+        assert calls == 3
+        assert scanner._window_armed
+        assert sdk.device.io.get_digital_output(2) == 0
+        assert not sdk.device.triggers.by_number[4].enabled
+    scanner.disarm_window()
+    axis.close()
+
+
+def test_window_cleanup_rejects_acknowledged_but_enabled_trigger(controller, monkeypatch):
+    sdk, axis, scanner = _armed_window(controller, monkeypatch)
+    with monkeypatch.context() as m:
+        m.setattr(sdk.device.triggers.by_number[3], "disable", lambda: None)
+        with pytest.raises(ExceptionGroup, match="Could not disable scan window") as exc:
+            scanner.disarm_window()
+        assert "still enabled" in str(exc.value.exceptions[0])
+        assert scanner._window_armed
+        assert sdk.device.io.get_digital_output(2) == 0
+    scanner.disarm_window()
+    axis.close()

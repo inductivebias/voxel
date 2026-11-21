@@ -197,6 +197,10 @@
   const blockers = $derived(checks.filter((check) => check.tone === 'block').length);
 
   let starting = $state(false);
+  let togglingPause = $state(false);
+  const stripLabel = $derived(
+    manifest?.volumes.some((item) => item.scan?.y_stack || item.scan?.axis === 'x') ? 'X-strip' : 'volume'
+  );
 
   function defaultPath(): string {
     const date = new Date();
@@ -392,6 +396,18 @@
     }
   }
 
+  async function togglePause(source: Instrument, resume: boolean): Promise<void> {
+    togglingPause = true;
+    try {
+      if (resume) await source.resumeAcquisition();
+      else await source.pauseAcquisition();
+    } catch (error) {
+      reportFailure(error);
+    } finally {
+      togglingPause = false;
+    }
+  }
+
   function newRun(): void {
     lastRunId = null;
     path = defaultPath();
@@ -502,6 +518,9 @@
               >
                 <span class="flex min-w-0 items-center gap-2">
                   <span class="min-w-0 flex-1 truncate text-base text-fg">Task {index + 1}</span>
+                  {#if task.acquire_dark_frames}
+                    <Badge tone="neutral">Dark ({task.dark_frame_count ?? 256})</Badge>
+                  {/if}
                   <Badge>{task.scan?.y_stack ? 'XY-Scan' : task.scan ? 'X-Scan' : TASK_TYPES[task.xy.mode]}</Badge>
                   {#if instrument}
                     <span class="text-sm text-fg-muted tabular-nums">{plural(taskVolumes(task.id), 'volume')}</span>
@@ -649,9 +668,17 @@
 <footer class="shrink-0 px-4 pt-4">
   <div class="max-w-4xl">
     {#if capture}
-      <Section heading="Acquiring" variant="raised" class="frame-docked-bottom">
+      <Section
+        heading={active?.phase === 'paused' ? 'Paused' : 'Acquiring'}
+        variant="raised"
+        class="frame-docked-bottom"
+      >
         {#snippet trailing()}
-          {#if active}<Badge>{displayName(active.phase)}</Badge>{/if}
+          {#if active}
+            <Badge tone={active.phase === 'paused' || active.pause_requested ? 'warning' : 'neutral'}>
+              {active.pause_requested ? `Pausing after ${stripLabel}` : displayName(active.phase)}
+            </Badge>
+          {/if}
           <span class="text-sm text-fg-muted tabular-nums">{percent}%</span>
         {/snippet}
         <progress
@@ -688,6 +715,34 @@
             <dd class="font-mono wrap-anywhere">{storageLabel(manifest)}</dd>
           </dl>
           {@render volumes(manifest)}
+          {#if manifest.volumes.length > 1 && active.phase !== 'stopping'}
+            {@const isPaused = active.phase === 'paused'}
+            {@const resume = isPaused || Boolean(active.pause_requested)}
+            {@const onFinal = !resume && active.volume_index >= manifest.volumes.length - 1}
+            <Button
+              variant={isPaused ? 'default' : 'outline'}
+              class="w-full"
+              disabled={togglingPause || onFinal}
+              onclick={() => togglePause(instrument, resume)}
+              title={isPaused
+                ? 'Continue to the next volume'
+                : active.pause_requested
+                  ? 'Cancel the pending pause and keep scanning continuously'
+                  : onFinal
+                    ? `Already on the final ${stripLabel}`
+                    : `Finish the current ${stripLabel} and pause before starting the next one`}
+            >
+              {togglingPause
+                ? resume
+                  ? 'Continuing…'
+                  : 'Pausing…'
+                : isPaused
+                  ? 'Continue scan'
+                  : active.pause_requested
+                    ? `Pausing after ${stripLabel} — Continue scan`
+                    : `Pause after ${stripLabel}`}
+            </Button>
+          {/if}
         {:else}
           <p class="text-sm text-fg-muted" role="status">Preparing the acquisition…</p>
         {/if}
