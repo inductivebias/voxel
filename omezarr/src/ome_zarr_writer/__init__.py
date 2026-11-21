@@ -42,14 +42,17 @@ from vxlib.vector import UIVec2D, UIVec3D, UVec3D, Vec3D
 
 from .dataset import (
     AffineTransform,
+    BinningMode,
     Compression,
     CoordinateSystem,
     DownscaleType,
     Dtype,
+    LossyDomain,
     Omero,
     OmeroChannel,
     OmeroWindow,
     OmeZarrDataset,
+    PreFilterType,
     ScaleLevel,
     SequenceTransform,
 )
@@ -61,12 +64,23 @@ from .deskew import (
     shear_factor_from_angle,
     shear_xz_from_angle,
 )
+from .preprocess import (
+    PreprocessConfig,
+    cutoff_to_sigma_px,
+    estimate_noise_sigma,
+    filter_and_bin_2d,
+    filter_and_bin_volume,
+    preprocess_volume,
+    quantize_lossy_volume,
+)
+from .sizing import vram_fits_batch
 from .storage import DirectS3, Local, S3Store, StagedS3, StagingConfig, Storage
 from .writer import BatchMetrics, FrameLease, OMEZarrWriter, WriterConfig, WriterSettings
 
 __all__ = [
     "AffineTransform",
     "BatchMetrics",
+    "BinningMode",
     "Compression",
     "CoordinateSystem",
     "DirectS3",
@@ -74,11 +88,14 @@ __all__ = [
     "Dtype",
     "FrameLease",
     "Local",
+    "LossyDomain",
     "OMEZarrWriter",
     "OmeZarrDataset",
     "Omero",
     "OmeroChannel",
     "OmeroWindow",
+    "PreFilterType",
+    "PreprocessConfig",
     "S3Store",
     "ScaleLevel",
     "SequenceTransform",
@@ -91,10 +108,17 @@ __all__ = [
     "Vec3D",
     "WriterConfig",
     "WriterSettings",
+    "cutoff_to_sigma_px",
     "deskew_dataset",
     "deskew_slice",
     "deskew_volume",
     "deskewed_width",
+    "estimate_noise_sigma",
+    "filter_and_bin_2d",
+    "filter_and_bin_volume",
+    "preprocess_volume",
+    "quantize_lossy_volume",
     "shear_factor_from_angle",
     "shear_xz_from_angle",
+    "vram_fits_batch",
 ]

@@ -309,6 +309,11 @@ class CameraController(DeviceController["Camera"]):
         """Return configured object-store names and non-secret connection fingerprints for this camera's host."""
         return {name: remote_store_fingerprint(remote.connection) for name, remote in self._system.remotes.items()}
 
+    @describe(label="Writer Throughput")
+    def writer_throughput_gb_s(self) -> tuple[float, float | None] | None:
+        """Current live writer throughput ``(raw_gb_s, compressed_gb_s)``, or ``None``."""
+        return self._writer.live_throughput_gb_s() if self._writer is not None else None
+
     @describe(label="Open Stack")
     async def open_stack(
         self,
@@ -420,14 +425,16 @@ class CameraController(DeviceController["Camera"]):
         await self._run_sync(_update)
 
     def _size_ring(self, config: WriterConfig) -> int:
-        """Choose the depth of a ring the writer is about to allocate.
-
-        Called by ``begin_stack`` only on the allocating path, and only after the previous ring has been
-        released — so the RAM share read here is not depressed by memory this camera is giving back.
-        Refuses below ``MIN_SLOTS``: a single slot would serialize collect against flush.
-        """
         budget = self.ram_budget_bytes
         available = System.Ram.available_bytes()
+        from ome_zarr_writer.pyramid_gpu import is_gpu_available  # noqa: PLC0415
+
+        effective_gpu = config.use_gpu and is_gpu_available()
+        kwargs = {
+            "use_gpu": effective_gpu,
+            "shard_shape": config.shard_shape if effective_gpu else None,
+            "raw_batch_shape": config.raw_batch_shape,
+        }
         slots = slots_for_budget(
             config.batch_shape,
             config.max_level,
@@ -435,14 +442,16 @@ class CameraController(DeviceController["Camera"]):
             budget_bytes=budget,
             available_bytes=available,
             label=self.device.uid,
+            **kwargs,
         )
         log.info(
-            "Sizing ring for %s: %d slots (%.2f GB/slot peak, %.2f GB share, %.2f GB free)",
+            "Sizing ring for %s: %d slots (%.2f GB/slot peak, %.2f GB share, %.2f GB free, gpu=%s)",
             self.device.uid,
             slots,
-            per_slot_bytes(config.batch_shape, config.max_level, config.dtype) / 1e9,
+            per_slot_bytes(config.batch_shape, config.max_level, config.dtype, **kwargs) / 1e9,
             budget / 1e9,
             available / 1e9,
+            effective_gpu,
         )
         return slots
 

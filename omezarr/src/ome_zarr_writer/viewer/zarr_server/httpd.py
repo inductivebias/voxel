@@ -7,14 +7,13 @@ ASGI implementations.
 """
 
 import logging
-import os
 import threading
 from http.server import HTTPServer, SimpleHTTPRequestHandler
 from pathlib import Path
 from typing import ClassVar
 from urllib.parse import unquote
 
-from .base import ZarrServer, get_host_ip
+from .base import ZarrServer, get_host_ip, neuroglancer_compatible_zarr_json
 
 log = logging.getLogger(__name__)
 
@@ -114,78 +113,67 @@ class CORSRequestHandler(SimpleHTTPRequestHandler):
 
     def _send_head(self, file_path: Path):
         """Send HEAD response for a file."""
+        payload = neuroglancer_compatible_zarr_json(file_path)
         try:
-            f = file_path.open("rb")
-        except OSError:
-            self.send_error(404, "File not found")
-            return
-
-        try:
-            fs = os.fstat(f.fileno())
+            st = file_path.stat()
             self.send_response(200)
             self.send_header("Content-type", self.guess_type(str(file_path)))
-            self.send_header("Content-Length", str(fs[6]))
-            self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+            self.send_header("Content-Length", str(len(payload) if payload is not None else st.st_size))
+            self.send_header("Last-Modified", self.date_time_string(st.st_mtime))
             self.send_header("Accept-Ranges", "bytes")
             self.end_headers()
-        finally:
-            f.close()
+        except OSError:
+            self.send_error(404, "File not found")
 
     def _serve_file(self, file_path: Path):
         """Serve a file with range request support."""
+        payload = neuroglancer_compatible_zarr_json(file_path)
+        f = None
         try:
-            f = file_path.open("rb")
-        except OSError:
-            self.send_error(404, "File not found")
-            return
-
-        try:
-            fs = os.fstat(f.fileno())
-            file_size = fs[6]
-
-            # Check for range request
+            st = file_path.stat()
+            if payload is None:
+                f = file_path.open("rb")
+            file_size = len(payload) if payload is not None else st.st_size
             range_header = self.headers.get("Range")
             if range_header:
-                # Parse range header
                 try:
                     byte_range = range_header.replace("bytes=", "").split("-")
                     start = int(byte_range[0]) if byte_range[0] else 0
                     end = int(byte_range[1]) if len(byte_range) > 1 and byte_range[1] else file_size - 1
-
-                    # Validate range
                     if start >= file_size or end >= file_size or start > end:
                         self.send_error(416, "Requested Range Not Satisfiable")
                         return
-
-                    # Send partial content
                     self.send_response(206)
                     self.send_header("Content-type", self.guess_type(str(file_path)))
                     self.send_header("Content-Range", f"bytes {start}-{end}/{file_size}")
                     self.send_header("Content-Length", str(end - start + 1))
-                    self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+                    self.send_header("Last-Modified", self.date_time_string(st.st_mtime))
                     self.send_header("Accept-Ranges", "bytes")
                     self.end_headers()
-
-                    # Send the requested range
-                    f.seek(start)
-                    bytes_to_send = end - start + 1
-                    self.wfile.write(f.read(bytes_to_send))
+                    if payload is not None:
+                        self.wfile.write(payload[start : end + 1])
+                    elif f is not None:
+                        f.seek(start)
+                        self.wfile.write(f.read(end - start + 1))
                 except (ValueError, IndexError):
                     self.send_error(400, "Bad Range Header")
                     return
             else:
-                # Send full file
                 self.send_response(200)
                 self.send_header("Content-type", self.guess_type(str(file_path)))
                 self.send_header("Content-Length", str(file_size))
-                self.send_header("Last-Modified", self.date_time_string(fs.st_mtime))
+                self.send_header("Last-Modified", self.date_time_string(st.st_mtime))
                 self.send_header("Accept-Ranges", "bytes")
                 self.end_headers()
-
-                # Send the file
-                self.wfile.write(f.read())
+                if payload is not None:
+                    self.wfile.write(payload)
+                elif f is not None:
+                    self.wfile.write(f.read())
+        except OSError:
+            self.send_error(404, "File not found")
         finally:
-            f.close()
+            if f is not None:
+                f.close()
 
     def log_message(self, format: str, *args: object) -> None:  # noqa: A002 - stdlib override parameter name
         """Log HTTP requests for debugging."""

@@ -62,6 +62,29 @@ def _time(block: np.ndarray, max_level: ScaleLevel, reduction: DownscaleType, re
     return out
 
 
+def _time_gpu(block: np.ndarray, max_level: ScaleLevel, reduction: DownscaleType, repeats: int) -> list[float]:
+    from ome_zarr_writer.pyramid_gpu import (  # noqa: PLC0415
+        clear_gpu_workspace_cache,
+        pyramids_3d_gpu,
+        register_pinned_host_memory,
+        unregister_pinned_host_memory,
+    )
+
+    pinned = register_pinned_host_memory(block)
+    try:
+        pyramids_3d_gpu(block, max_level, reduction=reduction)  # warm-up: CUDA JIT + workspace alloc
+        out = []
+        for _ in range(repeats):
+            t0 = time.perf_counter()
+            pyramids_3d_gpu(block, max_level, reduction=reduction)
+            out.append(time.perf_counter() - t0)
+        return out
+    finally:
+        clear_gpu_workspace_cache()
+        if pinned:
+            unregister_pinned_host_memory(block)
+
+
 def run(
     *,
     block_shape: tuple[int, int, int],
@@ -69,6 +92,7 @@ def run(
     reductions: tuple[DownscaleType, ...],
     threads: tuple[int, ...],
     repeats: int,
+    devices: tuple[str, ...] = ("cpu",),
 ) -> None:
     pool_max = numba.get_num_threads()
     thread_counts = sorted({max(1, min(t, pool_max)) for t in threads})
@@ -81,37 +105,55 @@ def run(
     console.rule(f"[bold]downsample bench[/]  run_id={run_id}")
     console.print(
         f"block=({z},{y},{x}) uint16  L0={l0_gb:.2f} GB  max_level={max_level.name}  pool_max={pool_max}  "
-        f"reductions={[r.name.lower() for r in reductions]}  threads={thread_counts}  repeats={repeats}"
+        f"reductions={[r.name.lower() for r in reductions]}  threads={thread_counts}  devices={list(devices)}  "
+        f"repeats={repeats}"
     )
 
     layer = "?"
     table = Table(box=box.SIMPLE)
     for col in ("reduction", "threads", "ms", "GB/s"):
         table.add_column(col, justify="left" if col == "reduction" else "right")
+    rows = 0
+
+    def _record(reduction: DownscaleType, n_threads: int, label: str, tlayer: str, times: list[float]) -> None:
+        nonlocal rows
+        med = median(times)
+        results.append(
+            DownsampleRun(
+                reduction=reduction.name.lower(),
+                threads=n_threads,
+                pool_max=pool_max,
+                threading_layer=tlayer,
+                block_z=z,
+                block_y=y,
+                block_x=x,
+                dtype="uint16",
+                max_level=max_level.name,
+                parallel=True,
+            ),
+            DownsampleResult(time_s=round(med, 4), repeats=repeats, times_s=[round(t, 4) for t in times]),
+        )
+        table.add_row(reduction.name.lower(), label, f"{med * 1000:.1f}", f"{l0_gb / med:.2f}")
+        rows += 1
+
+    gpu_ok = False
+    if "gpu" in devices:
+        from ome_zarr_writer.pyramid_gpu import is_gpu_available  # noqa: PLC0415
+
+        gpu_ok = is_gpu_available()
+        if not gpu_ok:
+            console.print("[yellow]GPU requested but CUDA is unavailable; skipping GPU rows.[/]")
+
     for reduction in reductions:
-        for n in thread_counts:
-            numba.set_num_threads(n)
-            times = _time(block, max_level, reduction, repeats)
-            layer = threading_layer()  # valid only after a parallel region has run
-            med = median(times)
-            results.append(
-                DownsampleRun(
-                    reduction=reduction.name.lower(),
-                    threads=n,
-                    pool_max=pool_max,
-                    threading_layer=layer,
-                    block_z=z,
-                    block_y=y,
-                    block_x=x,
-                    dtype="uint16",
-                    max_level=max_level.name,
-                    parallel=True,
-                ),
-                DownsampleResult(time_s=round(med, 4), repeats=repeats, times_s=[round(t, 4) for t in times]),
-            )
-            table.add_row(reduction.name.lower(), str(n), f"{med * 1000:.1f}", f"{l0_gb / med:.2f}")
+        if "cpu" in devices:
+            for n in thread_counts:
+                numba.set_num_threads(n)
+                times = _time(block, max_level, reduction, repeats)
+                layer = threading_layer()
+                _record(reduction, n, str(n), layer, times)
+        if gpu_ok:
+            _record(reduction, 0, "cuda", "cuda", _time_gpu(block, max_level, reduction, repeats))
     console.print(table)
-    rows = len(reductions) * len(thread_counts)
     console.print(f"[dim]threading_layer={layer}  recorded {rows} rows -> {RESULTS_PATH}[/]")
 
 
@@ -121,6 +163,7 @@ def _parse_args() -> dict:
     p.add_argument("--level", default="L7", help="max pyramid level (default L7)")
     p.add_argument("--reductions", default="gaussian,mean", help="comma list: gaussian,mean,max,min")
     p.add_argument("--threads", default="1,2,4,8,16,32,64", help="comma list of numba thread counts")
+    p.add_argument("--devices", default="cpu", help="comma list: cpu,gpu (default cpu)")
     p.add_argument("--repeats", type=int, default=3, help="timed repeats per point (median reported)")
     a = p.parse_args()
 
@@ -135,12 +178,16 @@ def _parse_args() -> dict:
         max_level = ScaleLevel[a.level]
     except KeyError:
         p.error(f"unknown level {a.level!r}; use L0..L7")
+    devices = tuple(d.strip().lower() for d in a.devices.split(",") if d.strip())
+    if not devices or any(d not in ("cpu", "gpu") for d in devices):
+        p.error(f"invalid --devices {a.devices!r}; use cpu, gpu, or cpu,gpu")
     threads = tuple(int(t) for t in a.threads.split(","))
     return {
         "block_shape": dims,
         "max_level": max_level,
         "reductions": reductions,
         "threads": threads,
+        "devices": devices,
         "repeats": a.repeats,
     }
 

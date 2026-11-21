@@ -3,7 +3,7 @@ from pathlib import Path, PurePosixPath
 from typing import Literal
 
 import pytest
-from ome_zarr_writer import ScaleLevel
+from ome_zarr_writer import LossyDomain, ScaleLevel
 from vxl_records import (
     AcquisitionStatus,
     DatasetStatus,
@@ -393,3 +393,29 @@ async def test_dark_frame_acquisition_before_and_conditional_after(
     assert len(writer.updated_darkfield) == 1
     assert writer.updated_darkfield[0][0] == PurePosixPath("volumes/000001/single_gfp/gfp")
     assert writer.updated_darkfield[0][1]["after"] == ("dark/after.ome.zarr" if expect_after else None)
+
+
+async def test_writer_patch_accepts_compression_lossy_and_gpu_fields(opened_instrument: Instrument) -> None:
+    await opened_instrument.update_output(
+        WriterPatch(
+            compression_level=5,
+            compression_shuffle="shuffle",
+            keep_bits=12,
+            dark_floor=100,
+            skip_empty_chunks=True,
+            lossy_step_noise=1.25,
+            lossy_domain=LossyDomain.LINEAR,
+            noise_sigma=4.5,
+            use_gpu=True,
+        )
+    )
+    out = opened_instrument.state.value.output
+    assert out.compression_level == 5
+    assert out.compression_shuffle == "shuffle"
+    assert out.keep_bits == 12
+    assert out.dark_floor == 100
+    assert out.skip_empty_chunks is True
+    assert out.lossy_step_noise == 1.25
+    assert out.lossy_domain == "linear"
+    assert out.noise_sigma == 4.5
+    assert out.use_gpu is True
