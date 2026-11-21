@@ -141,14 +141,25 @@ class PreviewGenerator:
             )
         return None
 
-    def submit_frame(self, frame: np.ndarray | FrameLease, idx: int, *, valid_bits: ValidBits = 16) -> None:
+    def submit_frame(
+        self,
+        frame: np.ndarray | FrameLease,
+        idx: int,
+        *,
+        valid_bits: ValidBits = 16,
+        force_overview: bool = False,
+    ) -> None:
         """Process a new raw frame: dispatch overview and viewport work in the background.
 
         The viewport uses cancel-stale (latest viewport invalidates prior work). Overview
         uses skip-if-busy — if the previous overview hasn't finished, drop this
-        frame's preview rather than queueing. Returns immediately so callers
-        (preview loop, acquisition grab loop) are not gated by preview work.
+        frame's preview rather than queueing (unless ``force_overview=True``). Returns immediately
+        so callers (preview loop, acquisition grab loop) are not gated by preview work.
         """
+        if force_overview and self._overview_future is not None and not self._overview_future.done():
+            self._work_epoch += 1
+            self._overview_future.cancel()
+            self._overview_future = None
         source = _PreviewSource(frame)
         previous = self._current_source
         self._frame_idx = idx
@@ -197,6 +208,21 @@ class PreviewGenerator:
             self.health.record_overview_drop()  # Gate 1 drop: prior overview still generating
         if previous is not None:
             previous.release()
+
+    async def submit_frame_and_wait(
+        self,
+        frame: np.ndarray | FrameLease,
+        idx: int,
+        *,
+        valid_bits: ValidBits = 16,
+    ) -> None:
+        """Submit a frame (such as a single-frame snapshot) and await overview + viewport emission."""
+        self.submit_frame(frame, idx, valid_bits=valid_bits, force_overview=True)
+        if self._overview_future is not None:
+            await asyncio.gather(self._overview_future, return_exceptions=True)
+        if self._viewport_task is not None:
+            await asyncio.gather(self._viewport_task, return_exceptions=True)
+        await asyncio.sleep(0)  # allow done callbacks (_on_overview_done) to invoke sink
 
     def reset_stream(self) -> str:
         """Start and return a new camera capture identity."""

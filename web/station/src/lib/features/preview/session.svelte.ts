@@ -228,6 +228,9 @@ export class PreviewSession {
   redrawGeneration = $state(0);
   error = $state<string | null>(null);
   viewport = $state<PreviewViewport>({ ...DEFAULT_VIEWPORT });
+  snapshotPending = $state(false);
+  snrPending = $state(false);
+  previewing = $state(false);
 
   readonly zoomModel = new NumericModel(1, { min: 1, max: 100, step: 0.1, home: 1, onPatch: (v) => this.setZoom(v) });
   readonly panXModel = new NumericModel(0, { min: 0, max: 1, step: 0.01, home: 0, onPatch: (v) => this.setPanX(v) });
@@ -351,6 +354,67 @@ export class PreviewSession {
 
   stopPreview(): Promise<void> {
     return this.#client.post(`${this.#instrumentBase}/preview/stop`);
+  }
+
+  async takeSnapshot(): Promise<void> {
+    if (this.snapshotPending || this.snrPending) return;
+    this.snapshotPending = true;
+    this.error = null;
+    try {
+      await this.#client.post<{
+        timestamp: string;
+        profile_id: string;
+        output_dir: string;
+        frames: Record<string, { saved_path: string | null }>;
+      }>(`${this.#instrumentBase}/preview/snapshot`);
+    } catch (error) {
+      this.error = error instanceof Error ? error.message : String(error);
+    } finally {
+      this.snapshotPending = false;
+    }
+  }
+
+  async runSnrDiagnostics(numFrames = 32, darkFrames = 8): Promise<void> {
+    if (this.snrPending || this.snapshotPending) return;
+    this.snrPending = true;
+    this.error = null;
+    const reportWindow = typeof window !== 'undefined' ? window.open('about:blank', '_blank') : null;
+    if (reportWindow) {
+      reportWindow.document.title = 'Generating Voxel SNR & Photobleaching Report...';
+      Object.assign(reportWindow.document.body.style, {
+        background: '#09090b',
+        color: '#e4e4e7',
+        fontFamily: 'system-ui, sans-serif',
+        display: 'flex',
+        alignItems: 'center',
+        justifyContent: 'center',
+        height: '100vh'
+      });
+      reportWindow.document.body.innerHTML =
+        `<div style="text-align:center">` +
+        `<h2 style="font-size:18px;margin-bottom:8px">Acquiring ${numFrames} stationary frames (+ ${darkFrames} dark) & computing SNR report...</h2>` +
+        `<p style="color:#a1a1aa;font-size:13px">Lasers turn off immediately after frame capture completes.</p></div>`;
+    }
+    try {
+      const res = await this.#client.post<{
+        report_id: string;
+        report_url: string;
+        report_path: string;
+        metrics_path: string;
+      }>(`${this.#instrumentBase}/diagnostics/snr`, {
+        num_frames: numFrames,
+        dark_frames: darkFrames
+      });
+      if (res?.report_url) {
+        if (reportWindow && !reportWindow.closed) reportWindow.location.href = res.report_url;
+        else if (typeof window !== 'undefined') window.open(res.report_url, '_blank');
+      }
+    } catch (error) {
+      this.error = error instanceof Error ? error.message : String(error);
+      if (reportWindow && !reportWindow.closed) reportWindow.close();
+    } finally {
+      this.snrPending = false;
+    }
   }
 
   setChannelVisible(name: string, visible: boolean): void {
@@ -684,6 +748,7 @@ export class PreviewSession {
   #applyStatus = (status: InstrumentStatus, stateCursor = this.#previewStateCursor): void => {
     this.#latestStateCursor = stateCursor;
     this.#fov = status.fov;
+    this.previewing = status.activity.kind !== 'idle';
     const imaging = status.state.imaging;
     // List only the channels that stream: those of the running preview or capture, or those preview would run.
     const activity = status.activity;

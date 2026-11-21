@@ -1,5 +1,6 @@
 /// <reference types="unplugin-icons/types/svelte" />
 
+export { default as Activity } from '~icons/lucide/activity';
 export { default as ArrowRight } from '~icons/lucide/arrow-right';
 export { default as Blend } from '~icons/lucide/blend';
 export { default as Bookmark } from '~icons/lucide/bookmark';
@@ -7,6 +8,7 @@ export { default as BoxSelect } from '~icons/lucide/box-select';
 export { default as Boxes } from '~icons/lucide/boxes';
 export { default as Brush } from '~icons/lucide/brush';
 export { default as Bug } from '~icons/lucide/bug';
+export { default as Camera } from '~icons/lucide/camera';
 export { default as ChartArea } from '~icons/lucide/chart-area';
 export { default as ChartSpline } from '~icons/lucide/chart-spline';
 export { default as Check } from '~icons/lucide/check';

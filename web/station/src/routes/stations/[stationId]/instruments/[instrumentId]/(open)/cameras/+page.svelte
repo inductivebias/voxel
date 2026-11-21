@@ -136,6 +136,7 @@
       {@const info = deviceReady(camera) && streaming ? camera.streamInfo : undefined}
       {@const dropIssue = issues.about({ device: camera.id }).find(({ code }) => code === 'camera.dropped_frames')}
       {@const frame = camera.connected ? camera.frameSizePx : null}
+      {@const outFrame = camera.connected ? camera.outputFrameSizePx : null}
       {@const sizeMb = camera.connected ? camera.frameSizeMb?.value : undefined}
       {@const buffer = info ? camera.bufferFill : null}
       {@const bufferPercent = buffer == null ? null : Math.max(0, Math.min(100, buffer * 100))}
@@ -212,14 +213,30 @@
             locked,
             select: true
           })}
+          {#each [{ name: 'GPU Bin Y', prop: 'gpu_bin_y', select: true, format: (v: unknown) => `${v}×` }, { name: 'GPU Bin X', prop: 'gpu_bin_x', select: true, format: (v: unknown) => `${v}×` }, { name: 'GPU Bin mode', prop: 'gpu_bin_mode', select: true, format: (v: unknown) => displayName(String(v)) }, { name: 'GPU Pre-filter', prop: 'gpu_pre_filter', select: true, format: (v: unknown) => displayName(String(v)) }, { name: 'GPU Filter size', prop: 'gpu_filter_size', select: false, format: (v: unknown) => `${v}×${v}` }] as gpuSetting (gpuSetting.prop)}
+            {@render setting({
+              name: gpuSetting.name,
+              deviceId: camera.id,
+              prop: camera.getProp(gpuSetting.prop),
+              locked,
+              select: gpuSetting.select,
+              format: gpuSetting.format
+            })}
+          {/each}
         </div>
 
         <div class="space-y-2">
           <div
             class="grid min-w-0 grid-cols-[minmax(0,1fr)_--spacing(24)] overflow-hidden rounded-sm border border-control-line bg-element-bg font-mono text-[10px] tabular-nums"
           >
-            <span class="flex h-6 min-w-0 items-center gap-1 px-1.5" title="Frame dimensions">
-              <span class="truncate">{frame ? `${frame.x} × ${frame.y}` : '— × —'}</span>
+            <span class="flex h-6 min-w-0 items-center gap-1 px-1.5" title="Frame dimensions (sensor → output)">
+              <span class="truncate"
+                >{frame
+                  ? outFrame && (outFrame.x !== frame.x || outFrame.y !== frame.y)
+                    ? `${frame.x} × ${frame.y} → ${outFrame.x} × ${outFrame.y}`
+                    : `${frame.x} × ${frame.y}`
+                  : '— × —'}</span
+              >
               <span class="text-fg-muted">px</span>
             </span>
             <span

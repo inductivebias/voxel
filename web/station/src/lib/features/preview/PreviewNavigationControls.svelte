@@ -5,7 +5,7 @@
   import { prefs } from '$lib/core/prefs';
   import { clampTopLeft } from '$lib/core/utils/vec';
   import { NumberBox } from '@voxel/kit';
-  import { ChevronDown, Crosshair, RotateCw } from '@voxel/kit/icons';
+  import { Activity, Camera, ChevronDown, Crosshair, Loader, RotateCw } from '@voxel/kit/icons';
 
   import { isFullViewport } from './render';
   import {
@@ -167,6 +167,23 @@
     >
       <Crosshair width="14" height="14" />
     </button>
+    {#each [{ onclick: () => void previewer.takeSnapshot(), pending: previewer.snapshotPending, label: 'Take single-frame laser snapshot', idleTitle: 'Take single-frame laser snapshot (saves .tif & keeps frame on screen)', busyTitle: 'Stop live preview before taking a single-frame snapshot', icon: Camera }, { onclick: () => void previewer.runSnrDiagnostics(32, 8), pending: previewer.snrPending, label: 'Run stationary SNR & photobleaching diagnostics', idleTitle: 'Run stationary SNR & photobleaching diagnostics (32 frames + 8 dark, opens HTML report)', busyTitle: 'Stop live preview before running SNR diagnostics', icon: Activity }] as action (action.label)}
+      {@const Icon = action.icon}
+      <button
+        type="button"
+        onclick={action.onclick}
+        disabled={previewer.snapshotPending || previewer.snrPending || previewer.previewing}
+        class="flex h-6 w-5 shrink-0 cursor-pointer items-center justify-center rounded text-fg-muted transition-colors hover:bg-element-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+        aria-label={action.label}
+        title={previewer.previewing ? action.busyTitle : action.idleTitle}
+      >
+        {#if action.pending}
+          <Loader width="14" height="14" class="animate-spin text-fg" />
+        {:else}
+          <Icon width="14" height="14" />
+        {/if}
+      </button>
+    {/each}
     <button
       type="button"
       onclick={() => navigatorVisible.set(!navigatorVisible.get())}

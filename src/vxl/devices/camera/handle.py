@@ -15,6 +15,7 @@ from vxl.devices.camera.base import (
     Camera,
     CaptureState,
     SensorROI,
+    SnapshotFrameInfo,
     StorageStatus,
     TriggerMode,
     TriggerPolarity,
@@ -23,6 +24,8 @@ from vxl.preview import PreviewViewport
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
+
+    from vxl.instrument.snr import CameraSnrAnalysis
 
 _DATASET_LOCATION_ADAPTER = TypeAdapter(DatasetLocation)
 _REMOTE_STORES_ADAPTER = TypeAdapter(dict[str, str])
@@ -188,6 +191,59 @@ class CameraHandle(DeviceHandle[Camera]):
         result = await self.call("reset_roi")
         return SensorROI.model_validate(result)
 
+    async def arm_capture(
+        self,
+        num_frames: int = 1,
+        trigger_mode: TriggerMode = TriggerMode.ON,
+        trigger_polarity: TriggerPolarity = TriggerPolarity.RISING_EDGE,
+    ) -> None:
+        """Arm the camera for ``num_frames`` hardware-triggered frames."""
+        await self.call("arm_capture", num_frames, trigger_mode, trigger_polarity)
+
+    async def capture_frames_raw(self, num_frames: int = 1, *, slot_key: str = "snapshot") -> int:
+        """Grab ``num_frames`` armed frames into RAM and immediately stop the camera."""
+        return int(await self.call("capture_frames_raw", num_frames, slot_key=slot_key))
+
+    async def process_snapshot(
+        self,
+        *,
+        slot_key: str = "snapshot",
+        save_path: str | None = None,
+        pixel_size_um: tuple[float, float] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SnapshotFrameInfo:
+        """Process a buffered raw snapshot frame, optionally save as TIFF, and emit preview."""
+        result = await self.call(
+            "process_snapshot",
+            slot_key=slot_key,
+            save_path=save_path,
+            pixel_size_um=pixel_size_um,
+            metadata=metadata,
+        )
+        return SnapshotFrameInfo.model_validate(result)
+
+    async def analyze_snr_buffer(
+        self,
+        *,
+        output_dir: str,
+        channel_id: str,
+        profile_id: str,
+        pixel_size_um: tuple[float, float],
+        exposure_ms: float,
+    ) -> "CameraSnrAnalysis":
+        """Analyze buffered signal + dark frames and return stationary SNR + photobleaching metrics."""
+        from vxl.instrument.snr import CameraSnrAnalysis  # noqa: PLC0415
+
+        result = await self.call(
+            "analyze_snr_buffer",
+            output_dir=output_dir,
+            channel_id=channel_id,
+            profile_id=profile_id,
+            pixel_size_um=pixel_size_um,
+            exposure_ms=exposure_ms,
+        )
+        return CameraSnrAnalysis.model_validate(result)
+
     @staticmethod
     def _parse_vec2d(value: object) -> Vec2D:
         """Parse a Vec2D property, handling its "y,x" string serialization over ZMQ."""
@@ -213,15 +269,3 @@ class CameraHandle(DeviceHandle[Camera]):
             return IVec2D(y=seq[0], x=seq[1])
         mapping = cast("Mapping[str, int]", value)
         return IVec2D(y=mapping["y"], x=mapping["x"])
-
-    # async def get_frame_area_um(self) -> Vec2D:
-    #     """Get the physical frame area in micrometers."""
-    #     return await self.frame_area_um.get()
-
-    # async def get_pixel_size_um(self) -> Vec2D:
-    #     """Get the sensor pixel size in micrometers."""
-    #     return await self.pixel_size_um.get()
-
-    # async def get_sensor_size_px(self) -> IVec2D:
-    #     """Get the full sensor size in pixels."""
-    #     return await self.sensor_size_px.get()
