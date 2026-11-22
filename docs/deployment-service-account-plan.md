@@ -138,18 +138,129 @@ Keep **all** URL exposure and Tailscale state isolated from both public `voxel` 
 
 ---
 
-## 6. Easy Zero-`sudo` Deployment Workflow (stored in `voxel-private`)
+## 6. New-Machine Bootstrap & Zero-`sudo` Deployment Workflow
 
-Two clean patterns for deploying a new `mobi` commit without general `sudo`:
+The same plan doubles as a repeatable **new-machine / fresh-account runbook**: public `voxel` holds the generic parameterized provisioning and deploy logic (zero hostnames, URLs, or secrets), while **`voxel-private`** supplies only the per-rig `.env`, `config.yaml`, and Tailscale Serve registration.
 
-- **Option 1 — Scoped restart helper (recommended with system unit):**
-  - Operators in group `voxel` (or a deploy key) run `/opt/voxel/deploy.sh <git-ref>` as `lm1-service`, which:
-    1. Fetches and checks out `<git-ref>` in `/opt/voxel`
-    2. Runs `uv sync --locked --all-packages --extra web --extra zaber` (plus rig hardware extras)
-    3. Rebuilds the web SPA (`pnpm -C web install --frozen-lockfile && pnpm -C web/station build`)
-    4. Calls a single narrow `sudoers` rule (`%voxel ALL=(root) NOPASSWD: /usr/bin/systemctl restart vxl-lm1.service, /usr/bin/systemctl status vxl-lm1.service`) — no shell, no arbitrary `sudo`.
-- **Option 2 — `systemd --user` service (`loginctl enable-linger lm1-service`):**
-  - Zero `sudoers` entries at all; `lm1-service` manages its own unit via `systemctl --user restart vxl.service`. Slightly less kernel sandboxing (`ProtectSystem=strict` unavailable in user units), so Option 1 is preferable for a hardware rig.
+### 6.1 New-Machine Prerequisites (Admin, One-Time)
+
+1. **Base OS & tooling (Ubuntu/Debian Linux):**
+   - `git`, `acl` (`setfacl`), `curl`, `openssl`
+   - `uv` installed system-wide (e.g. `/usr/local/bin/uv`) so any service user can run `uv sync`
+   - Node.js 24 LTS + `corepack` / `pnpm@12.16.1` (for building `web/station`)
+   - Tailscale daemon (`tailscaled`) enrolled with a rig tag (`tag:voxel-rig`), **not** a personal user login
+2. **Hardware drivers & SDKs (as applicable to the rig):**
+   - NVIDIA driver + CUDA runtime (for GPU pyramid/`nvcomp` writer)
+   - Teledyne Photometrics PVCAM kernel driver + SDK (`/opt/pvcam`, verify `/dev/pvcam*` group/ACL)
+   - NI-DAQmx Linux driver (`nidaqmx` / `/dev/nipalk`)
+   - USB-serial udev rules (fixed `/dev/serial/by-id/...` symlinks for lasers & filter wheels)
+   - Verify `/dev/shm` tmpfs size is large enough for the writer ring buffer (`df -h /dev/shm`)
+
+### 6.2 Parameterized Provisioning Blueprint (One-Time `sudo`, Generic)
+
+A generic script (e.g. `scripts/deploy/provision.sh` or copied into `voxel-private`) creates the account, directories, `systemd` unit, and narrow restart rule from environment variables — no machine names hardcoded:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+: "${VOXEL_SERVICE_USER:=voxel-service}"
+: "${VOXEL_GROUP:=voxel}"
+: "${VOXEL_INSTALL_DIR:=/opt/voxel}"
+: "${VOXEL_STATE_DIR:=/var/lib/${VOXEL_SERVICE_USER}}"
+: "${VOXEL_DATA_DIR:=/data/voxel}"
+: "${VOXEL_ENV_FILE:=/etc/voxel/${VOXEL_SERVICE_USER}.env}"
+: "${VOXEL_SERVICE_NAME:=vxl-${VOXEL_SERVICE_USER}}"
+: "${VOXEL_REPO_URL:=https://github.com/inductivebias/voxel.git}"
+: "${VOXEL_BRANCH:=mobi}"
+
+# 1. Service group & unprivileged user (no sudo, no login shell)
+getent group "$VOXEL_GROUP" >/dev/null || groupadd --system "$VOXEL_GROUP"
+id -u "$VOXEL_SERVICE_USER" >/dev/null 2>&1 || \
+  useradd --system --create-home --home-dir "$VOXEL_STATE_DIR" \
+    --shell /usr/sbin/nologin --gid "$VOXEL_GROUP" "$VOXEL_SERVICE_USER"
+
+for grp in users dialout plugdev video render; do
+  getent group "$grp" >/dev/null && usermod -aG "$grp" "$VOXEL_SERVICE_USER"
+done
+
+# 2. Directories with setgid + default group ACL so operators in $VOXEL_GROUP can read data
+install -d -o "$VOXEL_SERVICE_USER" -g "$VOXEL_GROUP" -m 2775 "$VOXEL_INSTALL_DIR" "$VOXEL_DATA_DIR"
+install -d -o "$VOXEL_SERVICE_USER" -g "$VOXEL_GROUP" -m 0750 "$VOXEL_STATE_DIR/.voxel"
+setfacl -R -m "g:${VOXEL_GROUP}:rwx" -m "d:g:${VOXEL_GROUP}:rwx" "$VOXEL_DATA_DIR"
+
+# 3. Initial env file (generate strong password once; populate VOXEL_ALLOWED_HOSTS from voxel-private)
+install -d -o root -g "$VOXEL_GROUP" -m 0750 "$(dirname "$VOXEL_ENV_FILE")"
+if [[ ! -f "$VOXEL_ENV_FILE" ]]; then
+  umask 027
+  cat >"$VOXEL_ENV_FILE" <<EOF
+VOXEL_WEB_PASSWORD=$(openssl rand -base64 24)
+VOXEL_PROXY_HEADERS=1
+VOXEL_ALLOWED_HOSTS=
+EOF
+  chown "root:${VOXEL_GROUP}" "$VOXEL_ENV_FILE"
+  chmod 0640 "$VOXEL_ENV_FILE"
+fi
+
+# 4. Initial repo clone owned by service user
+if [[ ! -d "$VOXEL_INSTALL_DIR/.git" ]]; then
+  sudo -u "$VOXEL_SERVICE_USER" git clone --branch "$VOXEL_BRANCH" "$VOXEL_REPO_URL" "$VOXEL_INSTALL_DIR"
+fi
+
+# 5. Narrow sudoers rule allowing ONLY restart/status of this single unit
+cat >"/etc/sudoers.d/${VOXEL_SERVICE_NAME}" <<EOF
+%${VOXEL_GROUP} ALL=(root) NOPASSWD: /usr/bin/systemctl restart ${VOXEL_SERVICE_NAME}.service, /usr/bin/systemctl status ${VOXEL_SERVICE_NAME}.service
+EOF
+chmod 0440 "/etc/sudoers.d/${VOXEL_SERVICE_NAME}"
+visudo -cf "/etc/sudoers.d/${VOXEL_SERVICE_NAME}"
+```
+
+### 6.3 Zero-`sudo` Deploy & Rollback Blueprint (Repeatable Updates)
+
+Once provisioned, deploying any commit/tag — or rolling back to a previous commit — runs as `VOXEL_SERVICE_USER` with no general `sudo`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+REF="${1:?usage: deploy.sh <git-ref-or-sha>}"
+: "${VOXEL_INSTALL_DIR:=/opt/voxel}"
+: "${VOXEL_SERVICE_NAME:=vxl-lm1-service}"
+: "${VOXEL_UV_EXTRAS:=--extra web --extra zaber --extra pvcam-camera}"
+
+cd "$VOXEL_INSTALL_DIR"
+PREV_SHA="$(git rev-parse HEAD)"
+echo "Deploying ${REF} (previous: ${PREV_SHA})"
+
+git fetch origin --tags
+git checkout --detach "$REF"
+
+# 1. Sync Python workspace (exact locked dependencies)
+uv sync --locked --all-packages ${VOXEL_UV_EXTRAS}
+
+# 2. Build web UI bundle served by `vxl serve`
+pnpm -C web install --frozen-lockfile
+pnpm -C web/station build
+
+# 3. Smoke-check CLI & GPU availability before restarting live service
+uv run --locked vxl --help >/dev/null
+uv run --locked python -c "import vxl, ome_zarr_writer; print('vxl import ok')"
+
+# 4. Restart via single scoped sudoers rule (or `systemctl --user restart` in user-unit mode)
+sudo /usr/bin/systemctl restart "${VOXEL_SERVICE_NAME}.service"
+sudo /usr/bin/systemctl is-active --quiet "${VOXEL_SERVICE_NAME}.service"
+echo "Deployed $(git rev-parse --short HEAD) successfully. Rollback: $0 ${PREV_SHA}"
+```
+
+> **Alternative (`systemd --user` mode):** If you prefer zero `sudoers` entries at all, enable lingering once (`sudo loginctl enable-linger "$VOXEL_SERVICE_USER"`) and place the unit in `~${VOXEL_SERVICE_USER}/.config/systemd/user/vxl.service`. System units with the single scoped `systemctl restart` rule are preferred on hardware rigs because they support `ProtectSystem=strict` and `LimitMEMLOCK=infinity` cleanly.
+
+### 6.4 First-Time Rig Config Wiring (from `voxel-private`)
+
+After provisioning a new machine:
+1. Copy or symlink the rig's private `system.yaml`, `station.yaml`, and `<rig>.voxel/config.yaml` from **`voxel-private`** into `/var/lib/<service-user>/.voxel/`.
+2. Set `VOXEL_ALLOWED_HOSTS=<host>.<tailnet>.ts.net` in `/etc/voxel/<service-user>.env`.
+3. Run `deploy.sh origin/mobi` to build the venv and web UI and start the service.
+4. From the **`voxel-private`** admin workflow, enable `sudo tailscale serve --bg --https=443 http://127.0.0.1:8000` and verify ACL grants.
 
 ---
 
