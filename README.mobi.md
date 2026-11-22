@@ -267,31 +267,15 @@ uv run vxl-zaber-diagnose --host <controller-host>
 Mutations hold the hub lock, reject changes while the axis is busy or a continuous scan is prepared,
 and stage writes through `STAGING` before atomically loading `LIVE`.
 
-[`scripts/tune_zaber_scan.py`](scripts/tune_zaber_scan.py) supports three workflows:
+[`scripts/tune_zaber_scan.py`](scripts/tune_zaber_scan.py) supports two workflows:
 
 ```bash
-# 1. Analyze an existing scan.json or scan_failure.json locally (no server required)
+# 1. Analyze an existing scan.json or scan_failure.json locally (no hardware required)
 python3 scripts/tune_zaber_scan.py --analyze /path/to/scan.json
 
-# 2. Snapshot / restore current Zaber live servo tuning via the vxl serve REST API
-# (--session-id is auto-discovered from the station snapshot when omitted; set VOXEL_WEB_PASSWORD or --password if auth is enabled)
-python3 scripts/tune_zaber_scan.py --station-id <STATION_UUID> --snapshot zaber_backup.json
-python3 scripts/tune_zaber_scan.py --station-id <STATION_UUID> --restore zaber_backup.json
-
-# 3. Sweep Zaber Simple Tuning stiffness over repeated Voxel test scans
-# (add --apply-best to keep the winner in LIVE, and --persist-paramset 1..9 to save & set startup slot)
-python3 scripts/tune_zaber_scan.py \
-  --station-id <STATION_UUID> \
-  --task-id <TASK_ID> \
-  --data-root /data/users/cfxuser \
-  --load-mass-kg 1.5 \
-  --stiffness-values 0.5,0.6,0.7,0.8,0.9,1.0 \
-  --repeats 2 \
-  --apply-best \
-  --persist-paramset 1
-
-# 4. Direct Zaber 1 kHz oscilloscope + ServoTuner sweep (measures pos - encoder.pos following error
-# and velocity ripple directly on the controller without cameras, DAQ, or Zarr)
+# 2. Direct Zaber 1 kHz oscilloscope + ServoTuner stiffness sweep (measures pos - encoder.pos
+# following error and velocity ripple directly on the controller without cameras, DAQ, or Zarr;
+# snapshots & restores original LIVE tuning on fault/dry-run, or keeps winner with --apply-best)
 python3 scripts/tune_zaber_scan.py \
   --zaber-host <CONTROLLER_IP> \
   --axis 1 \
@@ -299,5 +283,6 @@ python3 scripts/tune_zaber_scan.py \
   --scan-end-mm 25.0 \
   --scan-speed-mm-s 5.0 \
   --load-mass-kg 1.5 \
-  --apply-best
+  --apply-best \
+  --persist-paramset 1
 ```

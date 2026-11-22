@@ -203,42 +203,24 @@ def _require_non_empty(value: str, label: str) -> str:
 
 
 _PARAMSET_TO_CANONICAL: dict[ServoTuningParamset, str] = {
-    ServoTuningParamset.LIVE: "live",
-    ServoTuningParamset.STAGING: "staging",
-    ServoTuningParamset.DEFAULT: "default",
-    ServoTuningParamset.P_1: "1",
-    ServoTuningParamset.P_2: "2",
-    ServoTuningParamset.P_3: "3",
-    ServoTuningParamset.P_4: "4",
-    ServoTuningParamset.P_5: "5",
-    ServoTuningParamset.P_6: "6",
-    ServoTuningParamset.P_7: "7",
-    ServoTuningParamset.P_8: "8",
-    ServoTuningParamset.P_9: "9",
+    ps: ps.name.removeprefix("P_").lower() for ps in ServoTuningParamset
 }
-
 _CANONICAL_TO_PARAMSET: dict[str, ServoTuningParamset] = {
     **{name: ps for ps, name in _PARAMSET_TO_CANONICAL.items()},
-    **{f"p_{i}": getattr(ServoTuningParamset, f"P_{i}") for i in range(1, 10)},
+    **{ps.name.lower(): ps for ps in ServoTuningParamset},
 }
-
 _STORED_PARAMSETS: frozenset[ServoTuningParamset] = frozenset(
-    ps for ps in _PARAMSET_TO_CANONICAL if ps not in (ServoTuningParamset.LIVE, ServoTuningParamset.STAGING)
+    ps for ps in ServoTuningParamset if ps not in (ServoTuningParamset.LIVE, ServoTuningParamset.STAGING)
 )
 
 
 def _parse_paramset(name: str) -> ServoTuningParamset:
     """Parse a servo tuning paramset name ('live', 'staging', 'default', '1'..'9', or 'p_1'..'p_9')."""
-    key = name.strip().lower()
-    if key not in _CANONICAL_TO_PARAMSET:
+    if (ps := _CANONICAL_TO_PARAMSET.get(name.strip().lower())) is None:
         raise ValueError(
             f"Unknown servo paramset {name!r}; expected 'live', 'staging', 'default', '1'..'9', or 'p_1'..'p_9'"
         )
-    return _CANONICAL_TO_PARAMSET[key]
-
-
-def _format_paramset(paramset: ServoTuningParamset) -> str:
-    return _PARAMSET_TO_CANONICAL[paramset]
+    return ps
 
 
 def _require_writable_paramset(name: str) -> ServoTuningParamset:
@@ -1362,44 +1344,48 @@ class ZaberLinearAxis(ContinuousAxis):
         if self._axis.is_busy():
             raise RuntimeError("Cannot modify servo tuning while axis is busy")
 
+    def _read_optional_tuning[T](self, fn: Callable[[], T]) -> T | None:
+        try:
+            return fn()
+        except RequestTimeoutException:
+            raise
+        except MotionLibException:
+            return None
+
     def _read_servo_tuning_locked(self, target: ServoTuningParamset) -> dict[str, Any]:
         info = self._servo_tuner.get_tuning(target)
         startup = self._servo_tuner.get_startup_paramset()
-
-        pid_data: dict[str, float] | None
-        try:
-            pid = self._servo_tuner.get_pid_tuning(target)
-        except RequestTimeoutException:
-            raise
-        except MotionLibException:
-            pid_data = None
-        else:
-            pid_data = {"p": float(pid.p), "i": float(pid.i), "d": float(pid.d), "fc": float(pid.fc)}
-
-        simple_data: dict[str, Any] | None
-        try:
-            simple = self._servo_tuner.get_simple_tuning(target)
-        except RequestTimeoutException:
-            raise
-        except MotionLibException:
-            simple_data = None
-        else:
-            simple_data = {
+        pid = self._read_optional_tuning(lambda: self._servo_tuner.get_pid_tuning(target))
+        simple = self._read_optional_tuning(lambda: self._servo_tuner.get_simple_tuning(target))
+        return {
+            "paramset": _PARAMSET_TO_CANONICAL[target],
+            "startup_paramset": _PARAMSET_TO_CANONICAL[startup],
+            "type": info.type,
+            "version": info.version,
+            "params": {p.name: float(p.value) for p in info.params},
+            "pid": None
+            if pid is None
+            else {"p": float(pid.p), "i": float(pid.i), "d": float(pid.d), "fc": float(pid.fc)},
+            "simple": None
+            if simple is None
+            else {
                 "is_used": bool(simple.is_used),
                 "load_mass_kg": float(simple.load_inertia),
                 "carriage_mass_kg": float(simple.carriage_inertia) if simple.carriage_inertia is not None else None,
                 "params": {p.name: float(p.value) for p in simple.tuning_params},
-            }
-
-        return {
-            "paramset": _format_paramset(target),
-            "startup_paramset": _format_paramset(startup),
-            "type": info.type,
-            "version": info.version,
-            "params": {p.name: float(p.value) for p in info.params},
-            "pid": pid_data,
-            "simple": simple_data,
+            },
         }
+
+    def _mutate_servo_tuning(
+        self, target: ServoTuningParamset, mutate: Callable[[], object], *, via_staging: bool = False
+    ) -> dict[str, Any]:
+        with self.hub.lock:
+            self._require_servo_tuning_writable()
+            self._settings.clear()
+            mutate()
+            if via_staging and target is not ServoTuningParamset.STAGING:
+                self._servo_tuner.load_paramset(target, ServoTuningParamset.STAGING)
+            return self._read_servo_tuning_locked(target)
 
     @describe(label="Get Servo Tuning", desc="Read Zaber servo tuning parameters for a paramset.")
     def get_servo_tuning(self, paramset: str = "live") -> dict[str, Any]:
@@ -1424,13 +1410,10 @@ class ZaberLinearAxis(ContinuousAxis):
             raise ValueError(f"load_mass_kg must be finite and nonnegative, got {load_mass_kg}")
         if not math.isfinite(stiffness) or not 0.0 <= stiffness <= 1.0:
             raise ValueError(f"stiffness must be finite and within [0.0, 1.0], got {stiffness}")
-        target = _require_writable_paramset(paramset)
-        with self.hub.lock:
-            self._require_servo_tuning_writable()
-            self._settings.clear()
-            definitions = self._servo_tuner.get_simple_tuning_param_definitions()
-            param_name = next((d.name for d in definitions if d.name.lower() == "stiffness"), "Stiffness")
-            # Write to STAGING first so multi-parameter updates activate atomically on LIVE/stored paramsets.
+
+        def _apply() -> None:
+            defs = self._servo_tuner.get_simple_tuning_param_definitions()
+            param_name = next((d.name for d in defs if d.name.lower() == "stiffness"), "Stiffness")
             self._servo_tuner.set_simple_tuning(
                 ServoTuningParamset.STAGING,
                 [ServoTuningParam(name=param_name, value=float(stiffness))],
@@ -1438,50 +1421,30 @@ class ZaberLinearAxis(ContinuousAxis):
                 load_inertia_units=Units.INERTIA_KILOGRAMS,
                 enable_feed_forward=enable_feed_forward,
             )
-            if target is not ServoTuningParamset.STAGING:
-                self._servo_tuner.load_paramset(target, ServoTuningParamset.STAGING)
-            return self._read_servo_tuning_locked(target)
+
+        return self._mutate_servo_tuning(_require_writable_paramset(paramset), _apply, via_staging=True)
 
     @describe(label="Set PID Servo Tuning", desc="Apply Zaber PID servo tuning via STAGING.")
-    def set_pid_servo_tuning(
-        self,
-        p: float,
-        i: float,
-        d: float,
-        fc: float,
-        paramset: str = "live",
-    ) -> dict[str, Any]:
+    def set_pid_servo_tuning(self, p: float, i: float, d: float, fc: float, paramset: str = "live") -> dict[str, Any]:
         """Apply PID servo tuning to STAGING, then atomically load into ``paramset`` when needed."""
         for label, value in (("p", p), ("i", i), ("d", d)):
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"{label} must be finite and nonnegative, got {value}")
         if not math.isfinite(fc) or fc <= 0:
             raise ValueError(f"fc must be finite and positive, got {fc}")
-        target = _require_writable_paramset(paramset)
-        with self.hub.lock:
-            self._require_servo_tuning_writable()
-            self._settings.clear()
-            self._servo_tuner.set_pid_tuning(
-                ServoTuningParamset.STAGING,
-                float(p),
-                float(i),
-                float(d),
-                float(fc),
-            )
-            if target is not ServoTuningParamset.STAGING:
-                self._servo_tuner.load_paramset(target, ServoTuningParamset.STAGING)
-            return self._read_servo_tuning_locked(target)
+        return self._mutate_servo_tuning(
+            _require_writable_paramset(paramset),
+            lambda: self._servo_tuner.set_pid_tuning(
+                ServoTuningParamset.STAGING, float(p), float(i), float(d), float(fc)
+            ),
+            via_staging=True,
+        )
 
     @describe(label="Load Servo Paramset", desc="Atomically copy one Zaber servo paramset into another.")
     def load_servo_paramset(self, to_paramset: str, from_paramset: str) -> dict[str, Any]:
         """Atomically copy ``from_paramset`` into ``to_paramset`` and return the updated tuning."""
-        target = _require_writable_paramset(to_paramset)
-        source = _parse_paramset(from_paramset)
-        with self.hub.lock:
-            self._require_servo_tuning_writable()
-            self._settings.clear()
-            self._servo_tuner.load_paramset(target, source)
-            return self._read_servo_tuning_locked(target)
+        target, source = _require_writable_paramset(to_paramset), _parse_paramset(from_paramset)
+        return self._mutate_servo_tuning(target, lambda: self._servo_tuner.load_paramset(target, source))
 
     @describe(label="Set Servo Startup Paramset", desc="Select the stored Zaber servo paramset loaded on boot.")
     def set_servo_startup_paramset(self, paramset: str) -> str:
@@ -1493,7 +1456,7 @@ class ZaberLinearAxis(ContinuousAxis):
             self._require_servo_tuning_writable()
             self._settings.clear()
             self._servo_tuner.set_startup_paramset(target)
-            return _format_paramset(self._servo_tuner.get_startup_paramset())
+            return _PARAMSET_TO_CANONICAL[self._servo_tuner.get_startup_paramset()]
 
     def get_ttl_stepper(self) -> TTLStepper | None:
         return self._ttl_stepper

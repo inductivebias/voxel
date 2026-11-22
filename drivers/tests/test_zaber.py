@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from types import SimpleNamespace
 from typing import Any
 
@@ -177,23 +178,13 @@ class FakeServoTuner:
         self.startup_paramset = ServoTuningParamset.DEFAULT
         self.param_definitions = [
             SimpleTuningParamDefinition(
-                name="Stiffness",
-                min_label="Smooth",
-                max_label="Stiff",
-                data_type="0..1",
-                default_value=0.5,
+                name="Stiffness", min_label="Smooth", max_label="Stiff", data_type="0..1", default_value=0.5
             )
         ]
         self.calls: list[tuple[Any, ...]] = []
         self.pid_error: Exception | None = None
         self.simple_error: Exception | None = None
-        self._paramsets: dict[ServoTuningParamset, dict[str, Any]] = {}
-        for ps in ServoTuningParamset:
-            self._paramsets[ps] = self._default_state()
-
-    @staticmethod
-    def _default_state() -> dict[str, Any]:
-        return {
+        base = {
             "info": ParamsetInfo(
                 type="ffpid",
                 version=4,
@@ -209,6 +200,7 @@ class FakeServoTuner:
                 carriage_inertia=0.2,
             ),
         }
+        self._paramsets = {ps: copy.deepcopy(base) for ps in ServoTuningParamset}
 
     def get_tuning(self, paramset: ServoTuningParamset) -> ParamsetInfo:
         return self._paramsets[paramset]["info"]
@@ -233,13 +225,9 @@ class FakeServoTuner:
         tuning_params: list[ServoTuningParam],
         load_inertia: float,
         load_inertia_units: object = zaber.Units.NATIVE,
-        carriage_inertia: float | None = None,
-        carriage_inertia_units: object = zaber.Units.NATIVE,
-        motor_inertia: float | None = None,
-        motor_inertia_units: object = zaber.Units.NATIVE,
         enable_feed_forward: bool = True,
+        **_unused: Any,
     ) -> None:
-        del carriage_inertia_units, motor_inertia, motor_inertia_units
         self.calls.append(
             (
                 "set_simple_tuning",
@@ -251,31 +239,21 @@ class FakeServoTuner:
             )
         )
         prev = self._paramsets[paramset]
+        params = [ServoTuningParam(name=p.name, value=p.value) for p in tuning_params]
         self._paramsets[paramset] = {
-            "info": ParamsetInfo(
-                type=prev["info"].type,
-                version=prev["info"].version,
-                params=[ServoTuningParam(name=p.name, value=p.value) for p in tuning_params],
-            ),
+            "info": ParamsetInfo(type=prev["info"].type, version=prev["info"].version, params=params),
             "pid": prev["pid"],
             "simple": SimpleTuning(
                 is_used=True,
                 is_set=True,
                 load_inertia=load_inertia,
-                tuning_params=[ServoTuningParam(name=p.name, value=p.value) for p in tuning_params],
+                tuning_params=params,
                 enable_feed_forward=enable_feed_forward,
-                carriage_inertia=carriage_inertia if carriage_inertia is not None else prev["simple"].carriage_inertia,
+                carriage_inertia=prev["simple"].carriage_inertia,
             ),
         }
 
-    def set_pid_tuning(
-        self,
-        paramset: ServoTuningParamset,
-        p: float,
-        i: float,
-        d: float,
-        fc: float,
-    ) -> PidTuning:
+    def set_pid_tuning(self, paramset: ServoTuningParamset, p: float, i: float, d: float, fc: float) -> PidTuning:
         self.calls.append(("set_pid_tuning", paramset, p, i, d, fc))
         prev = self._paramsets[paramset]
         pid = PidTuning(type=prev["info"].type, version=prev["info"].version, p=p, i=i, d=d, fc=fc)
@@ -283,12 +261,7 @@ class FakeServoTuner:
             "info": ParamsetInfo(
                 type=prev["info"].type,
                 version=prev["info"].version,
-                params=[
-                    ServoTuningParam(name="kp", value=p),
-                    ServoTuningParam(name="ki", value=i),
-                    ServoTuningParam(name="kd", value=d),
-                    ServoTuningParam(name="fc", value=fc),
-                ],
+                params=[ServoTuningParam(name=k, value=v) for k, v in (("kp", p), ("ki", i), ("kd", d), ("fc", fc))],
             ),
             "pid": pid,
             "simple": SimpleTuning(
@@ -304,30 +277,7 @@ class FakeServoTuner:
 
     def load_paramset(self, to_paramset: ServoTuningParamset, from_paramset: ServoTuningParamset) -> None:
         self.calls.append(("load_paramset", to_paramset, from_paramset))
-        src = self._paramsets[from_paramset]
-        self._paramsets[to_paramset] = {
-            "info": ParamsetInfo(
-                type=src["info"].type,
-                version=src["info"].version,
-                params=[ServoTuningParam(name=p.name, value=p.value) for p in src["info"].params],
-            ),
-            "pid": PidTuning(
-                type=src["pid"].type,
-                version=src["pid"].version,
-                p=src["pid"].p,
-                i=src["pid"].i,
-                d=src["pid"].d,
-                fc=src["pid"].fc,
-            ),
-            "simple": SimpleTuning(
-                is_used=src["simple"].is_used,
-                is_set=src["simple"].is_set,
-                load_inertia=src["simple"].load_inertia,
-                tuning_params=[ServoTuningParam(name=p.name, value=p.value) for p in src["simple"].tuning_params],
-                enable_feed_forward=src["simple"].enable_feed_forward,
-                carriage_inertia=src["simple"].carriage_inertia,
-            ),
-        }
+        self._paramsets[to_paramset] = copy.deepcopy(self._paramsets[from_paramset])
 
     def get_startup_paramset(self) -> ServoTuningParamset:
         return self.startup_paramset
