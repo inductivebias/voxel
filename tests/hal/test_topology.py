@@ -1,5 +1,6 @@
 import pytest
 from pydantic import ValidationError
+from vxlib.vector import Vec3D
 
 from rigup import DeviceConfig
 from vxl.hal.topology import (
@@ -261,7 +262,7 @@ def test_acquisition_geometry_requires_calibrated_distinct_axes():
     with pytest.raises(ValidationError, match="permutation"):
         AcquisitionGeometry(stage_axes=("x", "x", "z"))
     with pytest.raises(ValidationError, match="finite"):
-        AcquisitionGeometry(stage_axes=("z", "y", "x"), offset={"z": float("inf"), "y": 0, "x": 0})
+        AcquisitionGeometry(stage_axes=("z", "y", "x"), offset=Vec3D(z=float("inf"), y=0, x=0))
     geometry = AcquisitionGeometry(stage_axes=("x", "y", "z"), shear_xz=0.5)
     origin = geometry.writer_origin({"x": 37000, "y": 5000, "z": 100})
     assert origin.z == 37000

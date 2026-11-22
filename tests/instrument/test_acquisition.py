@@ -14,6 +14,7 @@ from vxl_records import (
     StorageSpec,
     VolumeStatus,
 )
+from vxlib.vector import Vec3D
 
 from vxl.devices.camera import CaptureState
 from vxl.hal.topology import AcquisitionGeometry
@@ -253,7 +254,7 @@ async def test_acquisition_passes_calibrated_geometry_and_channel_metadata(
     topology = instrument._hal.topology
     detection = dict(topology.detection)
     geometry = AcquisitionGeometry(
-        stage_axes=("z", "y", "x"), offset={"z": 5, "y": 20, "x": 30}, shear_xz=0.5, shear_yz=-0.25
+        stage_axes=("z", "y", "x"), offset=Vec3D(z=5, y=20, x=30), shear_xz=0.5, shear_yz=-0.25
     )
     detection[camera_id] = detection[camera_id].model_copy(update={"acquisition_geometry": geometry})
     monkeypatch.setattr(instrument._hal, "_topology", topology.model_copy(update={"detection": detection}))
@@ -267,9 +268,14 @@ async def test_acquisition_passes_calibrated_geometry_and_channel_metadata(
     assert len(writer.opened_kwargs) == 2
     for index, kwargs in enumerate(writer.opened_kwargs):
         origin = kwargs["origin"]
+        shear_yz = kwargs["shear_yz"]
+        shear_xz = kwargs["shear_xz"]
+        assert isinstance(origin, Vec3D)
+        assert isinstance(shear_yz, float)
+        assert isinstance(shear_xz, float)
         assert origin.z == 5
-        assert origin.y + kwargs["shear_yz"] * origin.z == 20
-        assert origin.x + kwargs["shear_xz"] * origin.z == 30 + index * 10
+        assert origin.y + shear_yz * origin.z == 20
+        assert origin.x + shear_xz * origin.z == 30 + index * 10
         assert kwargs["channel_label"] == instrument.state.value.imaging.channels["gfp"].label
         assert kwargs["channel_color"] == instrument.state.value.imaging.channels["gfp"].colormap.lstrip("#").upper()
     assert started.volumes[0].x == 0

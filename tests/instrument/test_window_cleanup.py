@@ -1,11 +1,18 @@
 """Ordering and failure recovery for continuous acquisition window cleanup."""
 
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 from unittest.mock import AsyncMock
 
 import pytest
 
 from vxl.instrument.core import Instrument, _PassProgress
+
+if TYPE_CHECKING:
+    from vxl_records import PlannedVolume
+
+    from vxl.devices.axes import ContinuousAxisHandle
+    from vxl.instrument.scanning import ContinuousPass
 
 
 @pytest.mark.asyncio
@@ -22,7 +29,10 @@ async def test_return_to_start_resets_window_before_moving():
     inst = SimpleNamespace(_volume_scan_axis=lambda _v: axis, _hold_violations=AsyncMock(return_value=[]))
     progress = _PassProgress()
     await Instrument._position_volume(
-        inst, SimpleNamespace(scan=SimpleNamespace(y_stack=None)), SimpleNamespace(start=10), progress
+        cast("Instrument", inst),
+        cast("PlannedVolume", SimpleNamespace(scan=SimpleNamespace(y_stack=None))),
+        cast("ContinuousPass", SimpleNamespace(start=10)),
+        progress,
     )
     assert events == ["reset", "move"]
     assert progress.prepared
@@ -56,7 +66,12 @@ async def test_teardown_closes_window_first_and_continues_after_failure(monkeypa
         _all_lasers=list, _stop_signal_generators=stop, _abort_pass=abort, _close_stacks=AsyncMock(return_value=[])
     )
     monkeypatch.setattr("vxl.instrument.core._disable_lasers_and_halt", disable)
-    errors = await Instrument._teardown_capture(inst, [], axis, _PassProgress(prepared=True, finished=finished))
+    errors = await Instrument._teardown_capture(
+        cast("Instrument", inst),
+        [],
+        cast("ContinuousAxisHandle", axis),
+        _PassProgress(prepared=True, finished=finished),
+    )
     assert events[:3] == ["window", "laser/halt", "daq"]
     assert ("abort/retry" in events) is not finished
     assert len(errors) == int(disarm_fails)

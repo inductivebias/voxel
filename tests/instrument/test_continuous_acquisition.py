@@ -2,7 +2,7 @@ import asyncio
 import json
 from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -33,6 +33,15 @@ from vxl.instrument import (
     ZRange,
 )
 from vxl.instrument.config import TaskPatch
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping
+
+    from vxl_records import AcquisitionManifest
+
+    from vxl.devices.axes import ContinuousAxisHandle
+    from vxl.instrument.core import Channel
+    from vxl.instrument.scanning import ContinuousPass
 
 STORAGE = StorageSpec(path=PurePosixPath("run"))
 
@@ -494,7 +503,11 @@ async def test_continuous_progress_uses_first_camera_before_completion(fail: boo
     planned = SimpleNamespace(timeout_s=2, division=SimpleNamespace(cycles=20))
     manifest = object()
     run = Instrument._await_pass(
-        instrument, channels, SimpleNamespace(continuous_scan_moving=moving), planned, manifest
+        cast("Instrument", instrument),
+        cast("Mapping[str, Channel]", channels),
+        cast("ContinuousAxisHandle", SimpleNamespace(continuous_scan_moving=moving)),
+        cast("ContinuousPass", planned),
+        cast("AcquisitionManifest", manifest),
     )
     if fail:
         with pytest.raises(RuntimeError, match="camera failed"):
@@ -549,6 +562,7 @@ async def test_target_frame_rate_controls_speed_without_querying_camera_limit(
     instrument = opened_instrument
     await add_line(instrument)
     task = instrument.state.value.plan[0]
+    assert task.scan is not None
     await instrument.update_task(
         task.id,
         TaskPatch(
@@ -586,6 +600,7 @@ async def test_x_scan_array_positions_y_between_sweeps_and_keeps_z_fixed(
     instrument = opened_instrument
     await add_line(instrument)
     task = instrument.state.value.plan[0]
+    assert task.scan is not None
     scan = LineScan.model_validate({**task.scan.model_dump(), "y_stack": {"start": 0, "end": 250, "step": 100}})
     await instrument.update_task(task.id, TaskPatch(scan=scan))
     rows = instrument.planned_volumes.value
@@ -629,7 +644,9 @@ async def test_x_scan_array_positions_y_between_sweeps_and_keeps_z_fixed(
     assert y_moves == [100, 200]
     assert sweep_y == [0, 100, 200]
     assert [v.y for v in manifest.volumes] == [0, 100, 200]
-    assert all(v.scan.y_stack.step == 100 for v in manifest.volumes)
+    assert all(
+        v.scan is not None and v.scan.y_stack is not None and v.scan.y_stack.step == 100 for v in manifest.volumes
+    )
     assert all(v.warnings == ([warning] if start_warning else []) for v in manifest.volumes)
     assert writer.batches == [2, 2, 2]
 
@@ -644,6 +661,7 @@ async def test_cancelling_array_during_y_positioning_halts_y(
     instrument = opened_instrument
     await add_line(instrument)
     task = instrument.state.value.plan[0]
+    assert task.scan is not None
     await instrument.update_task(
         task.id,
         TaskPatch(
@@ -682,6 +700,7 @@ async def test_explicit_target_rejects_exposure_longer_than_target_period(
     await add_line(instrument)
     await instrument.set_device_properties("camera_1", {"exposure_time_ms": 100})
     task = instrument.state.value.plan[0]
+    assert task.scan is not None
     await instrument.update_task(
         task.id,
         TaskPatch(
@@ -709,6 +728,7 @@ async def test_diagnostic_run_continues_after_strip_error_and_logs_it_once(
     instrument = opened_instrument
     await add_line(instrument)
     task = instrument.state.value.plan[0]
+    assert task.scan is not None
     await instrument.update_task(
         task.id,
         TaskPatch(
@@ -761,6 +781,7 @@ async def test_diagnostic_mode_does_not_continue_after_cleanup_failure(
     instrument = opened_instrument
     await add_line(instrument)
     task = instrument.state.value.plan[0]
+    assert task.scan is not None
     await instrument.update_task(
         task.id,
         TaskPatch(
