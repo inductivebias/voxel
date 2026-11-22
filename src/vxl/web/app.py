@@ -3,7 +3,7 @@
 import logging
 import os
 import socket
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Iterable
 from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any
@@ -18,6 +18,7 @@ from starlette.middleware.trustedhost import TrustedHostMiddleware
 from starlette.responses import Response
 from starlette.staticfiles import StaticFiles
 from starlette.types import Receive, Scope, Send
+from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
 
 from vxl._utils.logging import configure_logging, get_uvicorn_log_config
 from vxl.hal import HALStartupError
@@ -100,6 +101,7 @@ def create_app(
     allowed_origins: tuple[str, ...] = (),
     allowed_hosts: tuple[str, ...] = ("localhost", "127.0.0.1", "[::1]"),
     password: str | None = None,
+    proxy_headers: bool = False,
 ) -> FastAPI:
     """Build the FastAPI application from injected runtime resources."""
     app = FastAPI(title="Voxel API", version="0.1.0", lifespan=_lifespan)
@@ -112,6 +114,8 @@ def create_app(
     )
     app.add_middleware(ControlAccess, origins=allowed_origins, password=password)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=list(allowed_hosts))
+    if proxy_headers:
+        app.add_middleware(ProxyHeadersMiddleware, trusted_hosts="127.0.0.1,::1")
     app.state.station = station
     app.state.instrument_templates = templates if templates is not None else InstrumentTemplates()
     app.state.realtime = Realtime(station)
@@ -126,9 +130,24 @@ def create_app(
     return app
 
 
-def _allowed_hosts(host: str) -> tuple[str, ...]:
+def _parse_allowed_hosts(raw: str | None) -> tuple[str, ...]:
+    """Parse a comma-separated list of extra Host header values."""
+    if not raw:
+        return ()
+    return tuple(dict.fromkeys(name for item in raw.split(",") if (name := item.strip().lower().rstrip("."))))
+
+
+def _env_flag(name: str) -> bool:
+    """Return True when environment variable ``name`` is set to a truthy flag."""
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _allowed_hosts(host: str, *, extra_hosts: Iterable[str] = ()) -> tuple[str, ...]:
     """Return the Host header values accepted when serving on ``host``."""
     hosts: dict[str, None] = dict.fromkeys(("localhost", "127.0.0.1", "[::1]", host))
+    for extra in extra_hosts:
+        if name := extra.strip().lower().rstrip("."):
+            hosts[name] = None
     if host in {"localhost", "127.0.0.1", "::1"}:
         return tuple(hosts)
     hosts[System.local_ip()] = None
@@ -151,9 +170,11 @@ def serve(*, host: str, port: int = 8000, debug: bool = False) -> None:
     """Run the Voxel web application as the sole hardware owner."""
     load_voxel_env()
     remote = host not in {"localhost", "127.0.0.1", "::1"}
-    password = os.getenv("VOXEL_WEB_PASSWORD")
+    password = os.getenv("VOXEL_WEB_PASSWORD") or None
     if remote and not password:
         raise RuntimeError("Set VOXEL_WEB_PASSWORD before serving beyond loopback (browser username: voxel)")
+    extra_hosts = _parse_allowed_hosts(os.getenv("VOXEL_ALLOWED_HOSTS"))
+    proxy_headers = _env_flag("VOXEL_PROXY_HEADERS")
     console_level = logging.DEBUG if debug else logging.INFO
     configure_logging(level=console_level, fmt="%(message)s", datefmt="[%X]")
     root_logger = logging.getLogger()
@@ -174,13 +195,15 @@ def serve(*, host: str, port: int = 8000, debug: bool = False) -> None:
         create_app(
             Station(StationConfig.load()),
             password=password,
-            allowed_hosts=_allowed_hosts(host),
+            allowed_hosts=_allowed_hosts(host, extra_hosts=extra_hosts),
             allowed_origins=("http://localhost:5173", "http://127.0.0.1:5173") if debug else (),
+            proxy_headers=proxy_headers,
         ),
         host=host,
         port=port,
         log_config=get_uvicorn_log_config(),
         loop="auto",
+        proxy_headers=False,
         ws_ping_interval=None,
     )
 
