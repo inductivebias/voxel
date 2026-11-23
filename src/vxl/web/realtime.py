@@ -3,10 +3,11 @@
 import asyncio
 import logging
 from contextlib import suppress
-from typing import TYPE_CHECKING, Literal, cast
+from typing import TYPE_CHECKING, Annotated, Literal, cast
 from uuid import UUID
 
 from fastapi import WebSocket, WebSocketDisconnect
+from pydantic import Field, FiniteFloat, TypeAdapter
 from rigup.wire import pack, unpack
 from vxl_records import LogEntry
 from vxlib.schema import FrozenModel
@@ -26,6 +27,21 @@ class PreviewViewportUpdate(FrozenModel):
     action: Literal["preview.viewport.update"]
     session_id: UUID
     viewport: PreviewViewport
+
+
+class StageJogUpdate(FrozenModel):
+    """Latest handheld-controller stick deflections for the expected instrument session.
+
+    ``velocity`` holds the logical x, y and z components as fractions of full jog speed in ``[-1, 1]``.
+    """
+
+    action: Literal["stage.jog"]
+    session_id: UUID
+    velocity: tuple[FiniteFloat, FiniteFloat, FiniteFloat]
+
+
+type StationControlMessage = Annotated[PreviewViewportUpdate | StageJogUpdate, Field(discriminator="action")]
+_CONTROL_MESSAGE = TypeAdapter[StationControlMessage](StationControlMessage)
 
 
 class _PreviewClient:
@@ -202,15 +218,19 @@ class Realtime:
                 log.warning("Ignoring a non-binary station control message")
                 continue
             try:
-                update = PreviewViewportUpdate.model_validate(unpack(payload))
+                update = _CONTROL_MESSAGE.validate_python(unpack(payload))
             except Exception as error:
-                log.warning("Ignoring an invalid preview viewport message: %s", error)
+                log.warning("Ignoring an invalid station control message: %s", error)
                 continue
             try:
                 async with self._station.instrument(update.session_id) as instrument:
-                    instrument.update_viewport(update.viewport)
+                    match update:
+                        case PreviewViewportUpdate():
+                            instrument.update_viewport(update.viewport)
+                        case StageJogUpdate():
+                            await instrument.jog_stage(update.velocity)
             except RuntimeError as error:
-                log.debug("Ignoring a preview viewport update for an unavailable session: %s", error)
+                log.debug("Ignoring a control message for an unavailable session: %s", error)
 
     @staticmethod
     async def _close_websocket(websocket: WebSocket) -> None:
@@ -242,4 +262,4 @@ class Realtime:
         return state.session.info.id, state.session.instrument.stream_revision
 
 
-__all__ = ["PreviewViewportUpdate", "Realtime"]
+__all__ = ["PreviewViewportUpdate", "Realtime", "StageJogUpdate"]

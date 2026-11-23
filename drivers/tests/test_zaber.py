@@ -199,6 +199,7 @@ class FakeAxis:
         self.move_relative_calls: list[tuple[float, object, bool]] = []
         self.home_calls: list[bool] = []
         self.stop_calls: list[bool] = []
+        self.move_velocity_calls: list[tuple[float, object]] = []
 
     def _clear_warnings(self) -> set[str]:
         previous = set(self.flags)
@@ -251,6 +252,10 @@ class FakeAxis:
         self.home_calls.append(wait_until_idle)
         self.position = self.settings.values[zaber.SettingConstants.LIMIT_HOME_PRESET]
         self.busy = not wait_until_idle
+
+    def move_velocity(self, velocity: float, unit: object) -> None:
+        self.move_velocity_calls.append((velocity, unit))
+        self.busy = True
 
     def stop(self, wait_until_idle: bool) -> None:
         self.stop_calls.append(wait_until_idle)
@@ -543,6 +548,30 @@ def test_zaber_axis_moves_nonblocking_and_enforces_timeout_and_limits(
     assert len(sdk_axis.move_absolute_calls) == 1
     assert not sdk_axis.move_relative_calls
     assert sdk_axis.position == 30_000.0
+
+    axis.close()
+    hub.close()
+
+
+def test_zaber_axis_jogs_at_velocity_and_stops_on_zero(
+    controller: tuple[zaber.ZaberHub, FakeConnection, FakeAxis, FakeAxis],
+) -> None:
+    hub, _connection, sdk_axis, _y_axis = controller
+    axis = zaber.ZaberLinearAxis("x_axis", hub=hub, device_serial=12345, axis_number=1)
+
+    assert axis.supports_jog
+    axis.move_vel(-1500.0)
+    assert sdk_axis.move_velocity_calls == [(-1500.0, zaber.Units.VELOCITY_MICROMETRES_PER_SECOND)]
+    assert axis.is_moving
+
+    axis.move_vel(0.0)
+    assert sdk_axis.stop_calls == [False]
+    assert len(sdk_axis.move_velocity_calls) == 1
+
+    for bad in (float("nan"), float("inf"), float("-inf")):
+        with pytest.raises(ValueError, match="velocity must be finite"):
+            axis.move_vel(bad)
+    assert len(sdk_axis.move_velocity_calls) == 1
 
     axis.close()
     hub.close()

@@ -67,6 +67,7 @@ from .errors import (
     Violation,
     ViolationLoc,
 )
+from .jog import StageJog
 from .metadata import ExperimentMetadata, resolve_metadata_class
 from .planning import resolve_xy, resolve_z
 from .scanning import ContinuousPass, plan_continuous_pass
@@ -250,6 +251,10 @@ class Instrument:
         self._history = UndoHistory()
         self._acq_task: asyncio.Task[None] | None = None  # the in-flight acquisition run, if any
         self._continue_on_error_next = False
+        self._jog = StageJog(
+            lambda: {"x": self._hal.stage.x, "y": self._hal.stage.y, "z": self._hal.stage.z},
+            busy=self._busy,
+        )
         self.fov: ReactiveQuery[tuple[float, float]] = ReactiveQuery(fn=self._compute_current_fov)
         self.profile_fovs = Computed[dict[str, dict[str, Bounds]]](
             self._store,
@@ -401,6 +406,7 @@ class Instrument:
 
     async def close(self) -> None:
         """Stop preview, close hardware, and clear history while retaining the selected profile."""
+        await self._jog.stop()
         await self.stop_acquisition()
         self._preview_source_ids.clear()
         self._preview_positions.clear()
@@ -520,6 +526,10 @@ class Instrument:
                 if position is not None
             ]
             await asyncio.gather(*moves)
+
+    async def jog_stage(self, velocity: tuple[float, float, float]) -> None:
+        """Apply one controller update: x, y, z as fractions of full jog speed in ``[-1, 1]``."""
+        await self._jog.command(velocity)
 
     async def set_routing_rule(
         self,
@@ -777,6 +787,8 @@ class Instrument:
                 raise OperationRejectedError("; ".join(violations))
             await self._stop_preview()
             await self._activity.set(CaptureActivity())
+            # Manual jogging must never move the stage once a capture owns it.
+            await self._jog.stop()
         try:
             # Preflight: every camera in the plan must be able to write `storage`, tested on its own node
             # (round-trip write). Any failure raises here — before a manifest, motion, or capture.

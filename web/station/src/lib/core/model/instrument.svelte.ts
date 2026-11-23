@@ -484,6 +484,11 @@ export class Instrument {
     return manifest;
   }
 
+  /** Stream stick deflections (fractions of full jog speed); false if the state socket is down. */
+  sendJog(velocity: [number, number, number]): boolean {
+    return this.#client.sendJog({ action: 'stage.jog', session_id: this.sessionId, velocity });
+  }
+
   stopAcquisition(): Promise<void> {
     return this.#client.post(`${this.#base}/acquisition/stop`);
   }

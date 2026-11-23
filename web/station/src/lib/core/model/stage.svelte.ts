@@ -69,6 +69,12 @@ export class Stage {
     return this.moving('x') || this.moving('y') || this.moving('z');
   }
 
+  get jogAvailable(): boolean {
+    return (
+      this.x.jogAvailable?.value === true && this.y.jogAvailable?.value === true && this.z.jogAvailable?.value === true
+    );
+  }
+
   /** True while the stage is still short of its commanded target on any axis. */
   readonly targetPending: boolean = $derived.by(() => {
     const t = this.target;

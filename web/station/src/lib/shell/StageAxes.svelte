@@ -1,28 +1,83 @@
 <script lang="ts">
-  import type { Stage } from '$lib/core/model';
+  import { JOG_SPEEDS, startGamepadJog } from '$lib/core/gamepad';
+  import type { Instrument } from '$lib/core/model';
   import { prefs } from '$lib/core/prefs';
   import { fromMicrometers, getSpatialUnit, toMicrometers } from '$lib/core/spatial-units';
-  import { Button, SpinBox } from '@voxel/kit';
+  import { Button, SpinBox, toast } from '@voxel/kit';
   import { cn } from '@voxel/kit/cn';
   import { reportFailure } from '@voxel/kit/failures';
+  import { Gamepad } from '@voxel/kit/icons';
 
   interface Props {
-    stage: Stage;
+    instrument: Instrument;
   }
 
-  let { stage }: Props = $props();
-
+  let { instrument }: Props = $props();
+  const stage = $derived(instrument.stage);
   const unit = $derived(getSpatialUnit(prefs.spatialUnit.get()));
-  // The step of each stage axis box, in µm, whatever unit shows.
   const AXIS_SPINS = [
     ['x', 10],
     ['y', 10],
     ['z', 10]
   ] as const;
+
+  let armed = $state(false);
+  let driving = $state(false);
+  let padName = $state<string | null>(null);
+  let speedIdx = $state(0);
+  const speed = $derived(JOG_SPEEDS[speedIdx] ?? JOG_SPEEDS[0]!);
+  const jogAvailable = $derived(stage.jogAvailable);
+  const jogOn = $derived(armed && !instrument.busy);
+  const toggleJog = () => {
+    if (armed) armed = false;
+    else if (jogAvailable && !instrument.busy) armed = true;
+  };
+  const cycleSpeed = () => {
+    speedIdx = (speedIdx + 1) % JOG_SPEEDS.length;
+  };
+
+  $effect(() => {
+    if (instrument.busy && armed) {
+      armed = false;
+      toast.warning('Jogging disabled: an acquisition started');
+    } else if (!jogAvailable) {
+      armed = false;
+    }
+  });
+
+  $effect(() =>
+    startGamepadJog({
+      isArmed: () => jogOn,
+      orientation: () => stage.orientation,
+      labels: () => stage.labels,
+      speedScale: () => speed.scale,
+      send: (v) => instrument.sendJog(v),
+      onToggle: toggleJog,
+      onCycleSpeed: cycleSpeed,
+      onHalt: () => reportFailure(stage.halt()),
+      onState: (name, isDriving) => {
+        padName = name;
+        driving = isDriving;
+      }
+    })
+  );
+
+  const jogLabel = $derived(instrument.busy ? 'Jog locked' : jogOn ? `Jog · ${speed.label}` : 'Jog OFF');
+  const jogTitle = $derived(
+    !jogAvailable
+      ? 'This stage does not support controller jogging'
+      : instrument.busy
+        ? 'Controller jogging is disabled while an acquisition runs'
+        : `${jogOn ? `Jogging ON (${speed.label}) — LB or click to turn off; RB cycles Slow/Med/Fast; B halts.` : `Jogging OFF (${speed.label}) — LB or click to turn on; RB cycles Slow/Med/Fast.`}\n${padName ? `Controller: ${padName}` : 'No controller detected (USB on localhost/HTTPS)'}`
+  );
 </script>
 
 <div
-  class="grid min-w-0 grid-cols-4 gap-2 @min-[64rem]/viewer-pane:grid-cols-[repeat(3,10rem)_auto]"
+  class={cn(
+    'grid min-w-0 grid-cols-[repeat(3,minmax(0,1fr))_auto_auto] gap-2 rounded-md',
+    '@min-[64rem]/viewer-pane:grid-cols-[repeat(3,10rem)_auto_auto]',
+    jogOn && 'outline-2 outline-offset-4 outline-success'
+  )}
   role="group"
   aria-label="Stage movement controls"
 >
@@ -47,5 +102,26 @@
     title="Halt stage motion"
   >
     Halt
+  </Button>
+  <Button
+    variant={jogOn ? 'success' : 'secondary'}
+    class={cn(
+      'w-full min-w-28 gap-1.5 whitespace-nowrap disabled:opacity-60',
+      jogOn && 'ring-2 ring-success/60 ring-offset-1 ring-offset-shell'
+    )}
+    aria-pressed={jogOn}
+    disabled={!jogAvailable || instrument.busy}
+    title={jogTitle}
+    onclick={toggleJog}
+  >
+    <Gamepad class={cn('size-4 shrink-0', !padName && 'opacity-50')} aria-hidden="true" />
+    {jogLabel}
+    <span
+      class={cn(
+        'size-2 shrink-0 rounded-full',
+        driving ? 'animate-pulse bg-on-success' : jogOn ? 'bg-on-success/50' : 'bg-fg-muted/40'
+      )}
+      aria-hidden="true"
+    ></span>
   </Button>
 </div>

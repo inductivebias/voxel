@@ -75,6 +75,10 @@ class ContinuousAxisHandle(DeviceHandle[ContinuousAxis]):
     async def await_movement(self, timeout_s: float | None = None) -> None:
         await self._poll_until_idle(timeout_s)
 
+    async def jog(self, velocity: float) -> None:
+        """Move continuously at ``velocity`` (axis units/s); 0 stops. Refused while stepping or scanning."""
+        await self.call("jog", velocity)
+
     # TTL stepping
 
     async def configure_ttl_stepper(self, cfg: TTLStepperConfig) -> None:
