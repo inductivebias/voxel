@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { startGamepadJog } from '$lib/core/gamepad';
+  import { JOG_SPEEDS, startGamepadJog } from '$lib/core/gamepad';
   import type { Instrument } from '$lib/core/model';
   import { prefs } from '$lib/core/prefs';
   import { fromMicrometers, getSpatialUnit, toMicrometers } from '$lib/core/spatial-units';
@@ -24,11 +24,16 @@
   let armed = $state(false);
   let driving = $state(false);
   let padName = $state<string | null>(null);
+  let speedIdx = $state(0);
+  const speed = $derived(JOG_SPEEDS[speedIdx] ?? JOG_SPEEDS[0]!);
   const jogAvailable = $derived(stage.jogAvailable);
   const jogOn = $derived(armed && !instrument.busy);
   const toggleJog = () => {
     if (armed) armed = false;
     else if (jogAvailable && !instrument.busy) armed = true;
+  };
+  const cycleSpeed = () => {
+    speedIdx = (speedIdx + 1) % JOG_SPEEDS.length;
   };
 
   $effect(() => {
@@ -44,8 +49,11 @@
     startGamepadJog({
       isArmed: () => jogOn,
       orientation: () => stage.orientation,
+      labels: () => stage.labels,
+      speedScale: () => speed.scale,
       send: (v) => instrument.sendJog(v),
       onToggle: toggleJog,
+      onCycleSpeed: cycleSpeed,
       onHalt: () => reportFailure(stage.halt()),
       onState: (name, isDriving) => {
         padName = name;
@@ -54,13 +62,13 @@
     })
   );
 
-  const jogLabel = $derived(instrument.busy ? 'Jog locked' : jogOn ? 'Jog ON' : 'Jog OFF');
+  const jogLabel = $derived(instrument.busy ? 'Jog locked' : jogOn ? `Jog · ${speed.label}` : 'Jog OFF');
   const jogTitle = $derived(
     !jogAvailable
       ? 'This stage does not support controller jogging'
       : instrument.busy
         ? 'Controller jogging is disabled while an acquisition runs'
-        : `${jogOn ? 'Jogging ON — left bumper or click to turn off; B halts.' : 'Jogging OFF — left bumper or click to turn on.'}\n${padName ? `Controller: ${padName}` : 'No controller detected (USB on localhost/HTTPS)'}`
+        : `${jogOn ? `Jogging ON (${speed.label}) — LB or click to turn off; RB cycles Slow/Med/Fast; B halts.` : `Jogging OFF (${speed.label}) — LB or click to turn on; RB cycles Slow/Med/Fast.`}\n${padName ? `Controller: ${padName}` : 'No controller detected (USB on localhost/HTTPS)'}`
   );
 </script>
 
@@ -98,7 +106,7 @@
   <Button
     variant={jogOn ? 'success' : 'secondary'}
     class={cn(
-      'w-full min-w-24 gap-1.5 whitespace-nowrap disabled:opacity-60',
+      'w-full min-w-28 gap-1.5 whitespace-nowrap disabled:opacity-60',
       jogOn && 'ring-2 ring-success/60 ring-offset-1 ring-offset-shell'
     )}
     aria-pressed={jogOn}
