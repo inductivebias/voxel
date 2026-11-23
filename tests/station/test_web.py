@@ -1,12 +1,15 @@
+import logging
 import secrets
+from typing import Any
 
 import pytest
 from starlette.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+import vxl.web.app as web_app
 from vxl.station import Station
 from vxl.system import StationConfig, System
-from vxl.web.app import _allowed_hosts, _parse_allowed_hosts, create_app
+from vxl.web.app import _allowed_hosts, _parse_allowed_hosts, create_app, serve
 
 
 def test_web_control_requires_authentication_and_accepts_same_origin_session_cookie(
@@ -74,6 +77,64 @@ def test_allowed_hosts_merges_extra_hosts_on_loopback() -> None:
         "rig.example.net",
         "other.internal",
     )
+
+
+@pytest.mark.parametrize(
+    "bad_value",
+    [
+        "rig.example.net:8443",
+        "https://rig.example.net",
+        "rig.example.net/api",
+        "[::1]:8443",
+    ],
+)
+def test_allowed_hosts_rejects_ports_schemes_and_paths(bad_value: str) -> None:
+    with pytest.raises(ValueError, match="bare hostname without scheme, path, or port"):
+        _parse_allowed_hosts(bad_value)
+
+
+def test_serve_requires_password_in_proxy_mode_unless_explicitly_opted_out(
+    station_config: StationConfig,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    monkeypatch.setattr(web_app, "load_voxel_env", lambda: None)
+    monkeypatch.setattr(web_app.StationConfig, "load", classmethod(lambda _cls: station_config))
+    monkeypatch.delenv("VOXEL_WEB_PASSWORD", raising=False)
+    monkeypatch.delenv("VOXEL_ALLOWED_HOSTS", raising=False)
+    monkeypatch.delenv("VOXEL_PROXY_HEADERS", raising=False)
+    monkeypatch.delenv("VOXEL_ALLOW_UNAUTHENTICATED_PROXY", raising=False)
+
+    # Proxy mode without VOXEL_WEB_PASSWORD fails fast on startup.
+    monkeypatch.setenv("VOXEL_ALLOWED_HOSTS", "rig.example.net")
+    with pytest.raises(RuntimeError, match="VOXEL_WEB_PASSWORD"):
+        serve(host="127.0.0.1")
+
+    # VOXEL_ALLOW_UNAUTHENTICATED_PROXY=1 does NOT bypass password on non-loopback binds.
+    monkeypatch.setenv("VOXEL_ALLOW_UNAUTHENTICATED_PROXY", "1")
+    with pytest.raises(RuntimeError, match="beyond loopback"):
+        serve(host="0.0.0.0")  # noqa: S104
+
+    # On loopback with explicit opt-out, serve starts and warns if VOXEL_PROXY_HEADERS is unset.
+    captured: dict[str, Any] = {}
+
+    def _fake_create_app(*_args: Any, **kwargs: Any) -> object:
+        captured["create_app"] = kwargs
+        return object()
+
+    def _fake_uvicorn_run(app: object, **kwargs: Any) -> None:
+        captured["uvicorn"] = {"app": app, **kwargs}
+
+    monkeypatch.setattr(web_app, "create_app", _fake_create_app)
+    monkeypatch.setattr(web_app.uvicorn, "run", _fake_uvicorn_run)
+    with caplog.at_level(logging.WARNING, logger="vxl.web.app"):
+        serve(host="127.0.0.1")
+
+    assert "VOXEL_PROXY_HEADERS=1" in caplog.text
+    assert captured["create_app"]["password"] is None
+    assert "rig.example.net" in captured["create_app"]["allowed_hosts"]
+    assert captured["create_app"]["proxy_headers"] is False
+    assert captured["uvicorn"]["proxy_headers"] is False
 
 
 def test_reverse_proxy_https_loopback_enables_wss_and_enforces_trusted_loopback(

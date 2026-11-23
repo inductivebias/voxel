@@ -130,11 +130,23 @@ def create_app(
     return app
 
 
+def _normalize_allowed_host(raw: str) -> str:
+    """Normalize a single Host allow-list entry and reject schemes, paths, or ports."""
+    name = raw.strip().lower().rstrip(".")
+    if not name:
+        return ""
+    if "://" in name or "/" in name or (":" in name and not (name.startswith("[") and name.endswith("]"))):
+        raise ValueError(
+            f"VOXEL_ALLOWED_HOSTS entry {raw.strip()!r} must be a bare hostname without scheme, path, or port"
+        )
+    return name
+
+
 def _parse_allowed_hosts(raw: str | None) -> tuple[str, ...]:
     """Parse a comma-separated list of extra Host header values."""
     if not raw:
         return ()
-    return tuple(dict.fromkeys(name for item in raw.split(",") if (name := item.strip().lower().rstrip("."))))
+    return tuple(dict.fromkeys(name for item in raw.split(",") if (name := _normalize_allowed_host(item))))
 
 
 def _env_flag(name: str) -> bool:
@@ -146,7 +158,7 @@ def _allowed_hosts(host: str, *, extra_hosts: Iterable[str] = ()) -> tuple[str, 
     """Return the Host header values accepted when serving on ``host``."""
     hosts: dict[str, None] = dict.fromkeys(("localhost", "127.0.0.1", "[::1]", host))
     for extra in extra_hosts:
-        if name := extra.strip().lower().rstrip("."):
+        if name := _normalize_allowed_host(extra):
             hosts[name] = None
     if host in {"localhost", "127.0.0.1", "::1"}:
         return tuple(hosts)
@@ -171,10 +183,17 @@ def serve(*, host: str, port: int = 8000, debug: bool = False) -> None:
     load_voxel_env()
     remote = host not in {"localhost", "127.0.0.1", "::1"}
     password = os.getenv("VOXEL_WEB_PASSWORD") or None
-    if remote and not password:
-        raise RuntimeError("Set VOXEL_WEB_PASSWORD before serving beyond loopback (browser username: voxel)")
     extra_hosts = _parse_allowed_hosts(os.getenv("VOXEL_ALLOWED_HOSTS"))
     proxy_headers = _env_flag("VOXEL_PROXY_HEADERS")
+    allow_unauthenticated_proxy = _env_flag("VOXEL_ALLOW_UNAUTHENTICATED_PROXY")
+    if remote and not password:
+        raise RuntimeError("Set VOXEL_WEB_PASSWORD before serving beyond loopback (browser username: voxel)")
+    if (extra_hosts or proxy_headers) and not password and not allow_unauthenticated_proxy:
+        raise RuntimeError(
+            "Set VOXEL_WEB_PASSWORD before serving behind a reverse proxy (browser username: voxel), "
+            "or set VOXEL_ALLOW_UNAUTHENTICATED_PROXY=1 if access is enforced by the proxy or private network"
+        )
+    allowed_hosts = _allowed_hosts(host, extra_hosts=extra_hosts)
     console_level = logging.DEBUG if debug else logging.INFO
     configure_logging(level=console_level, fmt="%(message)s", datefmt="[%X]")
     root_logger = logging.getLogger()
@@ -187,6 +206,11 @@ def serve(*, host: str, port: int = 8000, debug: bool = False) -> None:
     for handler in root_logger.handlers:
         handler.setLevel(console_level)
 
+    if extra_hosts and not proxy_headers:
+        log.warning(
+            "VOXEL_ALLOWED_HOSTS is set without VOXEL_PROXY_HEADERS=1; "
+            "HTTPS reverse proxies require VOXEL_PROXY_HEADERS=1 so Origin checks and wss:// discovery match"
+        )
     log.info("Starting Voxel...")
     log.info("Web UI: http://localhost:%d", port)
     if remote and (local_ip := System.local_ip()) != "127.0.0.1":
@@ -195,7 +219,7 @@ def serve(*, host: str, port: int = 8000, debug: bool = False) -> None:
         create_app(
             Station(StationConfig.load()),
             password=password,
-            allowed_hosts=_allowed_hosts(host, extra_hosts=extra_hosts),
+            allowed_hosts=allowed_hosts,
             allowed_origins=("http://localhost:5173", "http://127.0.0.1:5173") if debug else (),
             proxy_headers=proxy_headers,
         ),
