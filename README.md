@@ -53,6 +53,14 @@ Direct remote serving requires `VOXEL_WEB_PASSWORD` and an explicit `--host`; th
 cookie shared with the WebSocket connections. Browser origins and host headers are checked;
 `--debug` additionally permits the local frontend development origins on port 5173.
 
+To serve behind a local TLS-terminating reverse proxy (e.g. Caddy, nginx, or Tailscale Serve) while
+keeping Voxel bound to loopback, configure:
+
+- `VOXEL_ALLOWED_HOSTS` — comma-separated bare hostnames accepted in the `Host` header (no scheme, path, or port).
+- `VOXEL_PROXY_HEADERS=1` — trusts `X-Forwarded-Proto` and `X-Forwarded-For` strictly from loopback (`127.0.0.1`, `::1`) so same-origin checks, `wss://` WebSocket discovery URLs, and `Secure` cookies match the external HTTPS origin.
+- `VOXEL_WEB_PASSWORD` — required in proxy mode by default; set `VOXEL_ALLOW_UNAUTHENTICATED_PROXY=1` on loopback only if the reverse proxy or private network enforces access control.
+- Preserve the original `Host` header in the proxy (Caddy and Tailscale Serve do this by default; nginx requires `proxy_set_header Host $http_host;`).
+
 Station initialization is a one-time operation that writes `~/.voxel/station.yaml`. Remote device nodes do not need
 a station configuration; they use an optional `~/.voxel/system.yaml`, `VOXEL_*` environment variables, or defaults.
 
