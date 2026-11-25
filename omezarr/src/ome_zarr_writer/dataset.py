@@ -187,7 +187,10 @@ class Zarr3ArrayMeta(SparseModel):
         chunk_shape: list[int],
         dtype: Dtype,
         compression: Compression,
+        compression_level: int | None = None,
+        compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = None,
         dimension_names: list[str | None] | None = None,
+        attributes: dict[str, Any] | None = None,
     ) -> "Zarr3ArrayMeta":
         """A sharded array meta — outer (shard) chunk grid wrapping an inner
         chunk shape inside a `sharding_indexed` codec.
@@ -204,31 +207,44 @@ class Zarr3ArrayMeta(SparseModel):
                 ShardingIndexedCodec(
                     configuration=_ShardingConfig(
                         chunk_shape=chunk_shape,
-                        codecs=inner_codecs_for(compression, dtype.itemsize),
+                        codecs=inner_codecs_for(
+                            compression, dtype.itemsize, level=compression_level, shuffle=compression_shuffle
+                        ),
                     )
                 )
             ],
             dimension_names=dimension_names,
+            attributes=attributes or {},
         )
 
 
-def inner_codecs_for(compression: Compression, typesize: int) -> list[InnerCodec]:
+def inner_codecs_for(
+    compression: Compression,
+    typesize: int,
+    *,
+    level: int | None = None,
+    shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = None,
+) -> list[InnerCodec]:
     """Inner codec chain (applied to each inner chunk inside a shard) for one of
     our supported `Compression` presets. Encodes our level/shuffle policy."""
+    clevel = 3 if level is None else level
+    blosc_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] = "bitshuffle" if shuffle is None else shuffle
     codecs: list[InnerCodec] = [BytesCodec()]
     if compression == Compression.NONE:
         return codecs
     if compression == Compression.GZIP:
-        codecs.append(GzipCodec(configuration=_GzipConfig(level=3)))
+        codecs.append(GzipCodec(configuration=_GzipConfig(level=clevel)))
     elif compression == Compression.ZSTD:
-        codecs.append(ZstdCodec(configuration=_ZstdConfig(level=3)))
+        codecs.append(ZstdCodec(configuration=_ZstdConfig(level=clevel)))
     elif compression in (Compression.LZ4, Compression.BLOSC_LZ4):
         codecs.append(
-            BloscCodec(configuration=_BloscConfig(cname="lz4", clevel=3, shuffle="bitshuffle", typesize=typesize))
+            BloscCodec(configuration=_BloscConfig(cname="lz4", clevel=clevel, shuffle=blosc_shuffle, typesize=typesize))
         )
     elif compression == Compression.BLOSC_ZSTD:
         codecs.append(
-            BloscCodec(configuration=_BloscConfig(cname="zstd", clevel=3, shuffle="bitshuffle", typesize=typesize))
+            BloscCodec(
+                configuration=_BloscConfig(cname="zstd", clevel=clevel, shuffle=blosc_shuffle, typesize=typesize)
+            )
         )
     else:
         raise ValueError(f"Unsupported compression: {compression}")
@@ -308,6 +324,22 @@ class DownscaleType(StrEnum):
     MEAN = "mean"
     MIN = "min"
     MAX = "max"
+
+
+class PreFilterType(StrEnum):
+    NONE = "none"
+    MEAN = "mean"
+    GAUSSIAN = "gaussian"
+    MEDIAN = "median"
+    HIGHPASS = "highpass"
+
+
+class BinningMode(StrEnum):
+    MEAN = "mean"
+    MEDIAN = "median"
+    SUM = "sum"
+    MAX = "max"
+    NEAREST = "nearest"
 
 
 class SpaceAxis(SparseModel):
@@ -688,6 +720,7 @@ class OmeMeta(SparseModel):
 
 class ZarrGroupAttributes(SparseModel):
     ome: OmeMeta
+    preprocessing: dict[str, Any] | None = None
     darkfield: dict[str, Any] | None = None
 
 
@@ -712,6 +745,9 @@ class Zarr3GroupMeta(SparseModel):
         shear_yz: float = 0.0,
         channel_label: str = "channel 0",
         channel_color: str = "FFFFFF",
+        bin_y: int = 1,
+        bin_x: int = 1,
+        preprocessing: dict[str, Any] | None = None,
         darkfield: dict[str, Any] | None = None,
     ) -> "Zarr3GroupMeta":
         """A Zarr v3 group with OME-NGFF v0.6 multiscale attributes for a CZYX
@@ -719,6 +755,10 @@ class Zarr3GroupMeta(SparseModel):
         transforms (scale, half-voxel center translation, and optional oblique
         shear affine), and default `omero` channel display metadata."""
         oz, oy, ox = (origin.z, origin.y, origin.x) if origin is not None else (0.0, 0.0, 0.0)
+        if bin_y > 1:
+            oy += voxel_size.y * (bin_y - 1) / (2.0 * bin_y)
+        if bin_x > 1:
+            ox += voxel_size.x * (bin_x - 1) / (2.0 * bin_x)
         has_origin = oz != 0.0 or oy != 0.0 or ox != 0.0
         has_shear = shear_xz != 0.0 or shear_yz != 0.0
         affine = AffineTransform.from_shear(shear_xz=shear_xz, shear_yz=shear_yz, ndim=4) if has_shear else None
@@ -779,6 +819,7 @@ class Zarr3GroupMeta(SparseModel):
                     ],
                     omero=Omero.default(dtype=dtype, label=channel_label, color=channel_color),
                 ),
+                preprocessing=preprocessing,
                 darkfield=darkfield,
             )
         )

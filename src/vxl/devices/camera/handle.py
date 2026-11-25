@@ -166,6 +166,13 @@ class CameraHandle(DeviceHandle[Camera]):
         """Number of frames collected in the current stack."""
         return int(await self.call("captured_frames"))
 
+    async def writer_throughput_gb_s(self) -> tuple[float, float | None] | None:
+        """Live writer throughput ``(raw_gb_s, compressed_gb_s)``, or ``None``."""
+        res = await self.call("writer_throughput_gb_s")
+        if isinstance(res, (list, tuple)) and len(res) == 2 and res[0] is not None:
+            return (float(res[0]), float(res[1]) if res[1] is not None else None)
+        return None
+
     async def capture_state(self) -> CaptureState:
         """Lifecycle of the most recent begin_batch/close_stack. Raises if the task failed."""
         result = await self.call("capture_state")

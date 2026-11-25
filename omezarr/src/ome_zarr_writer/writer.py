@@ -24,6 +24,7 @@ The module provides two objects:
 import json
 import logging
 import math
+import os
 import threading
 import time
 from collections.abc import Callable, Generator, Iterator
@@ -33,7 +34,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cached_property
 from pathlib import Path
-from typing import Any, Self, cast
+from typing import Any, Literal, Self, cast
 
 import numpy as np
 from cloudpathlib import S3Path
@@ -42,16 +43,19 @@ from vxlib.vector import UIVec3D, UVec3D, Vec3D
 
 from ome_zarr_writer.array import ArrayWriter
 from ome_zarr_writer.dataset import (
+    BinningMode,
     Compression,
     DownscaleType,
     Dtype,
     OmeZarrDataset,
+    PreFilterType,
     ScaleLevel,
     SpaceUnit,
     Zarr3ArrayMeta,
     Zarr3GroupMeta,
 )
-from ome_zarr_writer.sizing import MIN_SLOTS, RingSizingError
+from ome_zarr_writer.preprocess import PreprocessConfig
+from ome_zarr_writer.sizing import MIN_SLOTS, RingSizingError, gpu_workspace_bytes
 from ome_zarr_writer.slot import BatchResult, BatchSlot, OutputSetup, SlotStage
 from ome_zarr_writer.storage import Local, S3Store, StagedS3, StagingConfig, Storage
 from ome_zarr_writer.transfer import TransferJob, run_s5cmd
@@ -83,12 +87,25 @@ class WriterSettings(BaseModel):
     batch_z_shards: int = 1
     # coherence (uniform for a consistent dataset; camera conforms)
     compression: Compression = Field(default=Compression.BLOSC_LZ4, description="Compression codec for zarr chunks")
+    compression_level: int | None = Field(
+        default=None, ge=0, le=9, description="Codec compression level (defaults to 3)"
+    )
+    compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = Field(
+        default=None, description="Blosc shuffle mode (defaults to 'shuffle' for GPU writer, 'bitshuffle' for CPU)"
+    )
+    skip_empty_chunks: bool = Field(
+        default=False, description="Omit all-fill_value chunks from Zarr v3 shard index and skip empty shards"
+    )
     downscale_type: DownscaleType = Field(
         default=DownscaleType.GAUSSIAN,
         description="Pyramid downsample method. Gaussian (anti-aliased) is the default for display-quality",
     )
     target_shard_gb: float = 1.0
     io_timeout_s: float = Field(default=300.0, gt=0, allow_inf_nan=False)
+    use_gpu: bool = Field(
+        default_factory=lambda: os.environ.get("VOXEL_WRITER_GPU", "0").lower() in ("1", "true", "yes"),
+        description="Use GPU-accelerated pyramid generation and shard compression when available",
+    )
 
     @property
     def chunk_shape(self) -> UIVec3D:
@@ -120,7 +137,34 @@ class WriterConfig(WriterSettings):
     shear_yz: float = 0.0
     channel_label: str = "channel 0"
     channel_color: str = "FFFFFF"
+    bin_y: int = Field(default=1, ge=1, le=16)
+    bin_x: int = Field(default=1, ge=1, le=16)
+    bin_mode: BinningMode = BinningMode.MEAN
+    pre_filter: PreFilterType = PreFilterType.NONE
+    filter_size: int = Field(default=3, ge=3, le=5)
+    highpass_add: float = 100.0
+    raw_frame_y: int | None = Field(default=None, ge=1)
+    raw_frame_x: int | None = Field(default=None, ge=1)
     darkfield: dict[str, Any] | None = None
+
+    @cached_property
+    def preprocess_config(self) -> PreprocessConfig:
+        return PreprocessConfig(
+            bin_y=self.bin_y,
+            bin_x=self.bin_x,
+            pre_filter=self.pre_filter,
+            filter_size=self.filter_size,
+            bin_mode=self.bin_mode,
+            highpass_add=self.highpass_add,
+        )
+
+    @cached_property
+    def raw_batch_shape(self) -> UIVec3D:
+        if self.bin_y == 1 and self.bin_x == 1 and self.raw_frame_y is None and self.raw_frame_x is None:
+            return self.batch_shape
+        ry = self.raw_frame_y if self.raw_frame_y is not None else self.volume_shape.y * self.bin_y
+        rx = self.raw_frame_x if self.raw_frame_x is not None else self.volume_shape.x * self.bin_x
+        return UIVec3D(z=self.batch_z, y=ry, x=rx)
 
     @cached_property
     def shard_shape(self) -> UIVec3D:
@@ -160,13 +204,24 @@ class WriterConfig(WriterSettings):
             sv = level.scale(self.volume_shape)
             ss = level.scale(self.shard_shape)
             sc = level.scale(self.chunk_shape)
+            f = level.factor
             arrays[level] = Zarr3ArrayMeta.sharded(
                 shape=[1, sv.z, sv.y, sv.x],
                 shard_shape=[1, ss.z, ss.y, ss.x],
                 chunk_shape=[1, sc.z, sc.y, sc.x],
                 dtype=self.dtype,
                 compression=self.compression,
+                compression_level=self.compression_level,
+                compression_shuffle=self.compression_shuffle,
                 dimension_names=["c", "z", "y", "x"],
+                attributes={
+                    "dimension_units": [
+                        None,
+                        f"{self.voxel_size.z * f:g} {self.voxel_unit.value}",
+                        f"{self.voxel_size.y * f:g} {self.voxel_unit.value}",
+                        f"{self.voxel_size.x * f:g} {self.voxel_unit.value}",
+                    ]
+                },
             )
 
         group = Zarr3GroupMeta.multiscale(
@@ -180,6 +235,9 @@ class WriterConfig(WriterSettings):
             shear_yz=self.shear_yz,
             channel_label=self.channel_label,
             channel_color=self.channel_color,
+            bin_y=self.bin_y,
+            bin_x=self.bin_x,
+            preprocessing=self.preprocess_config.to_metadata(),
             darkfield=self.darkfield,
         )
 
@@ -238,6 +296,7 @@ class BatchMetrics(BaseModel):
     expected_frames: int
     collected_frames: int = 0
     flushed_bytes: int = 0
+    written_bytes: int | None = None
     transfered_bytes: int = 0
     collecting: Timing = Field(default_factory=Timing)
     processing: Timing = Field(default_factory=Timing)
@@ -265,22 +324,43 @@ class Ring:
     batch_shape: UIVec3D
     max_level: ScaleLevel
     dtype: Dtype
+    raw_batch_shape: UIVec3D | None = None
 
     @classmethod
-    def allocate(cls, *, slots: int, prefix: str, batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> "Ring":
+    def allocate(
+        cls,
+        *,
+        slots: int,
+        prefix: str,
+        batch_shape: UIVec3D,
+        max_level: ScaleLevel,
+        dtype: Dtype,
+        raw_batch_shape: UIVec3D | None = None,
+    ) -> "Ring":
         """Allocate `slots` BatchSlots for one batch geometry, built concurrently (each spawns a worker
         and prefaults its shared memory)."""
+        raw_eff = raw_batch_shape if (raw_batch_shape is not None and raw_batch_shape != batch_shape) else None
 
         def _build(i: int) -> BatchSlot:
-            return BatchSlot(name=f"{prefix}_{i}", shape_l0=batch_shape, max_level=max_level, dtype=dtype)
+            return BatchSlot(
+                name=f"{prefix}_{i}", shape_l0=batch_shape, max_level=max_level, dtype=dtype, raw_shape_l0=raw_eff
+            )
 
         with ThreadPoolExecutor(max_workers=min(slots, 8)) as pool:
             built = tuple(pool.map(_build, range(slots)))
-        return cls(slots=built, batch_shape=batch_shape, max_level=max_level, dtype=dtype)
+        return cls(slots=built, batch_shape=batch_shape, max_level=max_level, dtype=dtype, raw_batch_shape=raw_eff)
 
-    def matches(self, batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> bool:
+    def matches(
+        self, batch_shape: UIVec3D, max_level: ScaleLevel, dtype: Dtype, raw_batch_shape: UIVec3D | None = None
+    ) -> bool:
         """Whether this ring's slots have the given batch shape, pyramid depth, and dtype."""
-        return self.batch_shape == batch_shape and self.max_level == max_level and self.dtype == dtype
+        raw_eff = raw_batch_shape if (raw_batch_shape is not None and raw_batch_shape != batch_shape) else None
+        return (
+            self.batch_shape == batch_shape
+            and self.max_level == max_level
+            and self.dtype == dtype
+            and self.raw_batch_shape == raw_eff
+        )
 
     def bind_output(self, setup: OutputSetup) -> None:
         """Point every slot's worker at the dataset described by `setup` (open its per-level writers)."""
@@ -364,14 +444,24 @@ class DatasetWriter:
         ring: Ring,
         *,
         backend: ArrayWriter.Backend,
+        use_gpu: bool | None = None,
     ) -> None:
-        if not ring.matches(config.batch_shape, config.max_level, config.dtype):
+        if not ring.matches(config.batch_shape, config.max_level, config.dtype, config.raw_batch_shape):
             raise ValueError(
                 f"ring geometry {ring.batch_shape}/{ring.max_level}/{ring.dtype} does not match writer "
                 f"config {config.batch_shape}/{config.max_level}/{config.dtype}"
             )
         if len(ring) < 2:
             raise ValueError(f"ring needs at least 2 slots, got {len(ring)}")
+
+        if (
+            backend == ArrayWriter.Backend.GPU
+            and config.compression_shuffle is None
+            and config.compression in (Compression.LZ4, Compression.BLOSC_LZ4, Compression.BLOSC_ZSTD)
+        ):
+            config = config.model_copy(update={"compression_shuffle": "shuffle"})
+            if "dataset" in config.__dict__:
+                object.__delattr__(config, "dataset")
 
         self._config = config
         self._storage = storage
@@ -395,8 +485,7 @@ class DatasetWriter:
             config.dataset.write_metadata(scratch)
         author_root = scratch if scratch is not None else self._target
 
-        # Point every slot's worker at this dataset's arrays. The worker does the downsample AND the
-        # write, so the main process opens no array writers of its own.
+        resolved_gpu = (config.use_gpu or backend == ArrayWriter.Backend.GPU) if use_gpu is None else use_gpu
         ring.bind_output(
             OutputSetup(
                 backend=backend,
@@ -407,6 +496,9 @@ class DatasetWriter:
                 batch_z=self._batch_z,
                 volume_z=self._volume_z,
                 reduction=config.downscale_type,
+                use_gpu=resolved_gpu,
+                skip_empty_chunks=config.skip_empty_chunks,
+                preprocess=config.preprocess_config,
             )
         )
 
@@ -467,6 +559,23 @@ class DatasetWriter:
     def batches(self) -> list[BatchMetrics]:
         """The per-batch metrics records for this dataset, indexed by batch."""
         return self._batches
+
+    def live_throughput_gb_s(self) -> tuple[float, float | None] | None:
+        """Return ``(raw_gb_s, compressed_gb_s)`` across completed batches, or ``None`` if none yet."""
+        completed = [
+            b for b in list(self._batches) if b.flushing.ended is not None and b.collecting.started is not None
+        ]
+        if not completed:
+            return None
+        t0 = min(b.collecting.started for b in completed if b.collecting.started is not None)
+        t1 = max(b.flushing.ended for b in completed if b.flushing.ended is not None)
+        elapsed = (t1 - t0).total_seconds()
+        if elapsed <= 0:
+            return None
+        raw_gb_s = sum(b.flushed_bytes for b in completed) / 1e9 / elapsed
+        written = [b.written_bytes for b in completed if b.written_bytes is not None]
+        comp_gb_s = (sum(written) / 1e9 / elapsed) if len(written) == len(completed) else None
+        return (raw_gb_s, comp_gb_s)
 
     @contextmanager
     def new_frame(self) -> Generator[np.ndarray]:
@@ -667,6 +776,7 @@ class DatasetWriter:
         batch.processing.started, batch.processing.ended = result.process_started, result.process_ended
         batch.flushing.started, batch.flushing.ended = result.flush_started, result.flush_ended
         batch.flushed_bytes = result.flushed_bytes
+        batch.written_bytes = result.written_bytes
 
     def _queue_upload(self, batch_idx: int) -> None:
         """Queue the s5cmd upload of a written batch's shards (staged only). Blocks if max_pending uploads
@@ -788,14 +898,22 @@ class OMEZarrWriter:
     def __init__(
         self,
         *,
-        backend: ArrayWriter.Backend = ArrayWriter.Backend.TS,
+        backend: ArrayWriter.Backend | None = None,
         slots: int = 4,  # ring depth = max batches in flight (caller sizes from its RAM share)
     ) -> None:
         self._backend = backend
         self._slots = slots
         self._ring: Ring | None = None
+        self._ring_use_gpu: bool | None = None
         self._active: DatasetWriter | None = None
         self._ring_failed = False
+        self._last_throughput: tuple[float, float | None] | None = None
+
+    def live_throughput_gb_s(self) -> tuple[float, float | None] | None:
+        """Return ``(raw_gb_s, compressed_gb_s)`` for the active stack, or the last completed stack."""
+        if self._active is not None and (stats := self._active.live_throughput_gb_s()) is not None:
+            return stats
+        return self._last_throughput
 
     @property
     def ready_for_batch(self) -> bool:
@@ -838,10 +956,35 @@ class OMEZarrWriter:
         """
         if self._active is not None:
             raise RuntimeError("stack already open; call end_stack() first")
+        wants_gpu = config.use_gpu or self._backend == ArrayWriter.Backend.GPU
+        effective_use_gpu = False
+        if wants_gpu:
+            from ome_zarr_writer.pyramid_gpu import get_free_gpu_bytes, is_gpu_available  # noqa: PLC0415
+
+            effective_use_gpu = is_gpu_available()
+            if effective_use_gpu:
+                free_vram = get_free_gpu_bytes()
+                shard = config.shard_shape if self._backend in (None, ArrayWriter.Backend.GPU) else None
+                needed = gpu_workspace_bytes(
+                    config.batch_shape,
+                    config.max_level,
+                    config.dtype,
+                    raw_batch_shape=config.raw_batch_shape,
+                    shard_shape=shard,
+                )
+                if free_vram > 0 and needed > int(free_vram * 0.85):
+                    log.warning(
+                        "GPU batch workspace (%d MiB) exceeds 85%% of free VRAM (%d MiB); falling back to CPU writer",
+                        needed // (1024 * 1024),
+                        free_vram // (1024 * 1024),
+                    )
+                    effective_use_gpu = False
+
         if (
             self._ring is None
             or self._ring_failed
-            or not self._ring.matches(config.batch_shape, config.max_level, config.dtype)
+            or self._ring_use_gpu != effective_use_gpu
+            or not self._ring.matches(config.batch_shape, config.max_level, config.dtype, config.raw_batch_shape)
         ):
             self._drop_ring()
             slots = sizer(config) if sizer is not None else self._slots
@@ -853,8 +996,20 @@ class OMEZarrWriter:
                 batch_shape=config.batch_shape,
                 max_level=config.max_level,
                 dtype=config.dtype,
+                raw_batch_shape=config.raw_batch_shape,
             )
-        self._active = DatasetWriter(config, storage, self._ring, backend=self._backend)
+            self._ring_use_gpu = effective_use_gpu
+
+        effective_backend = (
+            ArrayWriter.Backend.TS
+            if (self._backend == ArrayWriter.Backend.GPU and not effective_use_gpu)
+            else (
+                self._backend
+                if self._backend is not None
+                else (ArrayWriter.Backend.GPU if effective_use_gpu else ArrayWriter.Backend.TS)
+            )
+        )
+        self._active = DatasetWriter(config, storage, self._ring, backend=effective_backend, use_gpu=effective_use_gpu)
         return self._active
 
     @contextmanager
@@ -883,6 +1038,7 @@ class OMEZarrWriter:
             self._ring_failed = True
             raise
         finally:
+            self._last_throughput = self._active.live_throughput_gb_s() or self._last_throughput
             self._active = None
 
     def close(self) -> None:
@@ -892,11 +1048,13 @@ class OMEZarrWriter:
                 self._active.close()
         finally:
             self._active = None
+            self._last_throughput = None
             self._drop_ring()
 
     def _drop_ring(self) -> None:
         """Release the retained ring, if any."""
         ring, self._ring = self._ring, None
         self._ring_failed = False
+        self._ring_use_gpu = None
         if ring is not None:
             ring.close()

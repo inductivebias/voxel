@@ -494,6 +494,10 @@ class WriterPatch(Patch):
     shard_z_chunks: Annotated[int, Field(ge=1)] | None = None
     batch_z_shards: Annotated[int, Field(ge=1)] | None = None
     compression: Compression | None = None
+    compression_level: Annotated[int, Field(ge=0, le=9)] | None = None
+    compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = None
+    skip_empty_chunks: bool | None = None
+    use_gpu: bool | None = None
     downscale_type: DownscaleType | None = None
     target_shard_gb: Annotated[float, Field(gt=0)] | None = None
 

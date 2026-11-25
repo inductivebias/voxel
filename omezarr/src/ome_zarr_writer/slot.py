@@ -1,71 +1,83 @@
-"""Process-based buffer slot that downsamples AND writes — the whole batch pipeline in one worker.
-
-`BatchSlot`'s worker does both halves of the batch pipeline: it reads the collected L0 frames from
-shared memory, builds the pyramid, and writes every level to the store itself. The main process only
-fills reserved L0 destinations and waits on the result — so the CPU/GIL-heavy compress+write never touches the
-capture event loop. That's the whole point: overlap the flush with capture without starving it.
-
-Self-contained by design: there is no `get_volume` (the main process never reads the pyramid) and no
-separate flush stage — downsample and write are one worker task.
-
-    slot = BatchSlot(name="s0", shape_l0=..., max_level=ScaleLevel.L7, dtype=Dtype.UINT16)
-    slot.bind_output(setup)              # once per dataset: worker opens one ArrayWriter per level
-    slot.assign_batch(0)                 # IDLE → COLLECTING
-    for frame in frames:
-        np.copyto(slot.frame_array(), frame)
-        slot.commit_frame()
-    fut = slot.flush()                   # worker: downsample + write this batch to the store (async)
-    result = fut.result()                # BatchResult(process/flush start+end timestamps, flushed_bytes)
-    ...
-    slot.close()                         # close writers, shut the worker, unlink shared memory
-"""
+"""Process-based buffer slot that downsamples AND writes — the whole batch pipeline in one worker."""
 
 import logging
 import math
 import multiprocessing as mp
 import os
 import signal
+import tempfile
 import threading
+import time
+from collections.abc import Generator
 from concurrent.futures import Future, ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import IntEnum
 from multiprocessing.shared_memory import SharedMemory
 from pathlib import Path
+from typing import Any
 
 import numba
 import numba.core.config as numba_config
 import numpy as np
 from cloudpathlib import S3Path
 from numba.np.ufunc.parallel import threading_layer
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from vxlib.vector import UIVec3D
 
 from ome_zarr_writer.array import ArrayWriter
 from ome_zarr_writer.dataset import DownscaleType, Dtype, ScaleLevel
+from ome_zarr_writer.preprocess import PreprocessConfig, filter_and_bin_volume
 from ome_zarr_writer.storage import S3Store
 
 from .pyramid import pyramids_3d_numba
 
 log = logging.getLogger(__name__)
 
-# Threads used to prefault (commit) a large segment at allocation; numpy's fill releases the GIL, so
-# leading-axis slices commit in parallel. Segments below the threshold are filled in one call.
 _PREFAULT_WORKERS = min(32, os.cpu_count() or 1)
 _PREFAULT_MIN_BYTES = 1 << 28  # 256 MiB
-
-# Thread cap for the pyramid's numba parallel region. The separable gaussian downscale is memory-
-# bandwidth bound and saturates by ~16 threads; past that, memory-controller/NUMA contention makes it
-# *slower* (measured ~3x slower at 256 vs 16 threads on a 256-core host). Left uncapped numba grabs the
-# whole machine, so with several slots downsampling at once the memory system is badly oversubscribed.
-# Env-tunable (`VOXEL_NUMBA_THREADS`) so the in-pipeline optimum can be swept; clamped to the pool max.
-_NUMBA_POOL_MAX = int(getattr(numba_config, "NUMBA_NUM_THREADS", os.cpu_count() or 1))  # runtime-only attr
+_NUMBA_POOL_MAX = int(getattr(numba_config, "NUMBA_NUM_THREADS", os.cpu_count() or 1))
 _NUMBA_THREADS = max(1, min(int(os.environ.get("VOXEL_NUMBA_THREADS", "16")), _NUMBA_POOL_MAX))
+_GPU_CONCURRENT_WORKERS = max(1, int(os.environ.get("VOXEL_GPU_CONCURRENT_WORKERS", "2")))
+
+
+@contextmanager
+def _gpu_worker_slot() -> Generator[None]:
+    """Cross-process flock semaphore capping concurrent GPU VRAM workers across camera nodes."""
+    try:
+        import fcntl  # noqa: PLC0415
+    except ImportError:
+        yield
+        return
+    lock_dir = Path(tempfile.gettempdir()) / f"voxel_ozw_locks_{getattr(os, 'getuid', lambda: 0)()}"
+    lock_dir.mkdir(parents=True, exist_ok=True)
+    start_idx = os.getpid() % _GPU_CONCURRENT_WORKERS
+    fd: int | None = None
+    try:
+        while fd is None:
+            for offset in range(_GPU_CONCURRENT_WORKERS):
+                idx = (start_idx + offset) % _GPU_CONCURRENT_WORKERS
+                cand = os.open(lock_dir / f"gpu_worker_{idx}.lock", os.O_CREAT | os.O_RDWR, 0o600)
+                try:
+                    fcntl.flock(cand, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fd = cand
+                    break
+                except BlockingIOError:
+                    os.close(cand)
+            if fd is None:
+                time.sleep(0.01)
+        yield
+    finally:
+        if fd is not None:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
 
 def _prefault_zero(arr: np.ndarray) -> None:
-    """Zero (and thereby commit) a freshly created SharedMemory-backed array, in parallel — so the
-    commit is paid here, off the capture path, rather than as page faults during frame population."""
+    """Zero (commit) a newly allocated SharedMemory array in parallel off the capture path."""
     n = int(arr.shape[0])
     if arr.nbytes < _PREFAULT_MIN_BYTES or n <= 1 or _PREFAULT_WORKERS <= 1:
         arr.fill(0)
@@ -77,12 +89,6 @@ def _prefault_zero(arr: np.ndarray) -> None:
 
 
 class SlotStage(IntEnum):
-    """Lifecycle of a `BatchSlot`. IDLE is the only reusable stage (the buffer is empty).
-
-    IDLE → COLLECTING → PROCESSING → IDLE   (PROCESSING covers both downsample and write, in the worker)
-                                   → ERROR   (worker task failed; terminal)
-    """
-
     ERROR = -1
     IDLE = 0
     COLLECTING = 1
@@ -90,101 +96,130 @@ class SlotStage(IntEnum):
 
 
 class OutputSetup(BaseModel):
-    """Backend-agnostic, picklable description of where and how a slot's worker writes its pyramid.
+    """Picklable description of where and how a slot's worker writes its pyramid."""
 
-    Built once per dataset by the writer and handed to the slot (`bind_output`); it crosses the spawn
-    boundary to the worker, which instantiates ``backend`` and opens one ArrayWriter per level under
-    ``author_root``. Carries no live handles. For `Local`/`StagedS3` the worker writes to a local
-    ``author_root`` (scratch when staging) with ``store=None``; only `DirectS3` passes an ``S3Path`` +
-    ``S3Store`` for a direct remote write.
-    """
+    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)
 
-    model_config = ConfigDict(frozen=True, arbitrary_types_allowed=True)  # S3Path / S3Store aren't pydantic types
-
-    backend: ArrayWriter.Backend  # which ArrayWriter the worker instantiates (TS, zarrs, …)
-    author_root: Path | S3Path  # root the level arrays live under (metadata already authored there)
-    store: S3Store | None  # S3 connection for a remote write, else None (local filesystem)
-    channel: int  # leading-axis index this writer owns
-    levels: tuple[ScaleLevel, ...]  # pyramid levels to write — one ArrayWriter each
-    batch_z: int  # L0 depth per batch → maps batch_idx to its z-range
-    volume_z: int  # total L0 depth → clamps the final partial batch
-    reduction: DownscaleType = DownscaleType.MEAN  # pyramid downsample method (mirrors config.downscale_type)
+    backend: ArrayWriter.Backend
+    author_root: Path | S3Path
+    store: S3Store | None
+    channel: int
+    levels: tuple[ScaleLevel, ...]
+    batch_z: int
+    volume_z: int
+    reduction: DownscaleType = DownscaleType.MEAN
+    use_gpu: bool = False
+    skip_empty_chunks: bool = False
+    preprocess: PreprocessConfig = Field(default_factory=PreprocessConfig)
 
 
 @dataclass(frozen=True)
 class BatchResult:
-    """What the worker returns for one batch: absolute UTC timestamps for its processing (downsample)
-    and flushing (write) stages, plus bytes written. Absolute rather than durations, so the writer can
-    place these on the same timeline as the main-process collecting/transferring spans and see overlap."""
-
     process_started: datetime
     process_ended: datetime
     flush_started: datetime
     flush_ended: datetime
     flushed_bytes: int
+    written_bytes: int | None = None
 
 
 # ---------------------------------------------------------------------------
-# Worker-side state (lives inside the child process). The initializer attaches to the shared-memory
-# segments once; bind_output opens the per-level writers; each task reuses both.
+# Worker-side state & helpers
 # ---------------------------------------------------------------------------
 
+_RAW_SHM_KEY = -1
 _WORKER_SHMS: list[SharedMemory] = []
 _WORKER_ARRAYS: dict[ScaleLevel, np.ndarray] = {}
+_WORKER_RAW: dict[str, np.ndarray] = {}
 _WORKER_WRITERS: dict[ScaleLevel, ArrayWriter] = {}
-_WORKER_STATE: dict[str, OutputSetup] = {}  # holds the current "setup"; a dict to avoid a global rebind
-_LAYER_WARNED: list[bool] = []  # one-shot latch for the threading-layer warning (list mutated in place, no `global`)
+_WORKER_STATE: dict[str, OutputSetup] = {}
+_LAYER_WARNED: list[bool] = []
+_WORKER_GPU_WS: dict[str, Any] = {}
+_WORKER_PINNED_L0: list[np.ndarray] = []
+_GPU_FALLBACK_WARNED: list[bool] = []
 
 
 def _worker_init(shm_layout: list[tuple[int, str, tuple[int, int, int]]], dtype_str: str) -> None:
-    """Runs once per worker on startup: attach to the shared-memory segments (one per level)."""
-    # Ignore SIGINT/Ctrl+C in workers: on Windows CTRL_C_EVENT hits the whole process group, so
-    # otherwise each worker blocked in the pool's call queue dumps a KeyboardInterrupt traceback.
-    # The parent handles the interrupt and tears the pool down via the normal close() path.
     signal.signal(signal.SIGINT, signal.SIG_IGN)
-    numba.set_num_threads(
-        _NUMBA_THREADS
-    )  # cap pyramid parallelism to avoid memory oversubscription (see _NUMBA_THREADS)
-    # We don't force a numba threading layer: its default already cascades tbb > omp > workqueue and
-    # honors a NUMBA_THREADING_LAYER env override. Workers are spawned (not forked), so omp/tbb (not
-    # fork-safe) are fine; the first flush warns if it lands on workqueue (the slowest fallback).
+    numba.set_num_threads(_NUMBA_THREADS)
     for level_value, shm_name, shape in shm_layout:
         shm = SharedMemory(name=shm_name, create=False, track=False)
         arr = np.ndarray(shape, dtype=dtype_str, buffer=shm.buf)
         _WORKER_SHMS.append(shm)
-        _WORKER_ARRAYS[ScaleLevel(level_value)] = arr
+        if level_value == _RAW_SHM_KEY:
+            _WORKER_RAW["raw"] = arr
+        else:
+            _WORKER_ARRAYS[ScaleLevel(level_value)] = arr
+
+
+def _is_gpu_writer(writer: ArrayWriter) -> bool:
+    return hasattr(writer, "write_slice_gpu")
 
 
 def _worker_bind_output(setup: OutputSetup) -> None:
-    """Open one ArrayWriter per level for this dataset (closing any from a previous one). The arrays'
-    metadata must already exist under ``author_root`` (the main process authors it before binding)."""
     for writer in _WORKER_WRITERS.values():
         writer.close()
     _WORKER_WRITERS.clear()
     for level in setup.levels:
         writer = setup.backend()
         writer.open(setup.author_root / str(level.value), setup.store)
+        if _is_gpu_writer(writer):
+            writer.skip_empty_chunks = setup.skip_empty_chunks  # type: ignore[attr-defined]
         _WORKER_WRITERS[level] = writer
     _WORKER_STATE["setup"] = setup
 
+    if setup.use_gpu or setup.backend == ArrayWriter.Backend.GPU:
+        from ome_zarr_writer.array.gpu import release_shared_encoder_device_buffers  # noqa: PLC0415
+        from ome_zarr_writer.pyramid_gpu import (  # noqa: PLC0415
+            flush_gpu_deallocations,
+            is_gpu_available,
+            register_pinned_host_memory,
+            warmup_gpu_pyramid,
+        )
+
+        if is_gpu_available():
+            src_full = _WORKER_RAW.get("raw", _WORKER_ARRAYS.get(ScaleLevel.L0))
+            if src_full is not None and not _WORKER_PINNED_L0 and register_pinned_host_memory(src_full):
+                _WORKER_PINNED_L0.append(src_full)
+            with _gpu_worker_slot():
+                if src_full is not None:
+                    warmup_gpu_pyramid(src_full.dtype, setup.reduction)
+                for writer in _WORKER_WRITERS.values():
+                    if _is_gpu_writer(writer):
+                        writer.warmup()  # type: ignore[attr-defined]
+                release_shared_encoder_device_buffers()
+                flush_gpu_deallocations()
+
 
 def _worker_close_output() -> None:
-    """Close the per-level writers (drain pending writes, release handles)."""
     for writer in _WORKER_WRITERS.values():
         writer.close()
     _WORKER_WRITERS.clear()
+    if _WORKER_GPU_WS or _WORKER_PINNED_L0:
+        from ome_zarr_writer.array.gpu import release_shared_encoder_buffers  # noqa: PLC0415
+        from ome_zarr_writer.pyramid_gpu import (  # noqa: PLC0415
+            flush_gpu_deallocations,
+            unregister_pinned_host_memory,
+        )
+
+        for ws in _WORKER_GPU_WS.values():
+            ws.close()
+        _WORKER_GPU_WS.clear()
+        release_shared_encoder_buffers()
+        for pinned_arr in _WORKER_PINNED_L0:
+            unregister_pinned_host_memory(pinned_arr)
+        _WORKER_PINNED_L0.clear()
+        flush_gpu_deallocations()
 
 
 def _warn_if_slow_threading_layer() -> None:
-    """After the first parallel region, log once if numba fell back to the slowest layer (workqueue).
-    `threading_layer()` is only valid once a parallel region has run, so call it after the pyramid."""
     if _LAYER_WARNED:
         return
     _LAYER_WARNED.append(True)
     try:
         layer = threading_layer()
     except ValueError:
-        return  # no parallel region ran yet; nothing to report
+        return
     if layer == "workqueue":
         log.warning(
             "numba threading layer fell back to 'workqueue' (slowest); install a loadable 'tbb' (Linux) or "
@@ -194,40 +229,157 @@ def _warn_if_slow_threading_layer() -> None:
         log.debug("numba threading layer: %s", layer)
 
 
-def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: int) -> BatchResult:
-    """Downsample the collected L0 block into the pyramid (in shared memory), then write every level to
-    the store. Runs entirely in the worker process, so the compress+write never touches the main GIL."""
-    setup = _WORKER_STATE.get("setup")
-    if setup is None:
-        raise RuntimeError("worker has no OutputSetup; call bind_output before flush")
-    max_level = ScaleLevel(max_level_value)
-
-    process_started = datetime.now(UTC)
-    block = _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0]
-    pyramid = pyramids_3d_numba(block, max_level, reduction=setup.reduction, parallel=True)
-    _warn_if_slow_threading_layer()
-    for level, vol in pyramid.items():
-        arr = _WORKER_ARRAYS[level]
-        z = min(arr.shape[0], vol.shape[0])
-        y = min(arr.shape[1], vol.shape[1])
-        x = min(arr.shape[2], vol.shape[2])
-        arr[:z, :y, :x] = vol[:z, :y, :x].astype(arr.dtype)
-
-    process_ended = datetime.now(UTC)  # also the flush start — the write begins as soon as the pyramid is ready
+def _write_host_levels(setup: OutputSetup, batch_idx: int, l0_block: np.ndarray | None = None) -> int:
     z_start = batch_idx * setup.batch_z
     z_end = min(z_start + setup.batch_z, setup.volume_z)
     flushed = 0
     for level in setup.levels:
         z0, z1 = z_start // level.factor, z_end // level.factor
-        flushed += _WORKER_WRITERS[level].write_slice(setup.channel, z0, _WORKER_ARRAYS[level][: z1 - z0])
+        use_l0 = level == ScaleLevel.L0 and l0_block is not None
+        src = l0_block[: z1 - z0] if use_l0 and l0_block is not None else _WORKER_ARRAYS[level][: z1 - z0]
+        flushed += _WORKER_WRITERS[level].write_slice(setup.channel, z0, src)
+    return flushed
 
-    return BatchResult(
-        process_started=process_started,
-        process_ended=process_ended,
-        flush_started=process_ended,
-        flush_ended=datetime.now(UTC),
-        flushed_bytes=flushed,
+
+def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: int) -> BatchResult:
+    """CPU worker: preprocess, downsample into shared memory, and write every level."""
+    setup = _WORKER_STATE.get("setup")
+    if setup is None:
+        raise RuntimeError("worker has no OutputSetup; call bind_output before flush")
+    max_level = ScaleLevel(max_level_value)
+    pp = setup.preprocess
+    process_started = datetime.now(UTC)
+    raw_full = _WORKER_RAW.get("raw")
+    block = raw_full[:filled_l0] if raw_full is not None else _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0]
+
+    if pp.has_spatial_op:
+        block = filter_and_bin_volume(
+            block,
+            bin_y=pp.bin_y,
+            bin_x=pp.bin_x,
+            pre_filter=pp.pre_filter,
+            filter_size=pp.filter_size,
+            bin_mode=pp.bin_mode,
+            highpass_add=pp.highpass_add,
+            use_gpu=False,
+        )
+        _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0] = block
+
+    pyramid = pyramids_3d_numba(block, max_level, reduction=setup.reduction, parallel=True)
+    _warn_if_slow_threading_layer()
+    for level, vol in pyramid.items():
+        if level == ScaleLevel.L0:
+            continue
+        arr = _WORKER_ARRAYS[level]
+        z, y, x = min(arr.shape[0], vol.shape[0]), min(arr.shape[1], vol.shape[1]), min(arr.shape[2], vol.shape[2])
+        arr[:z, :y, :x] = vol[:z, :y, :x].astype(arr.dtype)
+
+    process_ended = datetime.now(UTC)
+    flushed = _write_host_levels(setup, batch_idx, l0_block=block)
+    return BatchResult(process_started, process_ended, process_ended, datetime.now(UTC), flushed)
+
+
+def _get_worker_gpu_workspace(
+    l0_full: np.ndarray, raw_full: np.ndarray | None, max_level: ScaleLevel, needs_spatial: bool
+) -> Any:
+    from ome_zarr_writer.pyramid_gpu import GpuPyramidWorkspace  # noqa: PLC0415
+
+    shape_l0 = UIVec3D(z=l0_full.shape[0], y=l0_full.shape[1], x=l0_full.shape[2])
+    raw_shape_l0 = (
+        UIVec3D(z=raw_full.shape[0], y=raw_full.shape[1], x=raw_full.shape[2])
+        if raw_full is not None
+        else (shape_l0 if needs_spatial else None)
     )
+    ws = _WORKER_GPU_WS.get("ws")
+    if (
+        ws is None
+        or ws.shape_l0 != shape_l0
+        or ws.raw_shape_l0 != raw_shape_l0
+        or ws.max_level != max_level
+        or ws.dtype != l0_full.dtype
+    ):
+        if ws is not None:
+            ws.close()
+        ws = GpuPyramidWorkspace(shape_l0, max_level, l0_full.dtype, raw_shape_l0=raw_shape_l0)
+        _WORKER_GPU_WS["ws"] = ws
+    return ws
+
+
+def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_idx: int) -> BatchResult:
+    """GPU worker: compute pyramid on GPU and write directly via GPUArrayWriter or host fallback."""
+    setup = _WORKER_STATE.get("setup")
+    if setup is None:
+        raise RuntimeError("worker has no OutputSetup; call bind_output before flush")
+    from ome_zarr_writer.array.gpu import release_shared_encoder_device_buffers  # noqa: PLC0415
+    from ome_zarr_writer.pyramid_gpu import (  # noqa: PLC0415
+        flush_gpu_deallocations,
+        is_gpu_available,
+        register_pinned_host_memory,
+    )
+
+    if not is_gpu_available():
+        if not _GPU_FALLBACK_WARNED:
+            _GPU_FALLBACK_WARNED.append(True)
+            log.warning("GPU requested for BatchSlot worker, but CUDA is unavailable; falling back to CPU worker")
+        return _worker_process_and_write(max_level_value, filled_l0, batch_idx)
+
+    max_level = ScaleLevel(max_level_value)
+    l0_full = _WORKER_ARRAYS[ScaleLevel.L0]
+    raw_full = _WORKER_RAW.get("raw")
+    src_full = raw_full if raw_full is not None else l0_full
+    if not _WORKER_PINNED_L0 and register_pinned_host_memory(src_full):
+        _WORKER_PINNED_L0.append(src_full)
+
+    all_gpu_writers = all(_is_gpu_writer(_WORKER_WRITERS[lvl]) for lvl in setup.levels)
+    z_start = batch_idx * setup.batch_z
+    z_end = min(z_start + setup.batch_z, setup.volume_z)
+    flushed = 0
+    written_bytes: int | None = None
+
+    with _gpu_worker_slot():
+        process_started = datetime.now(UTC)
+        ws: Any = None
+        try:
+            ws = _get_worker_gpu_workspace(l0_full, raw_full, max_level, setup.preprocess.has_spatial_op)
+            d_levels: dict[ScaleLevel, Any] = {}
+            try:
+                d_levels = ws.compute_from_host(
+                    src_full[:filled_l0],
+                    max_level,
+                    reduction=setup.reduction,
+                    preprocess=setup.preprocess,
+                    copy_levels_to=None if all_gpu_writers else _WORKER_ARRAYS,
+                    copy_l0_to=(l0_full if (not all_gpu_writers and setup.preprocess.has_spatial_op) else None),
+                    return_host_f32=False,
+                )
+                process_ended = datetime.now(UTC)
+                if all_gpu_writers:
+                    written_bytes = 0
+                    for level in setup.levels:
+                        z0, z1 = z_start // level.factor, z_end // level.factor
+                        gpu_writer: Any = _WORKER_WRITERS[level]
+                        flushed += gpu_writer.write_slice_gpu(setup.channel, z0, d_levels[level][: z1 - z0])
+                        written_bytes += gpu_writer.last_written_bytes
+                        gpu_writer.release_device_buffers()
+            finally:
+                d_levels.clear()
+                ws.release_device_buffers()
+                release_shared_encoder_device_buffers()
+                flush_gpu_deallocations()
+        except Exception as exc:
+            if "OUT_OF_MEMORY" in str(exc) or "OutOfMemory" in type(exc).__name__:
+                log.warning("GPU VRAM exhausted during batch processing (%s); falling back to CPU worker", exc)
+                if ws is not None:
+                    ws.release_device_buffers()
+                release_shared_encoder_device_buffers()
+                flush_gpu_deallocations()
+                if not all_gpu_writers:
+                    return _worker_process_and_write(max_level_value, filled_l0, batch_idx)
+            raise
+
+    if not all_gpu_writers:
+        flushed = _write_host_levels(setup, batch_idx)
+    return BatchResult(process_started, process_ended, process_ended, datetime.now(UTC), flushed, written_bytes)
 
 
 # ---------------------------------------------------------------------------
@@ -238,54 +390,62 @@ def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: i
 class BatchSlot:
     """A ring slot backed by SharedMemory whose worker downsamples and writes each batch to the store."""
 
-    def __init__(self, name: str, shape_l0: UIVec3D, max_level: ScaleLevel, dtype: Dtype) -> None:
+    def __init__(
+        self,
+        name: str,
+        shape_l0: UIVec3D,
+        max_level: ScaleLevel,
+        dtype: Dtype,
+        raw_shape_l0: UIVec3D | None = None,
+    ) -> None:
         self.name = name
         self.shape_l0 = shape_l0
+        self.raw_shape_l0 = raw_shape_l0 if (raw_shape_l0 is not None and raw_shape_l0 != shape_l0) else None
         self.max_level = max_level
         self._dtype = dtype.dtype
         self._dtype_str = np.dtype(self._dtype).str
         self.filled_l0 = 0
         self.batch_idx: int | None = None
-
+        self._use_gpu = False
         self._condition = threading.Condition()
         self._active_readers = 0
-        self._stage = SlotStage.IDLE  # explicit stage while no task is in flight (IDLE / COLLECTING)
-        self._future: Future[BatchResult] | None = None  # set by flush(); stage derives from it
-
-        # Allocate one shared-memory segment per level (L0 + pyramid), prefaulted off the capture path.
-        self._shms: dict[ScaleLevel, SharedMemory] = {}
+        self._stage = SlotStage.IDLE
+        self._future: Future[BatchResult] | None = None
+        self._shms: dict[int, SharedMemory] = {}
         self._arrays: dict[ScaleLevel, np.ndarray] = {}
+        self._raw_array: np.ndarray | None = None
         shm_layout: list[tuple[int, str, tuple[int, int, int]]] = []
+
+        def _alloc(key: int, suffix: str, shape: tuple[int, int, int]) -> np.ndarray:
+            nbytes = int(np.prod(shape)) * self._dtype.itemsize
+            shm_name = f"{self.name}_{suffix}"
+            shm = SharedMemory(name=shm_name, create=True, size=nbytes, track=False)
+            arr = np.ndarray(shape, dtype=self._dtype, buffer=shm.buf)
+            _prefault_zero(arr)
+            self._shms[key] = shm
+            shm_layout.append((key, shm_name, shape))
+            return arr
+
         try:
+            if self.raw_shape_l0 is not None:
+                r = self.raw_shape_l0
+                self._raw_array = _alloc(_RAW_SHM_KEY, "raw", (r.z, r.y, r.x))
             for level in self.max_level.levels:
-                shp = level.scale(self.shape_l0)
-                shape = (shp.z, shp.y, shp.x)
-                nbytes = int(np.prod(shape)) * self._dtype.itemsize
-                shm_name = f"{self.name}_{level.value}"
-                shm = SharedMemory(name=shm_name, create=True, size=nbytes, track=False)
-                arr = np.ndarray(shape, dtype=self._dtype, buffer=shm.buf)
-                _prefault_zero(arr)
-                self._shms[level] = shm
-                self._arrays[level] = arr
-                shm_layout.append((level.value, shm_name, shape))
+                s = level.scale(self.shape_l0)
+                self._arrays[level] = _alloc(level.value, str(level.value), (s.z, s.y, s.x))
         except Exception:
             self._release_shms()
             raise
 
-        # Force 'spawn' — the main process is multi-threaded and fork-after-thread is a deadlock hazard.
-        ctx = mp.get_context("spawn")
         self._executor = ProcessPoolExecutor(
             max_workers=1,
-            mp_context=ctx,
+            mp_context=mp.get_context("spawn"),
             initializer=_worker_init,
             initargs=(shm_layout, self._dtype_str),
         )
 
     @property
     def stage(self) -> SlotStage:
-        """Current stage. While a batch task is in flight the stage derives from its future (so a
-        completed batch reads IDLE without waiting on a done-callback); otherwise it's the explicit
-        IDLE/COLLECTING set by assign_batch."""
         fut = self._future
         if fut is None:
             return self._stage
@@ -295,22 +455,18 @@ class BatchSlot:
 
     @property
     def active_readers(self) -> int:
-        """Number of retained read-only frame views that still reference this slot."""
         with self._condition:
             return self._active_readers
 
     @property
     def reusable(self) -> bool:
-        """Whether the slot can be assigned a new batch without overwriting an active reader."""
         return self.stage == SlotStage.IDLE and self.active_readers == 0
 
     def bind_output(self, setup: OutputSetup) -> None:
-        """Open the worker's per-level writers for a dataset. Call once per dataset before the first
-        batch; blocks until the writers are open."""
+        self._use_gpu = setup.use_gpu
         self._executor.submit(_worker_bind_output, setup).result()
 
     def assign_batch(self, batch_idx: int) -> None:
-        """Prepare an IDLE (empty) slot to collect a new batch."""
         with self._condition:
             if not self.reusable:
                 raise ValueError(
@@ -323,16 +479,15 @@ class BatchSlot:
             self.filled_l0 = 0
 
     def frame_array(self) -> np.ndarray:
-        """Return the next writable L0 frame destination while this slot is collecting."""
         with self._condition:
             if self.stage != SlotStage.COLLECTING:
                 raise RuntimeError(f"frame_array requires COLLECTING, got {self.stage.name}")
             if self.filled_l0 >= self.shape_l0.z:
                 raise IndexError(f"slot is full at L0 depth {self.shape_l0.z}")
-            return self._arrays[ScaleLevel.L0][self.filled_l0]
+            buf = self._raw_array if self._raw_array is not None else self._arrays[ScaleLevel.L0]
+            return buf[self.filled_l0]
 
     def commit_frame(self) -> None:
-        """Mark a populated L0 frame as complete and visible to slot consumers."""
         with self._condition:
             if self.stage != SlotStage.COLLECTING:
                 raise RuntimeError(f"commit_frame requires COLLECTING, got {self.stage.name}")
@@ -341,17 +496,16 @@ class BatchSlot:
             self.filled_l0 += 1
 
     def retain_last_frame(self) -> np.ndarray:
-        """Retain the most recently committed frame and prevent slot reuse until released."""
         with self._condition:
             if self.filled_l0 <= 0:
                 raise RuntimeError("cannot retain a slot with no committed frames")
             self._active_readers += 1
-            frame = self._arrays[ScaleLevel.L0][self.filled_l0 - 1].view()
+            buf = self._raw_array if self._raw_array is not None else self._arrays[ScaleLevel.L0]
+            frame = buf[self.filled_l0 - 1].view()
             frame.flags.writeable = False
             return frame
 
     def abort_empty_batch(self) -> None:
-        """Return an empty collecting slot to IDLE after its first frame aborts."""
         with self._condition:
             if self.stage != SlotStage.COLLECTING or self.filled_l0 != 0:
                 raise RuntimeError("only an empty collecting slot can be aborted")
@@ -359,7 +513,6 @@ class BatchSlot:
             self.batch_idx = None
 
     def release_reader(self) -> None:
-        """Release one retained frame view."""
         with self._condition:
             if self._active_readers <= 0:
                 raise RuntimeError("release_reader called with no active readers")
@@ -367,24 +520,18 @@ class BatchSlot:
             self._condition.notify_all()
 
     def wait_for_reader_change(self, timeout: float) -> None:
-        """Wait briefly for a retained reader to release, used when every ring slot is pinned."""
         with self._condition:
             self._condition.wait(timeout=timeout)
 
-    def flush(self) -> Future[BatchResult]:
-        """Flush the collected batch to the store: kick off the worker's downsample-and-write and return
-        its future. **Asynchronous** — the work runs in the worker; the returned future resolves (to a
-        `BatchResult`) when the batch is durably written. The slot is not reusable until it settles, so
-        the caller waits on it before reassigning."""
+    def flush(self, *, use_gpu: bool | None = None) -> Future[BatchResult]:
         if self.batch_idx is None:
             raise RuntimeError("cannot flush a slot with no batch assigned")
-        self._future = self._executor.submit(
-            _worker_process_and_write, self.max_level.value, self.filled_l0, self.batch_idx
-        )
+        run_gpu = self._use_gpu if use_gpu is None else use_gpu
+        worker_fn = _worker_process_and_write_gpu if run_gpu else _worker_process_and_write
+        self._future = self._executor.submit(worker_fn, self.max_level.value, self.filled_l0, self.batch_idx)
         return self._future
 
     def close(self) -> None:
-        """Close the worker's writers, shut the worker down, then unlink the shared memory."""
         with self._condition:
             self._condition.wait_for(lambda: self._active_readers == 0)
         try:
@@ -396,6 +543,7 @@ class BatchSlot:
             self._release_shms()
 
     def _release_shms(self) -> None:
+        self._raw_array = None
         self._arrays.clear()
         for shm in self._shms.values():
             try:

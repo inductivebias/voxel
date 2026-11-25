@@ -393,3 +393,19 @@ async def test_dark_frame_acquisition_before_and_conditional_after(
     assert len(writer.updated_darkfield) == 1
     assert writer.updated_darkfield[0][0] == PurePosixPath("volumes/000001/single_gfp/gfp")
     assert writer.updated_darkfield[0][1]["after"] == ("dark/after.ome.zarr" if expect_after else None)
+
+
+async def test_writer_patch_accepts_compression_and_gpu_fields(opened_instrument: Instrument) -> None:
+    await opened_instrument.update_output(
+        WriterPatch(
+            compression_level=5,
+            compression_shuffle="shuffle",
+            skip_empty_chunks=True,
+            use_gpu=True,
+        )
+    )
+    out = opened_instrument.state.value.output
+    assert out.compression_level == 5
+    assert out.compression_shuffle == "shuffle"
+    assert out.skip_empty_chunks is True
+    assert out.use_gpu is True

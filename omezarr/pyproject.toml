@@ -14,6 +14,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+gpu = [
+    "google-crc32c>=1.5.0",
+    "nvidia-nvcomp-cu13>=6.0.0; sys_platform == 'linux'",
+]
 ts = [
     "tensorstore>=0.1.76",
     "pydantic-tensorstore",

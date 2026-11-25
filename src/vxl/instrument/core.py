@@ -216,6 +216,8 @@ class ActiveAcquisition(FrozenModel):
     phase: AcquisitionPhase
     pause_requested: bool = False
     frames_captured: int = Field(default=0, ge=0)
+    raw_gb_s: float | None = None
+    compressed_gb_s: float | None = None
 
 
 class IdleActivity(FrozenModel):
@@ -1807,6 +1809,23 @@ class Instrument:
             )
         return planned_volumes
 
+    async def _writer_throughput_gb_s(self) -> tuple[float | None, float | None]:
+        """Aggregate live ``(raw_gb_s, compressed_gb_s)`` across active cameras."""
+        results = await asyncio.gather(
+            *(cam.writer_throughput_gb_s() for cam in self._hal.cameras.values()),
+            return_exceptions=True,
+        )
+        raw_total, comp_total = 0.0, 0.0
+        has_raw, has_comp = False, False
+        for res in results:
+            if isinstance(res, tuple):
+                raw_total += res[0]
+                has_raw = True
+                if res[1] is not None:
+                    comp_total += res[1]
+                    has_comp = True
+        return (round(raw_total, 2) if has_raw else None, round(comp_total, 2) if has_comp else None)
+
     async def _update_acquisition(
         self,
         manifest: AcquisitionManifest,
@@ -1822,13 +1841,20 @@ class Instrument:
             raise RuntimeError("cannot update acquisition state when no run is active")
         if current.id != manifest.id:
             raise RuntimeError("active acquisition does not match the running manifest")
+        next_phase = current.phase if phase is None else phase
+        if next_phase is AcquisitionPhase.CAPTURING or (frames_captured is not None and frames_captured > 0):
+            raw_gb_s, compressed_gb_s = await self._writer_throughput_gb_s()
+        else:
+            raw_gb_s, compressed_gb_s = current.raw_gb_s, current.compressed_gb_s
         updated = ActiveAcquisition(
             id=current.id,
             manifest_revision=manifest.revision,
             volume_index=current.volume_index if volume_index is None else volume_index,
-            phase=current.phase if phase is None else phase,
+            phase=next_phase,
             pause_requested=current.pause_requested if pause_requested is None else pause_requested,
             frames_captured=current.frames_captured if frames_captured is None else frames_captured,
+            raw_gb_s=raw_gb_s,
+            compressed_gb_s=compressed_gb_s,
         )
         await self._activity.set(capture.model_copy(update={"acquisition": updated}))
         return updated
@@ -1974,7 +2000,7 @@ class Instrument:
         """Collect ``volume.dark_frame_count`` dark frames (all lasers off) into ``dark/<phase_tag>.ome.zarr``."""
         num_frames = volume.dark_frame_count
         channels = {uid: self._channels[uid] for uid in self._store.value.imaging.profiles[volume.profile].channels}
-        dark_settings = self._store.value.output
+        dark_settings = self._store.value.output.model_copy(update={"skip_empty_chunks": False})
         base_subpath = PurePosixPath("volumes", f"{first_volume_index + 1:06d}", volume.profile)
         logger.info(
             "Capturing %d %s-scan dark frames (all lasers off) for task %s / profile %s",
