@@ -1,17 +1,10 @@
 import type { AcquisitionTask, Bounds, CameraSamplingYZ, Point2D } from './types';
 
-const DEFAULT_CAMERA_SAMPLING_YZ: Record<string, CameraSamplingYZ> = {
-  cam1: { y: 0.195, z: 0.169 },
-  camera_1: { y: 0.195, z: 0.169 },
-  cam2: { y: 0.293, z: 0.254 },
-  camera_2: { y: 0.293, z: 0.254 }
-};
-
 export function defaultCameraSamplingYZ(cameraId: string, index = 0): CameraSamplingYZ {
   const key = cameraId.trim().toLowerCase();
-  if (key in DEFAULT_CAMERA_SAMPLING_YZ) return { ...DEFAULT_CAMERA_SAMPLING_YZ[key] };
-  if (key.endsWith('2') || key.endsWith('_1') || index === 1) return { ...DEFAULT_CAMERA_SAMPLING_YZ.camera_2 };
-  return { ...DEFAULT_CAMERA_SAMPLING_YZ.camera_1 };
+  return key !== 'cam1' && key !== 'camera_1' && (key.endsWith('2') || key.endsWith('_1') || index === 1)
+    ? { y: 0.293, z: 0.254 }
+    : { y: 0.195, z: 0.169 };
 }
 
 export interface RegionBounds {

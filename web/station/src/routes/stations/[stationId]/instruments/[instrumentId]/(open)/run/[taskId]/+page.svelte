@@ -124,6 +124,8 @@
     if (task?.scan?.y_stack) updateScan({ y_stack: { ...task.scan.y_stack, ...patch } }, context);
   }
 
+  const cameraIds = $derived(instrument ? Object.keys(instrument.hal.detection) : []);
+
   function cameraSampling(cameraId: string, index: number): CameraSamplingYZ {
     return task?.scan?.camera_sampling_yz?.[cameraId] ?? defaultCameraSamplingYZ(cameraId, index);
   }
@@ -135,15 +137,8 @@
     context: EditContext = {}
   ): void {
     if (!task?.scan) return;
-    updateScan(
-      {
-        camera_sampling_yz: {
-          ...task.scan.camera_sampling_yz,
-          [cameraId]: { ...cameraSampling(cameraId, index), ...patch }
-        }
-      },
-      context
-    );
+    const next = { ...cameraSampling(cameraId, index), ...patch };
+    updateScan({ camera_sampling_yz: { ...task.scan.camera_sampling_yz, [cameraId]: next } }, context);
   }
 
   const sweepCount = $derived(
@@ -153,22 +148,11 @@
   );
   const zChunkEdge = $derived(instrument ? Math.max(64, 1 << instrument.state.output.max_level) : 128);
   const suggestedDarkFrames = $derived(Math.max(256, zChunkEdge));
-  const suggestedChunkCount = $derived(Math.max(1, Math.round(suggestedDarkFrames / zChunkEdge)));
   const acquireDarkFrames = $derived(Boolean(task?.acquire_dark_frames));
   const darkFrameCount = $derived(task?.dark_frame_count ?? suggestedDarkFrames);
 
-  function updateDarkFrames(
-    patch: { acquire_dark_frames?: boolean; dark_frame_count?: number },
-    context: EditContext = {}
-  ): void {
-    if (!task) return;
-    patchTask(
-      {
-        acquire_dark_frames: patch.acquire_dark_frames ?? acquireDarkFrames,
-        dark_frame_count: Math.max(1, Math.min(4096, Math.round(patch.dark_frame_count ?? darkFrameCount)))
-      },
-      context
-    );
+  function setDarkFrameCount(count: number, context: EditContext = {}): void {
+    patchTask({ dark_frame_count: Math.max(1, Math.min(4096, Math.round(count))) }, context);
   }
 
   function updateHold(axis: 'x' | 'y' | 'z', value: number, context: EditContext): void {
@@ -412,33 +396,23 @@
               {disabled}
             />
           </FieldRow>
-          {#each Object.keys(instrument.hal.detection) as cameraId, camIndex (cameraId)}
+          {#each cameraIds as cameraId, camIndex (cameraId)}
             {@const sampling = cameraSampling(cameraId, camIndex)}
             <FieldRow label={`${displayName(cameraId)} YZ`}>
-              <NumberBox
-                value={sampling.y}
-                min={0.001}
-                step={0.001}
-                bigStep={0.01}
-                prefix="Y"
-                suffix="µm"
-                aria-label={`${displayName(cameraId)} Y sampling in micrometres`}
-                onEditStart={() => instrument.edits.hold()}
-                onChange={(y, edit) => updateCameraSampling(cameraId, camIndex, { y }, edit)}
-                {disabled}
-              />
-              <NumberBox
-                value={sampling.z}
-                min={0.001}
-                step={0.001}
-                bigStep={0.01}
-                prefix="Z"
-                suffix="µm"
-                aria-label={`${displayName(cameraId)} Z sampling in micrometres`}
-                onEditStart={() => instrument.edits.hold()}
-                onChange={(z, edit) => updateCameraSampling(cameraId, camIndex, { z }, edit)}
-                {disabled}
-              />
+              {#each ['y', 'z'] as const as axis (axis)}
+                <NumberBox
+                  value={sampling[axis]}
+                  min={0.001}
+                  step={0.001}
+                  bigStep={0.01}
+                  prefix={axis.toUpperCase()}
+                  suffix="µm"
+                  aria-label={`${displayName(cameraId)} ${axis.toUpperCase()} sampling in micrometres`}
+                  onEditStart={() => instrument.edits.hold()}
+                  onChange={(value, edit) => updateCameraSampling(cameraId, camIndex, { [axis]: value }, edit)}
+                  {disabled}
+                />
+              {/each}
             </FieldRow>
           {/each}
           <FieldRow label="Targeted framerate">
@@ -888,11 +862,12 @@
     {/if}
 
     {#snippet darkFramesField()}
+      {@const chunks = suggestedDarkFrames / zChunkEdge}
       <FieldRow label="Dark-frames">
         <label class="flex h-ui-sm items-center gap-2 text-sm whitespace-nowrap text-fg">
           <Checkbox
             value={acquireDarkFrames}
-            onChange={(checked) => updateDarkFrames({ acquire_dark_frames: checked })}
+            onChange={(checked) => patchTask({ acquire_dark_frames: checked })}
             {disabled}
           />
           Acquire dark-frames
@@ -907,23 +882,20 @@
           suffix="frames"
           aria-label="Dark-frame count"
           onEditStart={() => instrument?.edits.hold()}
-          onChange={(count, edit) => updateDarkFrames({ dark_frame_count: count }, edit)}
+          onChange={setDarkFrameCount}
           disabled={disabled || !acquireDarkFrames}
         />
       </FieldRow>
       <p class="text-xs text-fg-muted">
-        Suggested: {suggestedDarkFrames} frames ({suggestedChunkCount} × {zChunkEdge}-frame OME-Zarr Z-chunk{suggestedChunkCount >
-        1
-          ? 's'
-          : ''} at L{instrument?.state.output.max_level}). Collected with all lasers off into
-        <code>dark/before.ome.zarr</code> before the scan, and into <code>dark/after.ome.zarr</code> if total scan time
-        exceeds 10 min.
+        Suggested: {suggestedDarkFrames} frames ({chunks} × {zChunkEdge}-frame Z-chunk{chunks > 1 ? 's' : ''} at L{instrument
+          ?.state.output.max_level}). Saved with lasers off to <code>dark/before.ome.zarr</code> (and
+        <code>dark/after.ome.zarr</code> if &gt;10 min).
         {#if acquireDarkFrames && darkFrameCount !== suggestedDarkFrames}
           <button
             type="button"
             class="ml-1 underline hover:text-fg"
             {disabled}
-            onclick={() => updateDarkFrames({ dark_frame_count: suggestedDarkFrames })}
+            onclick={() => setDarkFrameCount(suggestedDarkFrames)}
           >
             Use {suggestedDarkFrames}
           </button>

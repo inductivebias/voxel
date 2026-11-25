@@ -198,9 +198,28 @@
 
   let starting = $state(false);
   let togglingPause = $state(false);
-  const stripLabel = $derived(
-    manifest?.volumes.some((item) => item.scan?.y_stack || item.scan?.axis === 'x') ? 'X-strip' : 'volume'
-  );
+  const stripLabel = $derived(manifest?.volumes.some((item) => item.scan?.axis === 'x') ? 'X-strip' : 'volume');
+  const pauseAction = $derived.by(() => {
+    if (!manifest || !active || manifest.volumes.length <= 1 || active.phase === 'stopping') return null;
+    const isPaused = active.phase === 'paused';
+    const pending = Boolean(active.pause_requested);
+    const resume = isPaused || pending;
+    const onFinal = !resume && active.volume_index >= manifest.volumes.length - 1;
+    const variant = isPaused ? ('default' as const) : ('outline' as const);
+    let label = `Pause after ${stripLabel}`;
+    let title = onFinal
+      ? `Already on the final ${stripLabel}`
+      : `Finish the current ${stripLabel} and pause before starting the next one`;
+    if (isPaused) [label, title] = ['Continue scan', 'Continue to the next volume'];
+    else if (pending) {
+      [label, title] = [
+        `Pausing after ${stripLabel} — Continue scan`,
+        'Cancel the pending pause and keep scanning continuously'
+      ];
+    }
+    if (togglingPause) label = resume ? 'Continuing…' : 'Pausing…';
+    return { variant, disabled: togglingPause || onFinal, resume, label, title };
+  });
 
   function defaultPath(): string {
     const date = new Date();
@@ -399,8 +418,7 @@
   async function togglePause(source: Instrument, resume: boolean): Promise<void> {
     togglingPause = true;
     try {
-      if (resume) await source.resumeAcquisition();
-      else await source.pauseAcquisition();
+      await (resume ? source.resumeAcquisition() : source.pauseAcquisition());
     } catch (error) {
       reportFailure(error);
     } finally {
@@ -715,32 +733,15 @@
             <dd class="font-mono wrap-anywhere">{storageLabel(manifest)}</dd>
           </dl>
           {@render volumes(manifest)}
-          {#if manifest.volumes.length > 1 && active.phase !== 'stopping'}
-            {@const isPaused = active.phase === 'paused'}
-            {@const resume = isPaused || Boolean(active.pause_requested)}
-            {@const onFinal = !resume && active.volume_index >= manifest.volumes.length - 1}
+          {#if pauseAction}
             <Button
-              variant={isPaused ? 'default' : 'outline'}
+              variant={pauseAction.variant}
               class="w-full"
-              disabled={togglingPause || onFinal}
-              onclick={() => togglePause(instrument, resume)}
-              title={isPaused
-                ? 'Continue to the next volume'
-                : active.pause_requested
-                  ? 'Cancel the pending pause and keep scanning continuously'
-                  : onFinal
-                    ? `Already on the final ${stripLabel}`
-                    : `Finish the current ${stripLabel} and pause before starting the next one`}
+              disabled={pauseAction.disabled}
+              title={pauseAction.title}
+              onclick={() => togglePause(instrument, pauseAction.resume)}
             >
-              {togglingPause
-                ? resume
-                  ? 'Continuing…'
-                  : 'Pausing…'
-                : isPaused
-                  ? 'Continue scan'
-                  : active.pause_requested
-                    ? `Pausing after ${stripLabel} — Continue scan`
-                    : `Pause after ${stripLabel}`}
+              {pauseAction.label}
             </Button>
           {/if}
         {:else}
