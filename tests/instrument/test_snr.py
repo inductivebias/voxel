@@ -132,3 +132,27 @@ async def test_instrument_snapshot_and_snr_end_to_end(opened_instrument: Instrum
     assert Path(report.metrics_path).is_file()
     assert all(cam.previews == {} for cam in report.cameras.values())
     assert "Stationary SNR, Photobleaching" in opened_instrument.get_snr_report_html(report.report_id)
+
+
+def test_stationary_snr_dark_fallbacks_and_bleach_accuracy() -> None:
+    rng = np.random.default_rng(9)
+    n_sig, h, w = 8, 48, 48
+    yy, xx = np.ogrid[:h, :w]
+    fg_signal = np.where(((yy - 24) ** 2 + (xx - 24) ** 2) <= 10**2, 1200.0, 0.0)
+    frames = np.empty((n_sig, h, w), dtype=np.uint16)
+    for t in range(n_sig):
+        frames[t] = np.clip(50.0 + fg_signal * np.exp(-0.03 * t) + rng.normal(0.0, 2.5, size=(h, w)), 0, 65535).astype(
+            np.uint16
+        )
+
+    no_dark = compute_camera_snr_diagnostics(frames, dark_frames=None, camera_id="cam_no_dark")
+    assert no_dark.num_dark_frames == 0
+    assert no_dark.dark_offset_adu == pytest.approx(50.0, abs=6.0)
+    assert no_dark.bleach_total_pct > 10.0
+
+    one_dark = compute_camera_snr_diagnostics(
+        frames, dark_frames=np.full((1, h, w), 50, dtype=np.uint16), camera_id="cam_1_dark"
+    )
+    assert one_dark.num_dark_frames == 1
+    assert one_dark.dark_offset_adu == pytest.approx(50.0, abs=0.5)
+    assert one_dark.read_noise_adu == 0.0

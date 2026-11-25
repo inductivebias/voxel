@@ -19,15 +19,8 @@ def write_tiff_2d(
     pixel_size_um: tuple[float, float] | None = None,
     metadata: dict[str, Any] | None = None,
 ) -> Path:
-    """Write a 2D ``uint8``, ``uint16``, or ``float32`` array as an ImageJ-compatible TIFF.
-
-    Args:
-        path: Output ``.tif`` file path (parent directories are created automatically).
-        image: 2D numpy array.
-        pixel_size_um: Optional ``(py_um, px_um)`` physical pixel pitch in micrometers.
-        metadata: Optional JSON-serializable metadata stored in ImageJ's ``Info`` tag.
-    """
-    arr = np.ascontiguousarray(image)
+    """Write a 2D ``uint8``, ``uint16``, or ``float32`` array as an ImageJ-compatible TIFF."""
+    arr = np.asarray(image)
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D image for TIFF write, got shape {arr.shape}")
     if arr.dtype not in _SUPPORTED_DTYPES:
@@ -35,9 +28,8 @@ def write_tiff_2d(
 
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-
-    resolution: tuple[float, float] | None = None
     ij_meta: dict[str, Any] = {}
+    resolution: tuple[float, float] | None = None
     if pixel_size_um is not None and pixel_size_um[0] > 0 and pixel_size_um[1] > 0:
         resolution = (1.0 / float(pixel_size_um[1]), 1.0 / float(pixel_size_um[0]))
         ij_meta["unit"] = "um"
@@ -46,7 +38,7 @@ def write_tiff_2d(
 
     tifffile.imwrite(
         out,
-        arr,
+        np.ascontiguousarray(arr),
         imagej=True,
         resolution=resolution,
         resolutionunit="NONE" if resolution is not None else None,

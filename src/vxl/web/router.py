@@ -1,5 +1,6 @@
 """Station-scoped REST and WebSocket routes."""
 
+import asyncio
 import datetime
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
@@ -614,19 +615,22 @@ async def run_snr_diagnostics(
     return await instrument.run_snr_diagnostics(
         num_frames=req.num_frames,
         dark_frames=req.dark_frames,
-        report_url_for=lambda report_id: request.url_for(
-            "get_snr_report_html",
-            station_id=station_id,
-            session_id=session_id,
-            report_id=report_id,
-        ).path,
+        report_url_for=lambda report_id: (
+            request.url_for(
+                "get_snr_report_html",
+                station_id=station_id,
+                session_id=session_id,
+                report_id=report_id,
+            ).path
+        ),
     )
 
 
 @instrument_router.get("/diagnostics/reports/{report_id}", response_class=HTMLResponse)
 async def get_snr_report_html(report_id: str, instrument: InstrumentDep) -> HTMLResponse:
     try:
-        return HTMLResponse(content=instrument.get_snr_report_html(report_id))
+        content = await asyncio.to_thread(instrument.get_snr_report_html, report_id)
+        return HTMLResponse(content=content)
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
 

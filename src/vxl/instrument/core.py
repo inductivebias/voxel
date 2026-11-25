@@ -553,11 +553,27 @@ class Instrument:
         laser_chans = self._profile_lasers(profile)
         await self._inhibit_laser_outputs()
         await _gather_hardware(*(ch.prepare_laser(profile.lasers[ch.laser.uid]) for ch in laser_chans))
-        await self._apply_signals()
-        await self._reset_preview()
-        with suppress(NotImplementedError, RuntimeError):
-            await self._hal.stage.scanning_axis.reset_ttl_stepper()
+
+        async def _reset_stepper() -> None:
+            with suppress(NotImplementedError, RuntimeError):
+                await self._hal.stage.scanning_axis.reset_ttl_stepper()
+
+        await asyncio.gather(self._apply_signals(), self._reset_preview(), _reset_stepper())
         return chans, laser_chans, stage_xyz
+
+    @asynccontextmanager
+    async def _stationary_capture(
+        self,
+        action: str,
+    ) -> AsyncIterator[tuple[list[Channel], list[Illumination], tuple[float, float, float] | None]]:
+        """Hold ``_lock``, prepare stationary hardware, and mark ``_snapshot_active`` during capture."""
+        async with self._lock:
+            prepared = await self._prepare_stationary_capture(action)
+            self._snapshot_active = True
+            try:
+                yield prepared
+            finally:
+                self._snapshot_active = False
 
     async def _capture_gated_burst(
         self,
@@ -570,11 +586,13 @@ class Instrument:
     ) -> None:
         """Arm cameras, optionally gate lasers on, trigger ``num_frames``, and inhibit lasers immediately."""
         await _gather_hardware(*(ch.camera.arm_capture(num_frames) for ch in chans))
+        captured = False
         try:
             if lasers_on:
                 await _gather_hardware(*(ch.enable_laser_output() for ch in laser_chans))
                 await asyncio.sleep(0.015)  # allow APC laser modulation loop to settle before exposure
             await self._start_signal_generators()
+            captured = True
             await _gather_hardware(*(ch.camera.capture_frames_raw(num_frames, slot_key=slot_key) for ch in chans))
         finally:
             if lasers_on:
@@ -582,10 +600,12 @@ class Instrument:
                     await self._inhibit_laser_outputs()
             with suppress(Exception):
                 await self._stop_signal_generators()
+            if not captured:
+                with suppress(Exception):
+                    await _gather_hardware(*(ch.camera.capture_frames_raw(0) for ch in chans))
 
     def _camera_capture_info(self, cam: CameraHandle) -> tuple[tuple[float, float], float]:
-        detection_ids = list(self._hal.topology.detection)
-        cam_idx = detection_ids.index(cam.uid) if cam.uid in detection_ids else 0
+        cam_idx = next((i for i, cid in enumerate(self._hal.topology.detection) if cid == cam.uid), 0)
         sampling = default_camera_sampling_yz(cam.uid, cam_idx)
         exp_model = cam.props.cached_model("exposure_time_ms")
         exp_val = exp_model.value if exp_model is not None else None
@@ -608,57 +628,52 @@ class Instrument:
     async def snapshot(self, *, save_tiff: bool = True) -> SnapshotResult:
         """Capture one laser-gated frame per active channel, optionally save calibrated TIFFs,
         and keep the snapshot displayed on screen in ``IdleActivity`` with lasers off."""
-        async with self._lock:
-            chans, laser_chans, stage_xyz = await self._prepare_stationary_capture("take a snapshot")
+        async with self._stationary_capture("take a snapshot") as (chans, laser_chans, stage_xyz):
             profile_id = self._active_profile_id.value
-            self._snapshot_active = True
-            try:
-                await self._capture_gated_burst(chans, laser_chans, 1, slot_key="snapshot", lasers_on=True)
-                now = datetime.datetime.now()
-                snap_dir = self._system.store / self.path.stem / "snapshots" / now.strftime("%Y%m%d")
-                laser_summary = self._laser_summary(laser_chans)
-                pos_part = (
-                    f"_x{round(stage_xyz[0])}um_y{round(stage_xyz[1])}um_z{round(stage_xyz[2])}um"
-                    if stage_xyz is not None
-                    else ""
-                )
-
-                async def _process_one(ch: Channel) -> tuple[str, SnapshotFrameInfo]:
-                    px_um, exp_ms = self._camera_capture_info(ch.camera)
-                    fname = (
-                        f"snapshot_{now.strftime('%Y%m%d_%H%M%S')}_{profile_id}_{ch.uid}_{ch.camera.uid}"
-                        f"{pos_part}_{round(exp_ms)}ms.tif"
-                    )
-                    meta = {
-                        "instrument": self.path.stem,
-                        "profile_id": profile_id,
-                        "channel_id": ch.uid,
-                        "camera_id": ch.camera.uid,
-                        "timestamp": now.isoformat(),
-                        "stage_xyz_um": list(stage_xyz) if stage_xyz is not None else None,
-                        "exposure_time_ms": exp_ms,
-                        "lasers": laser_summary,
-                    }
-                    info = await ch.camera.process_snapshot(
-                        slot_key="snapshot",
-                        save_path=str(snap_dir / fname) if save_tiff else None,
-                        pixel_size_um=px_um,
-                        metadata=meta,
-                    )
-                    return ch.uid, info
-
-                processed = await _gather_hardware(*(_process_one(ch) for ch in chans))
-            finally:
-                self._snapshot_active = False
-
-            logger.info("Captured single-frame snapshot (%d channels) -> %s", len(chans), snap_dir)
-            return SnapshotResult(
-                timestamp=now.isoformat(),
-                profile_id=profile_id,
-                stage_xyz_um=stage_xyz,
-                output_dir=str(snap_dir),
-                frames=dict(processed),
+            await self._capture_gated_burst(chans, laser_chans, 1, slot_key="snapshot", lasers_on=True)
+            now = datetime.datetime.now()
+            snap_dir = self._system.store / self.path.stem / "snapshots" / now.strftime("%Y%m%d")
+            laser_summary = self._laser_summary(laser_chans)
+            pos_part = (
+                f"_x{round(stage_xyz[0])}um_y{round(stage_xyz[1])}um_z{round(stage_xyz[2])}um"
+                if stage_xyz is not None
+                else ""
             )
+
+            async def _process_one(ch: Channel) -> tuple[str, SnapshotFrameInfo]:
+                px_um, exp_ms = self._camera_capture_info(ch.camera)
+                fname = (
+                    f"snapshot_{now.strftime('%Y%m%d_%H%M%S')}_{profile_id}_{ch.uid}_{ch.camera.uid}"
+                    f"{pos_part}_{round(exp_ms)}ms.tif"
+                )
+                meta = {
+                    "instrument": self.path.stem,
+                    "profile_id": profile_id,
+                    "channel_id": ch.uid,
+                    "camera_id": ch.camera.uid,
+                    "timestamp": now.isoformat(),
+                    "stage_xyz_um": list(stage_xyz) if stage_xyz is not None else None,
+                    "exposure_time_ms": exp_ms,
+                    "lasers": laser_summary,
+                }
+                info = await ch.camera.process_snapshot(
+                    slot_key="snapshot",
+                    save_path=str(snap_dir / fname) if save_tiff else None,
+                    pixel_size_um=px_um,
+                    metadata=meta,
+                )
+                return ch.uid, info
+
+            processed = await _gather_hardware(*(_process_one(ch) for ch in chans))
+
+        logger.info("Captured single-frame snapshot (%d channels) -> %s", len(chans), snap_dir)
+        return SnapshotResult(
+            timestamp=now.isoformat(),
+            profile_id=profile_id,
+            stage_xyz_um=stage_xyz,
+            output_dir=str(snap_dir),
+            frames=dict(processed),
+        )
 
     async def run_snr_diagnostics(
         self,
@@ -674,59 +689,56 @@ class Instrument:
         if not 0 <= dark_frames <= 128:
             raise OperationRejectedError("dark_frames must be between 0 and 128")
 
-        async with self._lock:
-            chans, laser_chans, stage_xyz = await self._prepare_stationary_capture("run stationary SNR diagnostics")
+        async with self._stationary_capture("run stationary SNR diagnostics") as (chans, laser_chans, stage_xyz):
             profile_id = self._active_profile_id.value
-            self._snapshot_active = True
-            try:
-                await self._capture_gated_burst(chans, laser_chans, num_frames, slot_key="signal", lasers_on=True)
-                if dark_frames > 0:
-                    await self._capture_gated_burst(chans, laser_chans, dark_frames, slot_key="dark", lasers_on=False)
+            await self._capture_gated_burst(chans, laser_chans, num_frames, slot_key="signal", lasers_on=True)
+            if dark_frames > 0:
+                await self._capture_gated_burst(chans, laser_chans, dark_frames, slot_key="dark", lasers_on=False)
 
-                now = datetime.datetime.now()
-                report_id = f"snr_{now.strftime('%Y%m%d_%H%M%S')}_{profile_id}"
-                out_dir = self._system.store / self.path.stem / "snr_diagnostics" / report_id
+            now = datetime.datetime.now()
+            report_id = f"snr_{now.strftime('%Y%m%d_%H%M%S')}_{profile_id}"
+            out_dir = self._system.store / self.path.stem / "snr_diagnostics" / report_id
 
-                async def _analyze_one(ch: Channel) -> tuple[str, CameraSnrAnalysis]:
-                    px_um, exp_ms = self._camera_capture_info(ch.camera)
-                    analysis = await ch.camera.analyze_snr_buffer(
-                        output_dir=str(out_dir),
-                        channel_id=ch.uid,
-                        profile_id=profile_id,
-                        pixel_size_um=px_um,
-                        exposure_ms=exp_ms,
-                    )
-                    return ch.camera.uid, analysis
+            async def _analyze_one(ch: Channel) -> tuple[str, CameraSnrAnalysis]:
+                px_um, exp_ms = self._camera_capture_info(ch.camera)
+                analysis = await ch.camera.analyze_snr_buffer(
+                    output_dir=str(out_dir),
+                    channel_id=ch.uid,
+                    profile_id=profile_id,
+                    pixel_size_um=px_um,
+                    exposure_ms=exp_ms,
+                )
+                return ch.camera.uid, analysis
 
-                cam_analyses = dict(await _gather_hardware(*(_analyze_one(ch) for ch in chans)))
-            finally:
-                self._snapshot_active = False
+            cam_analyses = dict(await _gather_hardware(*(_analyze_one(ch) for ch in chans)))
+            laser_summary = self._laser_summary(laser_chans)
 
-            report_path = render_snr_html_report(
-                report_id=report_id,
-                timestamp=now,
-                instrument_name=self.path.stem,
-                profile_id=profile_id,
-                stage_xyz_um=stage_xyz,
-                laser_summary=self._laser_summary(laser_chans),
-                cameras=cam_analyses,
-                output_dir=out_dir,
-            )
-            report_url = report_url_for(report_id) if report_url_for is not None else str(report_path)
-            logger.info("Completed stationary SNR & photobleaching diagnostics -> %s", report_path)
-            return SnrReportResult(
-                report_id=report_id,
-                timestamp=now.isoformat(),
-                profile_id=profile_id,
-                num_frames=num_frames,
-                dark_frames=dark_frames,
-                stage_xyz_um=stage_xyz,
-                output_dir=str(out_dir),
-                report_path=str(report_path),
-                metrics_path=str(out_dir / "snr_metrics.json"),
-                report_url=report_url,
-                cameras={cid: cam.without_previews() for cid, cam in cam_analyses.items()},
-            )
+        report_path = await asyncio.to_thread(
+            render_snr_html_report,
+            report_id=report_id,
+            timestamp=now,
+            instrument_name=self.path.stem,
+            profile_id=profile_id,
+            stage_xyz_um=stage_xyz,
+            laser_summary=laser_summary,
+            cameras=cam_analyses,
+            output_dir=out_dir,
+        )
+        report_url = report_url_for(report_id) if report_url_for is not None else str(report_path)
+        logger.info("Completed stationary SNR & photobleaching diagnostics -> %s", report_path)
+        return SnrReportResult(
+            report_id=report_id,
+            timestamp=now.isoformat(),
+            profile_id=profile_id,
+            num_frames=num_frames,
+            dark_frames=dark_frames,
+            stage_xyz_um=stage_xyz,
+            output_dir=str(out_dir),
+            report_path=str(report_path),
+            metrics_path=str(out_dir / "snr_metrics.json"),
+            report_url=report_url,
+            cameras={cid: cam.without_previews() for cid, cam in cam_analyses.items()},
+        )
 
     def get_snr_report_html(self, report_id: str) -> str:
         """Read a previously generated ``snr_report.html`` by ``report_id``."""
