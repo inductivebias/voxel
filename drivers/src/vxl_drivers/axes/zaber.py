@@ -656,8 +656,6 @@ class ZaberContinuousScanner(ContinuousScanner):
             return
         for attempt in range(1, _WINDOW_DISARM_ATTEMPTS + 1):
             failures: list[Exception] = []
-            timed_out_triggers: set[int] = set()
-            output_timed_out = False
             for number in self._window_triggers:
                 try:
                     trigger = self._device.triggers.get_trigger(number)
@@ -665,29 +663,29 @@ class ZaberContinuousScanner(ContinuousScanner):
                     trigger.clear_action(TriggerAction.ALL)
                 except Exception as error:
                     failures.append(error)
-                    if isinstance(error, RequestTimeoutException):
-                        timed_out_triggers.add(number)
             # Always force LOW, even when a trigger command failed.
             try:
                 self._device.io.set_digital_output(self._window_output, DigitalOutputAction.OFF)
             except Exception as error:
                 failures.append(error)
-                output_timed_out = isinstance(error, RequestTimeoutException)
-            for number in self._window_triggers:
+            if not failures:
                 try:
-                    enabled = self._device.triggers.get_trigger(number).get_enabled_state().enabled
-                    if enabled and number not in timed_out_triggers:
-                        failures.append(RuntimeError(f"scan window trigger {number} is still enabled"))
+                    states = self._device.triggers.get_enabled_states()
+                    failures.extend(
+                        RuntimeError(f"scan window trigger {n} is still enabled")
+                        for n in self._window_triggers
+                        if states[n - 1].enabled
+                    )
                 except Exception as error:
                     failures.append(error)
-            try:
-                if self._device.io.get_digital_output(self._window_output) != 0 and not output_timed_out:
-                    failures.append(RuntimeError(f"scan window DO{self._window_output} did not reset LOW"))
-            except Exception as error:
-                failures.append(error)
-            if not failures:
-                self._window_armed = False
-                return
+                try:
+                    if self._device.io.get_digital_output(self._window_output) != 0:
+                        failures.append(RuntimeError(f"scan window DO{self._window_output} did not reset LOW"))
+                except Exception as error:
+                    failures.append(error)
+                if not failures:
+                    self._window_armed = False
+                    return
             if attempt == _WINDOW_DISARM_ATTEMPTS or not all(
                 isinstance(error, RequestTimeoutException) for error in failures
             ):
@@ -770,15 +768,16 @@ class ZaberContinuousScanner(ContinuousScanner):
             raise RuntimeError(f"Zaber reported {', '.join(sorted(flags))} during the continuous scan")
         return busy
 
-    def _restore(self) -> None:
+    def _restore(self, *, disarm: bool = True) -> None:
         """Restore every snapshotted setting in order, attempting all; raises naming each failure."""
         if self._originals is None:
             return
         failures: list[tuple[str, Exception]] = []
-        try:
-            self._disarm_window()
-        except Exception as error:
-            failures.append(("window off", error))
+        if disarm:
+            try:
+                self._disarm_window()
+            except Exception as error:
+                failures.append(("window off", error))
         for name, value in self._originals.items():
             try:
                 self._set_verified(name, value)
@@ -798,7 +797,7 @@ class ZaberContinuousScanner(ContinuousScanner):
                 raise RuntimeError("prepare the continuous scan first")
             state = self._state()
             self._check_settled(state, "target", target)
-            self._restore()
+            self._restore(disarm=False)
         return {**state, "status_poll_timeouts": self._status_timeouts}
 
     def _stop(self) -> None:
@@ -830,7 +829,7 @@ class ZaberContinuousScanner(ContinuousScanner):
                 failures.append(("stop", error))
             else:
                 try:
-                    self._restore()
+                    self._restore(disarm=False)
                 except Exception as error:
                     failures.append(("restore", error))
         try:

@@ -86,9 +86,6 @@ class FakeTrigger:
             raise RuntimeError("trigger disable failed")
         self.enabled = False
 
-    def get_enabled_state(self) -> SimpleNamespace:
-        return SimpleNamespace(enabled=self.enabled)
-
     def enable(self, count: int = 0) -> None:
         self.count = count
         self.enabled = True
@@ -1505,6 +1502,7 @@ def test_zaber_setting_and_command_accessors(controller):
 
 
 def _armed_window(controller, monkeypatch):
+    monkeypatch.setattr(zaber, "_WINDOW_DISARM_RETRY_S", 0)
     hub, _, sdk, _ = controller
     axis, scanner = scan_axis(hub, monkeypatch, scan_window_output=2, scan_window_triggers=(3, 4, 5))
     scanner.prepare(start=SCAN_START, speed=2000)
@@ -1514,12 +1512,16 @@ def _armed_window(controller, monkeypatch):
 
 
 @pytest.mark.parametrize(
-    "operation", ["disable", "clear_action", "get_enabled_state", "set_digital_output", "get_digital_output"]
+    "operation", ["disable", "clear_action", "get_enabled_states", "set_digital_output", "get_digital_output"]
 )
 @pytest.mark.parametrize("lost_reply", [False, True])
 def test_window_cleanup_retries_timeout_and_verifies_safe_state(controller, monkeypatch, operation, lost_reply):
     sdk, axis, scanner = _armed_window(controller, monkeypatch)
-    target = sdk.device.io if "digital_output" in operation else sdk.device.triggers.by_number[3]
+    target = (
+        sdk.device.io
+        if "output" in operation
+        else (sdk.device.triggers if operation == "get_enabled_states" else sdk.device.triggers.by_number[3])
+    )
     original = getattr(target, operation)
     calls = 0
 
@@ -1532,10 +1534,9 @@ def test_window_cleanup_retries_timeout_and_verifies_safe_state(controller, monk
             raise RequestTimeoutException("lost reply")
         return original(*args)
 
-    with monkeypatch.context() as m:
-        m.setattr(target, operation, flaky)
-        scanner.disarm_window()
-        assert calls == 3
+    monkeypatch.setattr(target, operation, flaky)
+    scanner.disarm_window()
+    assert calls == 3
     assert not scanner._window_armed
     assert not any(t.enabled for t in sdk.device.triggers.by_number.values())
     assert all(not sdk.device.triggers.by_number[n].actions for n in (3, 4, 5))
