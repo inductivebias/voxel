@@ -6,6 +6,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import partial
+from typing import Any
 from uuid import uuid4
 
 import numpy as np
@@ -218,10 +219,9 @@ class PreviewGenerator:
     ) -> None:
         """Submit a frame (such as a single-frame snapshot) and await overview + viewport emission."""
         self.submit_frame(frame, idx, valid_bits=valid_bits, force_overview=True)
-        if self._overview_future is not None:
-            await asyncio.gather(self._overview_future, return_exceptions=True)
-        if self._viewport_task is not None:
-            await asyncio.gather(self._viewport_task, return_exceptions=True)
+        pending: list[asyncio.Future[Any]] = [t for t in (self._overview_future, self._viewport_task) if t is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
         await asyncio.sleep(0)  # allow done callbacks (_on_overview_done) to invoke sink
 
     def reset_stream(self) -> str:

@@ -46,6 +46,12 @@ async def test_gpu_binning_snapshot_and_snr_pipeline(tmp_path: Path) -> None:
 
     controller = CameraController(cam, system=System(store=tmp_path))
     try:
+        # 0-frame disarm safely stops/frees buffer without touching _diag_buffers
+        await controller.arm_capture(1)
+        assert await controller.capture_frames_raw(0, slot_key="disarmed") == 0
+        assert "disarmed" not in controller._diag_buffers
+        assert not cam._buffer_allocated
+
         # 2-phase snapshot: capture raw -> process (GPU bin + TIFF + preview)
         await controller.arm_capture(1)
         assert await controller.capture_frames_raw(1, slot_key="snapshot") == 1

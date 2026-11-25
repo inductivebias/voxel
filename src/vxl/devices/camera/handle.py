@@ -213,14 +213,15 @@ class CameraHandle(DeviceHandle[Camera]):
         metadata: dict[str, Any] | None = None,
     ) -> SnapshotFrameInfo:
         """Process a buffered raw snapshot frame, optionally save as TIFF, and emit preview."""
-        result = await self.call(
-            "process_snapshot",
-            slot_key=slot_key,
-            save_path=save_path,
-            pixel_size_um=pixel_size_um,
-            metadata=metadata,
+        return SnapshotFrameInfo.model_validate(
+            await self.call(
+                "process_snapshot",
+                slot_key=slot_key,
+                save_path=save_path,
+                pixel_size_um=pixel_size_um,
+                metadata=metadata,
+            )
         )
-        return SnapshotFrameInfo.model_validate(result)
 
     async def analyze_snr_buffer(
         self,
@@ -234,15 +235,16 @@ class CameraHandle(DeviceHandle[Camera]):
         """Analyze buffered signal + dark frames and return stationary SNR + photobleaching metrics."""
         from vxl.instrument.snr import CameraSnrAnalysis  # noqa: PLC0415
 
-        result = await self.call(
-            "analyze_snr_buffer",
-            output_dir=output_dir,
-            channel_id=channel_id,
-            profile_id=profile_id,
-            pixel_size_um=pixel_size_um,
-            exposure_ms=exposure_ms,
+        return CameraSnrAnalysis.model_validate(
+            await self.call(
+                "analyze_snr_buffer",
+                output_dir=output_dir,
+                channel_id=channel_id,
+                profile_id=profile_id,
+                pixel_size_um=pixel_size_um,
+                exposure_ms=exposure_ms,
+            )
         )
-        return CameraSnrAnalysis.model_validate(result)
 
     @staticmethod
     def _parse_vec2d(value: object) -> Vec2D:
