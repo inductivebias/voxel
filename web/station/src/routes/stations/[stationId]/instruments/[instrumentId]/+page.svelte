@@ -9,7 +9,6 @@
     type AcquisitionStatus,
     type AcquisitionTask,
     type Compression,
-    type CompressionShuffle,
     createAreaTask,
     createLineTask,
     createPositionTask,
@@ -17,7 +16,6 @@
     type DownscaleType,
     type Instrument,
     isLoaded,
-    type LossyDomain,
     type PlannedVolume,
     planningFov,
     type ScaleLevel,
@@ -48,10 +46,6 @@
   const TASK_ROUTE = '/stations/[stationId]/instruments/[instrumentId]/(open)/run/[taskId]';
   const LOCAL_STORE = '__local__';
   const COMPRESSIONS: Compression[] = ['blosc.lz4', 'blosc.zstd', 'zstd', 'lz4', 'gzip', 'none'];
-  const COMPRESSION_LEVELS = ['default', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9'] as const;
-  const SHUFFLE_MODES: readonly ('default' | CompressionShuffle)[] = ['default', 'bitshuffle', 'shuffle', 'noshuffle'];
-  const KEEP_BITS_OPTIONS = ['all', ...Array.from({ length: 16 }, (_, i) => String(16 - i))] as const;
-  const LOSSY_DOMAINS: LossyDomain[] = ['sqrt', 'linear', 'none'];
   const DOWNSCALE_TYPES: DownscaleType[] = ['gaussian', 'mean', 'min', 'max'];
   const PYRAMID_LEVELS: ScaleLevel[] = [0, 1, 2, 3, 4, 5, 6, 7];
   const TASK_TYPES: Record<XYDefinition['mode'], string> = {
@@ -682,93 +676,6 @@
                 size="sm"
               />
             </Field>
-            <Field label="Compression level">
-              <Select
-                value={output.compression_level == null ? 'default' : String(output.compression_level)}
-                options={[...COMPRESSION_LEVELS]}
-                formatLabel={(v) => (v === 'default' ? 'Default (3)' : v)}
-                onChange={(v) =>
-                  reportFailure(instrument.updateOutput({ compression_level: v === 'default' ? null : Number(v) }))}
-              />
-            </Field>
-            <Field label="Shuffle">
-              <Select
-                value={output.compression_shuffle ?? 'default'}
-                options={[...SHUFFLE_MODES]}
-                formatLabel={(v) => (v === 'default' ? 'Default (bitshuffle)' : v)}
-                onChange={(v) =>
-                  reportFailure(
-                    instrument.updateOutput({
-                      compression_shuffle: v === 'default' ? null : (v as CompressionShuffle)
-                    })
-                  )}
-              />
-            </Field>
-            <Field label="Keep bits">
-              <Select
-                value={output.keep_bits == null ? 'all' : String(output.keep_bits)}
-                options={[...KEEP_BITS_OPTIONS]}
-                formatLabel={(v) => (v === 'all' ? 'All (lossless)' : `${v} bits`)}
-                onChange={(v) => reportFailure(instrument.updateOutput({ keep_bits: v === 'all' ? null : Number(v) }))}
-              />
-            </Field>
-            <Field label="Dark floor">
-              <SpinBox
-                value={output.dark_floor}
-                onChange={(value) => instrument.updateOutput({ dark_floor: Math.max(0, Math.round(value)) })}
-                onEditStart={() => instrument.edits.hold()}
-                min={0}
-                step={10}
-                bigStep={50}
-                decimals={0}
-                size="sm"
-              />
-            </Field>
-            <Field label="Lossy step (σ)">
-              <SpinBox
-                value={output.lossy_step_noise ?? 0}
-                onChange={(value) => instrument.updateOutput({ lossy_step_noise: value <= 0 ? null : value })}
-                onEditStart={() => instrument.edits.hold()}
-                min={0}
-                max={10}
-                step={0.25}
-                bigStep={0.5}
-                decimals={2}
-                size="sm"
-              />
-            </Field>
-            <Field label="Lossy domain">
-              <Select
-                value={output.lossy_domain ?? 'sqrt'}
-                options={LOSSY_DOMAINS}
-                formatLabel={(v) => (v === 'sqrt' ? 'Sqrt (Anscombe)' : v === 'linear' ? 'Linear' : 'None')}
-                onChange={(lossy_domain) => reportFailure(instrument.updateOutput({ lossy_domain }))}
-              />
-            </Field>
-            <Field label="Noise σ override">
-              <SpinBox
-                value={output.noise_sigma ?? 0}
-                onChange={(value) => instrument.updateOutput({ noise_sigma: value <= 0 ? null : value })}
-                onEditStart={() => instrument.edits.hold()}
-                min={0}
-                step={0.1}
-                bigStep={1}
-                decimals={2}
-                size="sm"
-              />
-            </Field>
-            <Field label="Skip empty chunks">
-              <Checkbox
-                value={output.skip_empty_chunks}
-                onChange={(skip_empty_chunks) => reportFailure(instrument.updateOutput({ skip_empty_chunks }))}
-              />
-            </Field>
-            <Field label="GPU writer">
-              <Checkbox
-                value={Boolean(output.use_gpu)}
-                onChange={(use_gpu) => reportFailure(instrument.updateOutput({ use_gpu }))}
-              />
-            </Field>
           </fieldset>
         </CollapsibleSection>
       </Section>
@@ -807,17 +714,6 @@
             <dd>{taskAndProfile(manifest, volume)}</dd>
             <dt>Frames</dt>
             <dd class="font-mono tabular-nums">{active.frames_captured} / {framesTotal}</dd>
-            {#if active.raw_gb_s != null}
-              <dt>Throughput</dt>
-              <dd class="font-mono tabular-nums">
-                {#if active.compressed_gb_s != null}
-                  {active.raw_gb_s.toFixed(2)} → {active.compressed_gb_s.toFixed(2)} GB/s{#if active.compressed_gb_s > 0}
-                    {' '}({(active.raw_gb_s / active.compressed_gb_s).toFixed(1)}×){/if}
-                {:else}
-                  {active.raw_gb_s.toFixed(2)} GB/s raw
-                {/if}
-              </dd>
-            {/if}
             <dt>Position</dt>
             <dd class="font-mono tabular-nums">
               {stage.qualifiedLabel('x')}
