@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-import numba
 import numpy as np
 from cloudpathlib import S3Path
 from numba import cuda
@@ -20,7 +19,6 @@ from ome_zarr_writer.dataset import (
     BloscCodec,
     BytesCodec,
     CRC32CCodec,
-    GzipCodec,
     ShardingIndexedCodec,
     Zarr3ArrayMeta,
     ZstdCodec,
@@ -131,41 +129,6 @@ def _find_nonempty_chunks_kernel(
             return
 
 
-@cuda.jit(device=True)
-def _pack_bitshuffle_group(
-    d_slab_u8: Any,
-    slab_z0: int,
-    shard_z0: int,
-    shard_y0: int,
-    shard_x0: int,
-    iz: int,
-    iy: int,
-    ix: int,
-    cz: int,
-    cy: int,
-    cx: int,
-    v_idx: int,
-    sub_idx: int,
-    g: int,
-    n_groups: int,
-    typesize: int,
-    d_sub_blocks: Any,
-) -> None:
-    planes = cuda.local.array(8, numba.uint8)  # type: ignore[misc]
-    for k in range(typesize):
-        for bit in range(8):
-            planes[bit] = np.uint8(0)
-        for lane in range(8):
-            val = _read_slab_byte(
-                d_slab_u8, slab_z0, shard_z0, shard_y0, shard_x0, iz, iy, ix, cz, cy, cx, v_idx + lane, k
-            )
-            for bit in range(8):
-                planes[bit] |= np.uint8(((val >> bit) & 1) << lane)
-        plane_base = k * 8 * n_groups + g
-        for bit in range(8):
-            d_sub_blocks[sub_idx, plane_base + bit * n_groups] = planes[bit]
-
-
 @cuda.jit
 def _gather_inner_chunks_kernel(
     d_slab_u8: Any,
@@ -192,15 +155,6 @@ def _gather_inner_chunks_kernel(
     elem_in_b = v_idx - b * elems_per_block
     sub_idx = a_idx * blocks_per_chunk + b
 
-    if shuffle_flag == 0x04 and typesize > 1:
-        n_groups = elems_per_block // 8
-        if elem_in_b < n_groups * 8:
-            if (elem_in_b & 7) == 0:
-                _pack_bitshuffle_group(
-                    d_slab_u8, slab_z0, shard_z0, shard_y0, shard_x0, iz, iy, ix, cz, cy, cx,
-                    v_idx, sub_idx, elem_in_b >> 3, n_groups, typesize, d_sub_blocks,
-                )
-            return
     for k in range(typesize):
         val = _read_slab_byte(d_slab_u8, slab_z0, shard_z0, shard_y0, shard_x0, iz, iy, ix, cz, cy, cx, v_idx, k)
         dst = k * elems_per_block + elem_in_b if (shuffle_flag == 0x01 and typesize > 1) else elem_in_b * typesize + k
@@ -223,24 +177,17 @@ def _write_blosc_header(
 
 @cuda.jit(device=True)
 def _unshuffle_sub_block(
-    d_sub_blocks: Any, sub_idx: int, d_shard_out: Any, raw_base: int, blocksize: int,
-    shuffle_flag: int, typesize: int, tid: int, stride: int,
+    d_sub_blocks: Any,
+    sub_idx: int,
+    d_shard_out: Any,
+    raw_base: int,
+    blocksize: int,
+    shuffle_flag: int,
+    typesize: int,
+    tid: int,
+    stride: int,
 ) -> None:
-    if shuffle_flag == 0x04 and typesize > 1:
-        elems_per_block = blocksize // typesize
-        n_groups = elems_per_block // 8
-        for e in range(tid, elems_per_block, stride):
-            if e < n_groups * 8:
-                g, lane = e >> 3, e & 7
-                for k in range(typesize):
-                    out_b = np.uint8(0)
-                    for bit in range(8):
-                        out_b |= np.uint8(((d_sub_blocks[sub_idx, (k * 8 + bit) * n_groups + g] >> lane) & 1) << bit)
-                    d_shard_out[raw_base + e * typesize + k] = out_b
-            else:
-                for k in range(typesize):
-                    d_shard_out[raw_base + e * typesize + k] = d_sub_blocks[sub_idx, e * typesize + k]
-    elif shuffle_flag != 0 and typesize > 1:
+    if shuffle_flag != 0 and typesize > 1:
         elems_per_block = blocksize // typesize
         for e in range(tid, elems_per_block, stride):
             for k in range(typesize):
@@ -278,8 +225,15 @@ def _pack_blosc_shard_kernel(
         if b == 0 and tid == 0:
             _write_blosc_header(d_shard_out, base, flag_fmt | 0x02, typesize, chunk_nbytes, blocksize, int(ctbytes))
         _unshuffle_sub_block(
-            d_sub_blocks, c * blocks_per_chunk + b, d_shard_out, base + 16 + b * blocksize,
-            blocksize, shuffle_flag, typesize, tid, stride,
+            d_sub_blocks,
+            c * blocks_per_chunk + b,
+            d_shard_out,
+            base + 16 + b * blocksize,
+            blocksize,
+            shuffle_flag,
+            typesize,
+            tid,
+            stride,
         )
         return
 
@@ -338,8 +292,6 @@ def _parse_inner_codecs(codecs: list[Any], typesize: int) -> tuple[str, str, int
                 raise ValueError(f"Unsupported BytesCodec endianness for GPUArrayWriter: {inner.configuration.endian}")
         elif isinstance(inner, ZstdCodec) and codec_kind == "none":
             codec_kind, nvcomp_alg = "zstd", "zstd"
-        elif isinstance(inner, GzipCodec) and codec_kind == "none":
-            codec_kind, nvcomp_alg = "gzip", "gzip"
         elif isinstance(inner, BloscCodec) and codec_kind == "none":
             codec_kind = "blosc"
             cname = inner.configuration.cname
@@ -349,8 +301,11 @@ def _parse_inner_codecs(codecs: list[Any], typesize: int) -> tuple[str, str, int
                 nvcomp_alg, blosc_flag_fmt = "zstd", 0x80
             else:
                 raise ValueError(f"Unsupported Blosc cname for GPUArrayWriter: {cname}")
-            if typesize > 1:
-                shuffle_flag = {"bitshuffle": 0x04, "shuffle": 0x01}.get(inner.configuration.shuffle, 0)
+            shuffle = inner.configuration.shuffle
+            if shuffle not in ("noshuffle", "shuffle"):
+                raise ValueError(f"Unsupported Blosc shuffle for GPUArrayWriter: {shuffle}")
+            if typesize > 1 and shuffle == "shuffle":
+                shuffle_flag = 0x01
         else:
             raise ValueError(f"Unsupported inner codec for GPUArrayWriter: {inner}")
     return codec_kind, nvcomp_alg, blosc_flag_fmt, shuffle_flag
@@ -378,8 +333,15 @@ def _parse_array_meta(meta: Zarr3ArrayMeta) -> _ParsedShardSpec:
     )
     cz, cy, cx = (int(x) for x in sharding.configuration.chunk_shape[1:])
     return _ParsedShardSpec(
-        (vz, vy, vx), (sz, sy, sx), (cz, cy, cx), int(dtype.itemsize), dtype,
-        codec_kind, nvcomp_alg, blosc_flag_fmt, shuffle_flag,
+        (vz, vy, vx),
+        (sz, sy, sx),
+        (cz, cy, cx),
+        int(dtype.itemsize),
+        dtype,
+        codec_kind,
+        nvcomp_alg,
+        blosc_flag_fmt,
+        shuffle_flag,
     )
 
 
@@ -479,9 +441,7 @@ class _GpuShardEncoder:
         self.max_comp_size = self.blocksize
         self._in_slices: list[_CudaSlice1D] = []
         self._out_slices: list[_CudaSlice1D] = []
-        self._in_views_cache: dict[int, Any] = {}
-        self._out_views_cache: dict[int, Any] = {}
-        self._comp_cfg_cache: dict[int, Any] = {}
+        self._batch_cache: dict[int, tuple[Any, Any, Any]] = {}
 
         if self.codec is not None:
             self._ensure_sub_buffer()
@@ -489,7 +449,6 @@ class _GpuShardEncoder:
         per_chunk_max = max(self.chunk_nbytes + 64 + 8 * self.blocks_per_chunk, self.max_comp_size)
         self.max_shard_payload = self.max_chunks * per_chunk_max
         self._min_pinned_bytes = self.max_shard_payload + self.max_chunks * 16 + 4
-        self.h_pinned = _ARENA.get_pinned_pair(self._min_pinned_bytes)
         self._slot_idx = 0
         self.ensure_device_buffers()
 
@@ -504,14 +463,12 @@ class _GpuShardEncoder:
             self._in_slices = [
                 _CudaSlice1D(in_ptr + i * self.blocksize, self.blocksize, d_sub_flat) for i in range(self.max_subs)
             ]
-            self._in_views_cache.clear()
-            self._comp_cfg_cache.clear()
+            self._batch_cache.clear()
 
     def ensure_device_buffers(self) -> None:
         self.h_pinned = _ARENA.get_pinned_pair(self._min_pinned_bytes)
         self._ensure_sub_buffer()
         if self.codec is not None:
-            self.max_comp_size = int(self.codec.get_max_comp_buffer_size(self._nvcomp.as_array(self._in_slices[0])))
             comp_bytes = self.max_subs * self.max_comp_size
             d_comp_flat = _ARENA.get_device("d_comp", comp_bytes)
             out_ptr = int(d_comp_flat.__cuda_array_interface__["data"][0])
@@ -522,7 +479,7 @@ class _GpuShardEncoder:
                     _CudaSlice1D(out_ptr + i * self.max_comp_size, self.max_comp_size, d_comp_flat)
                     for i in range(self.max_subs)
                 ]
-                self._out_views_cache.clear()
+                self._batch_cache.clear()
         self.d_shard_out = _ARENA.get_device("d_shard", self.max_shard_payload)[: self.max_shard_payload]
 
     def release_device_buffers(self) -> None:
@@ -530,9 +487,7 @@ class _GpuShardEncoder:
         self._sub_flat_ptr = self._comp_flat_ptr = 0
         self._in_slices.clear()
         self._out_slices.clear()
-        self._in_views_cache.clear()
-        self._out_views_cache.clear()
-        self._comp_cfg_cache.clear()
+        self._batch_cache.clear()
 
     def warmup(self) -> None:
         self.ensure_device_buffers()
@@ -544,11 +499,13 @@ class _GpuShardEncoder:
         release_shared_encoder_device_buffers()
 
     def _get_batch_views(self, n_subs: int) -> tuple[Any, Any, Any]:
-        if n_subs not in self._in_views_cache:
-            self._in_views_cache[n_subs] = self._nvcomp.as_arrays(self._in_slices[:n_subs])
-            self._out_views_cache[n_subs] = self._nvcomp.as_arrays(self._out_slices[:n_subs])
-            self._comp_cfg_cache[n_subs] = self.codec.compression_config([self.blocksize] * n_subs)
-        return self._in_views_cache[n_subs], self._out_views_cache[n_subs], self._comp_cfg_cache[n_subs]
+        if n_subs not in self._batch_cache:
+            self._batch_cache[n_subs] = (
+                self._nvcomp.as_arrays(self._in_slices[:n_subs]),
+                self._nvcomp.as_arrays(self._out_slices[:n_subs]),
+                self.codec.compression_config([self.blocksize] * n_subs),
+            )
+        return self._batch_cache[n_subs]
 
     def _launch_gather(
         self, d_slab_u8: Any, slab_z0: int, shard_z0: int, shard_y0: int, shard_x0: int, batch_coords: np.ndarray
@@ -558,15 +515,31 @@ class _GpuShardEncoder:
         cz, cy, cx = self.spec.chunk_shape
         self.d_active_coords[:nb].copy_to_device(batch_coords)
         _gather_inner_chunks_kernel[(math.ceil(self.chunk_elems / 256), nb), 256](  # type: ignore[index]
-            d_slab_u8, slab_z0, shard_z0, shard_y0, shard_x0, cz, cy, cx,
-            self.d_active_coords[:nb], self.elems_per_block, self.blocks_per_chunk,
-            self.spec.shuffle_flag, self.d_sub_blocks[:nb_subs],
+            d_slab_u8,
+            slab_z0,
+            shard_z0,
+            shard_y0,
+            shard_x0,
+            cz,
+            cy,
+            cx,
+            self.d_active_coords[:nb],
+            self.elems_per_block,
+            self.blocks_per_chunk,
+            self.spec.shuffle_flag,
+            self.d_sub_blocks[:nb_subs],
         )
         return nb_subs
 
     def _filter_nonempty_chunks(
-        self, d_slab_u8: Any, slab_z0: int, shard_z0: int, shard_y0: int, shard_x0: int,
-        active_coords: np.ndarray, active_ic: np.ndarray,
+        self,
+        d_slab_u8: Any,
+        slab_z0: int,
+        shard_z0: int,
+        shard_y0: int,
+        shard_x0: int,
+        active_coords: np.ndarray,
+        active_ic: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
         n_active = int(active_coords.shape[0])
         if n_active == 0:
@@ -598,8 +571,14 @@ class _GpuShardEncoder:
         return active_coords[keep], active_ic[keep]
 
     def _encode_compressed(
-        self, d_slab_u8: Any, slab_z0: int, shard_z0: int, shard_y0: int, shard_x0: int,
-        active_coords: np.ndarray, host_buf: Any,
+        self,
+        d_slab_u8: Any,
+        slab_z0: int,
+        shard_z0: int,
+        shard_y0: int,
+        shard_x0: int,
+        active_coords: np.ndarray,
+        host_buf: Any,
     ) -> tuple[int, np.ndarray, np.ndarray]:
         n_active = int(active_coords.shape[0])
         all_offsets = np.zeros(n_active, dtype=np.int64)
@@ -619,9 +598,16 @@ class _GpuShardEncoder:
                 offsets_i64, cur_offset = _prefix_offsets(ctbytes, cur_offset)
                 _pack_blosc_shard_kernel[(self.blocks_per_chunk, nb), 256](  # type: ignore[index]
                     self.d_comp_out[:nb_subs].reshape(nb, self.blocks_per_chunk, self.max_comp_size),
-                    cuda.to_device(sizes), self.d_sub_blocks[:nb_subs], cuda.to_device(offsets_i64),
-                    cuda.to_device(ctbytes), self.spec.blosc_flag_fmt, self.spec.shuffle_flag,
-                    self.spec.typesize, self.chunk_nbytes, self.blocksize, self.d_shard_out,
+                    cuda.to_device(sizes),
+                    self.d_sub_blocks[:nb_subs],
+                    cuda.to_device(offsets_i64),
+                    cuda.to_device(ctbytes),
+                    self.spec.blosc_flag_fmt,
+                    self.spec.shuffle_flag,
+                    self.spec.typesize,
+                    self.chunk_nbytes,
+                    self.blocksize,
+                    self.d_shard_out,
                 )
             else:
                 sizes_1d = np.asarray(res.buffer_sizes, dtype=np.int32)
@@ -637,8 +623,16 @@ class _GpuShardEncoder:
         return cur_offset, all_offsets.astype(np.uint64), all_ctbytes.astype(np.uint64)
 
     def encode_shard_to_host(
-        self, d_slab_u8: Any, slab_z0: int, shard_z0: int, shard_y0: int, shard_x0: int,
-        active_coords: np.ndarray, active_ic: np.ndarray, *, skip_empty_chunks: bool = False,
+        self,
+        d_slab_u8: Any,
+        slab_z0: int,
+        shard_z0: int,
+        shard_y0: int,
+        shard_x0: int,
+        active_coords: np.ndarray,
+        active_ic: np.ndarray,
+        *,
+        skip_empty_chunks: bool = False,
     ) -> memoryview:
         self.ensure_device_buffers()
         if skip_empty_chunks:
@@ -689,8 +683,18 @@ def _write_shard_file(path: Path, data: memoryview) -> None:
 
 
 def _active_shard_chunks(
-    shard_z0: int, shard_y0: int, shard_x0: int, z_end: int, vy: int, vx: int,
-    cz: int, cy: int, cx: int, nc_z: int, nc_y: int, nc_x: int,
+    shard_z0: int,
+    shard_y0: int,
+    shard_x0: int,
+    z_end: int,
+    vy: int,
+    vx: int,
+    cz: int,
+    cy: int,
+    cx: int,
+    nc_z: int,
+    nc_y: int,
+    nc_x: int,
 ) -> tuple[np.ndarray, np.ndarray] | None:
     nz = min(nc_z, max(0, math.ceil((z_end - shard_z0) / cz)))
     ny = min(nc_y, max(0, math.ceil((vy - shard_y0) / cy)))
@@ -771,14 +775,30 @@ class GPUArrayWriter(ArrayWriter):
                 for sy_idx in range(math.ceil(vy / sy)):
                     for sx_idx in range(math.ceil(vx / sx)):
                         active = _active_shard_chunks(
-                            shard_z0, sy_idx * sy, sx_idx * sx, z_end, vy, vx,
-                            cz, cy, cx, encoder.nc_z, encoder.nc_y, encoder.nc_x,
+                            shard_z0,
+                            sy_idx * sy,
+                            sx_idx * sx,
+                            z_end,
+                            vy,
+                            vx,
+                            cz,
+                            cy,
+                            cx,
+                            encoder.nc_z,
+                            encoder.nc_y,
+                            encoder.nc_x,
                         )
                         if active is None:
                             continue
                         shard_view = encoder.encode_shard_to_host(
-                            d_slab_u8, z_offset, shard_z0, sy_idx * sy, sx_idx * sx,
-                            active[0], active[1], skip_empty_chunks=self.skip_empty_chunks,
+                            d_slab_u8,
+                            z_offset,
+                            shard_z0,
+                            sy_idx * sy,
+                            sx_idx * sx,
+                            active[0],
+                            active[1],
+                            skip_empty_chunks=self.skip_empty_chunks,
                         )
                         if len(shard_view) == 0:
                             continue
@@ -798,9 +818,7 @@ class GPUArrayWriter(ArrayWriter):
                 pending.cancel()
             raise
 
-    def write_slice_gpu(
-        self, c: int, z_offset: int, d_slab: Any, *, host_fallback: np.ndarray | None = None
-    ) -> int:
+    def write_slice_gpu(self, c: int, z_offset: int, d_slab: Any, *, host_fallback: np.ndarray | None = None) -> int:
         """Write a GPU-resident 3D slab ``(slab_z, vy, vx)`` at channel ``c`` and ``z_offset``."""
         self.last_written_bytes = 0
         if self._target is None:
