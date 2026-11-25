@@ -617,10 +617,7 @@ async def run_snr_diagnostics(
         dark_frames=req.dark_frames,
         report_url_for=lambda report_id: (
             request.url_for(
-                "get_snr_report_html",
-                station_id=station_id,
-                session_id=session_id,
-                report_id=report_id,
+                "get_snr_report_html", station_id=station_id, session_id=session_id, report_id=report_id
             ).path
         ),
     )
@@ -629,8 +626,7 @@ async def run_snr_diagnostics(
 @instrument_router.get("/diagnostics/reports/{report_id}", response_class=HTMLResponse)
 async def get_snr_report_html(report_id: str, instrument: InstrumentDep) -> HTMLResponse:
     try:
-        content = await asyncio.to_thread(instrument.get_snr_report_html, report_id)
-        return HTMLResponse(content=content)
+        return HTMLResponse(content=await asyncio.to_thread(instrument.get_snr_report_html, report_id))
     except FileNotFoundError as error:
         raise HTTPException(status_code=404, detail=str(error)) from error
 

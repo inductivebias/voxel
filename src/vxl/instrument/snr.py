@@ -158,20 +158,16 @@ class _BleachMetrics:
 
 
 def _stack_temporal_stats(
-    stack: np.ndarray,
-    *,
-    quartiles: bool = False,
+    stack: np.ndarray, *, quartiles: bool = False
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute per-pixel mean, raw std, detrended std, and optional quartile means in one streaming pass."""
     n, h, w = int(stack.shape[0]), int(stack.shape[1]), int(stack.shape[2])
     mean = np.zeros((h, w), dtype=np.float32)
-    m2 = np.zeros((h, w), dtype=np.float32)
-    diff_sq = np.zeros((h, w), dtype=np.float32)
+    m2, diff_sq = np.zeros_like(mean), np.zeros_like(mean)
     q = max(1, n // 4)
-    first_q = np.zeros((h, w), dtype=np.float32) if quartiles else np.empty(0, dtype=np.float32)
-    last_q = np.zeros((h, w), dtype=np.float32) if quartiles else np.empty(0, dtype=np.float32)
-    delta = np.empty((h, w), dtype=np.float32)
-    tmp = np.empty((h, w), dtype=np.float32)
+    first_q = np.zeros_like(mean) if quartiles else np.empty(0, dtype=np.float32)
+    last_q = np.zeros_like(mean) if quartiles else np.empty(0, dtype=np.float32)
+    delta, tmp = np.empty_like(mean), np.empty_like(mean)
     prev: np.ndarray | None = None
 
     for t in range(n):
@@ -194,26 +190,26 @@ def _stack_temporal_stats(
         prev = frame
 
     if n >= 2:
-        std_raw = np.sqrt(m2 / np.float32(n - 1))
-        std_detrended = np.sqrt(diff_sq * np.float32(0.5 / (n - 1)))
-    else:
-        std_raw = np.zeros((h, w), dtype=np.float32)
-        std_detrended = np.zeros((h, w), dtype=np.float32)
+        m2 /= np.float32(n - 1)
+        np.sqrt(m2, out=m2)
+        diff_sq *= np.float32(0.5 / (n - 1))
+        np.sqrt(diff_sq, out=diff_sq)
     if quartiles:
         first_q /= np.float32(q)
         last_q /= np.float32(q)
-    return mean, std_raw, std_detrended, first_q, last_q
+    return mean, m2, diff_sq, first_q, last_q
 
 
 def _downsample_2d(arr: np.ndarray, *, max_width: int = 720, nearest: bool = False) -> np.ndarray:
     h, w = arr.shape[:2]
-    if w > max_width > 0:
-        dsize = (max_width, max(1, round(h * (max_width / w))))
-        if arr.dtype == np.bool_:
-            return cv2.resize(arr.astype(np.uint8), dsize, interpolation=cv2.INTER_NEAREST).astype(bool)
-        interp = cv2.INTER_NEAREST if nearest else cv2.INTER_AREA
-        return cv2.resize(arr.astype(np.float32, copy=False), dsize, interpolation=interp)
-    return arr
+    if w <= max_width or max_width <= 0:
+        return arr
+    dsize = (max_width, max(1, round(h * (max_width / w))))
+    if arr.dtype == np.bool_:
+        return cv2.resize(arr.astype(np.uint8), dsize, interpolation=cv2.INTER_NEAREST).astype(bool)
+    return cv2.resize(
+        arr.astype(np.float32, copy=False), dsize, interpolation=cv2.INTER_NEAREST if nearest else cv2.INTER_AREA
+    )
 
 
 def _encode_png(bgr: np.ndarray) -> str:
@@ -222,12 +218,7 @@ def _encode_png(bgr: np.ndarray) -> str:
 
 
 def _normalize_u8(
-    arr: np.ndarray,
-    *,
-    vmin: float | None = None,
-    vmax: float | None = None,
-    scale: float = 255.0,
-    offset: float = 0.0,
+    arr: np.ndarray, *, vmin: float | None = None, vmax: float | None = None, scale: float = 255.0, offset: float = 0.0
 ) -> np.ndarray:
     clean = np.nan_to_num(_downsample_2d(arr).astype(np.float32, copy=False), nan=0.0, posinf=0.0, neginf=0.0)
     if vmin is None and vmax is None:
@@ -240,20 +231,13 @@ def _normalize_u8(
 
 
 def _render_heatmap_png(
-    arr: np.ndarray,
-    *,
-    vmin: float | None = None,
-    vmax: float | None = None,
-    colormap: int = cv2.COLORMAP_INFERNO,
+    arr: np.ndarray, *, vmin: float | None = None, vmax: float | None = None, colormap: int = cv2.COLORMAP_INFERNO
 ) -> str:
     return _encode_png(cv2.applyColorMap(_normalize_u8(arr, vmin=vmin, vmax=vmax, offset=0.5), colormap))
 
 
 def _render_masks_overlay_png(
-    mean_img: np.ndarray,
-    fg_mask: np.ndarray,
-    bg_mask: np.ndarray,
-    sharp_mask: np.ndarray,
+    mean_img: np.ndarray, fg_mask: np.ndarray, bg_mask: np.ndarray, sharp_mask: np.ndarray
 ) -> str:
     fg_s, bg_s, sharp_s = (_downsample_2d(m, nearest=True) for m in (fg_mask, bg_mask, sharp_mask))
     bgr = cv2.cvtColor(_normalize_u8(mean_img, scale=200.0), cv2.COLOR_GRAY2BGR)
@@ -267,43 +251,28 @@ def _render_masks_overlay_png(
 
 
 def _dark_stats(
-    mean_proj: np.ndarray,
-    std_detrended: np.ndarray,
-    dark_frames: np.ndarray | None,
-    p1_all: float,
-    p5_all: float,
+    mean_proj: np.ndarray, std_detrended: np.ndarray, dark_frames: np.ndarray | None, p1_all: float, p5_all: float
 ) -> tuple[int, float, float, np.ndarray]:
-    if dark_frames is not None:
-        d_arr = np.asarray(dark_frames)
-        if d_arr.ndim == 3 and d_arr.shape[0] >= 1:
-            dark_mean, _, read_map, _, _ = _stack_temporal_stats(d_arr)
-            sig_mean = mean_proj - dark_mean
-            np.maximum(sig_mean, np.float32(0.0), out=sig_mean)
-            return int(d_arr.shape[0]), float(np.median(dark_mean)), float(np.median(read_map)), sig_mean
+    if dark_frames is not None and (d_arr := np.asarray(dark_frames)).ndim == 3 and d_arr.shape[0] >= 1:
+        dark_mean, _, read_map, _, _ = _stack_temporal_stats(d_arr)
+        sig_mean = np.maximum(mean_proj - dark_mean, np.float32(0.0))
+        return int(d_arr.shape[0]), float(np.median(dark_mean)), float(np.median(read_map)), sig_mean
     bg_floor = mean_proj <= p5_all
     read_noise = float(np.median(std_detrended[bg_floor])) if np.any(bg_floor) else 1.0
-    sig_mean = mean_proj - np.float32(p1_all)
-    np.maximum(sig_mean, np.float32(0.0), out=sig_mean)
-    return 0, p1_all, read_noise, sig_mean
+    return 0, p1_all, read_noise, np.maximum(mean_proj - np.float32(p1_all), np.float32(0.0))
 
 
 def _segment_masks(
-    mean_proj: np.ndarray,
-    dark_offset: float,
-    read_noise: float,
-    p05: float,
-    p25: float,
-    p50: float,
-    p998: float,
+    mean_proj: np.ndarray, dark_offset: float, read_noise: float, p05: float, p25: float, p50: float, p998: float
 ) -> tuple[float, np.ndarray, np.ndarray]:
     span = max(1.0, p998 - p05)
     norm_u8 = np.clip((mean_proj - p05) * (255.0 / span), 0.0, 255.0).astype(np.uint8)
-    if norm_u8.min() == norm_u8.max():
-        otsu_u8 = 128.0
-    else:
-        otsu_u8, _ = cv2.threshold(norm_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU, dst=norm_u8)
+    otsu_u8 = (
+        128.0
+        if norm_u8.min() == norm_u8.max()
+        else cv2.threshold(norm_u8, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU, dst=norm_u8)[0]
+    )
     otsu_thresh = max(p05 + (otsu_u8 / 255.0) * span, dark_offset + 4.0 * read_noise)
-
     fg_mask = mean_proj > otsu_thresh
     if not np.any(fg_mask):
         fg_mask = mean_proj >= p50
@@ -360,18 +329,18 @@ def _compute_bleaching(
         0.0,
     ).astype(np.float32)
     return _BleachMetrics(
-        initial_fg=initial_fg,
-        final_fg=final_fg,
-        total_pct=total_pct,
-        rate_per_frame_pct=rate_pct,
-        half_life_frames=half_frames,
-        half_life_s=half_s,
-        fit_r2=fit_r2,
-        fg_mean_trace=fg_mean,
-        fg_p95_trace=fg_p95,
-        bg_mean_trace=bg_mean,
-        fit_trace=fit_trace,
-        map_pct=bleach_map,
+        initial_fg,
+        final_fg,
+        total_pct,
+        rate_pct,
+        half_frames,
+        half_s,
+        fit_r2,
+        fg_mean,
+        fg_p95,
+        bg_mean,
+        fit_trace,
+        bleach_map,
     )
 
 
@@ -414,23 +383,14 @@ def _compute_sharpness(
 
 
 def _compute_ptc(
-    mean_proj: np.ndarray,
-    sig_mean: np.ndarray,
-    std_detrended: np.ndarray,
-    std_raw: np.ndarray,
-    max_code: float,
+    mean_proj: np.ndarray, sig_mean: np.ndarray, std_detrended: np.ndarray, std_raw: np.ndarray, max_code: float
 ) -> tuple[list[PtcPoint], float | None]:
     valid_px = (sig_mean > 1.0) & (mean_proj < 0.98 * max_code)
     if np.count_nonzero(valid_px) < 128:
         return [], None
-    s_vals = sig_mean[valid_px]
-    sd_v = std_detrended[valid_px]
-    sr_v = std_raw[valid_px]
+    s_vals, sd_v, sr_v = sig_mean[valid_px], std_detrended[valid_px], std_raw[valid_px]
     order = np.argsort(s_vals)
-    s_sorted = s_vals[order]
-    vd_sorted = (sd_v * sd_v)[order]
-    vr_sorted = (sr_v * sr_v)[order]
-
+    s_sorted, vd_sorted, vr_sorted = s_vals[order], (sd_v * sd_v)[order], (sr_v * sr_v)[order]
     edges = np.unique(np.percentile(s_sorted, np.linspace(2.0, 98.0, 21)))
     if len(edges) < 2:
         return [], None
@@ -439,15 +399,13 @@ def _compute_ptc(
     ends[-1] = int(np.searchsorted(s_sorted, edges[-1], side="right"))
 
     points: list[PtcPoint] = []
-    for idx in range(len(edges) - 1):
-        lo_i, hi_i = int(starts[idx]), int(ends[idx])
+    for lo_i, hi_i in zip(starts.tolist(), ends.tolist(), strict=True):
         cnt = hi_i - lo_i
         if cnt < 16:
             continue
         mid = lo_i + cnt // 2
         m_adu = float(s_sorted[mid]) if cnt % 2 else float(0.5 * (s_sorted[mid - 1] + s_sorted[mid]))
-        v_det = float(np.median(vd_sorted[lo_i:hi_i]))
-        v_raw = float(np.median(vr_sorted[lo_i:hi_i]))
+        v_det, v_raw = float(np.median(vd_sorted[lo_i:hi_i])), float(np.median(vr_sorted[lo_i:hi_i]))
         points.append(
             PtcPoint(
                 mean_adu=round(m_adu, 2),
@@ -558,14 +516,13 @@ def compute_camera_snr_diagnostics(
             ("snr_corrected", "snr_bleach_corrected", snr_corr_map, "snr_bleaching_corrected"),
             ("bleach_pct_map", "bleach_pct_map", bleach.map_pct, "photobleaching_pct_map"),
         ):
-            saved_tiffs[key] = str(
-                write_tiff_2d(
-                    out_root / f"{camera_id}_{suffix}.tif",
-                    arr,
-                    pixel_size_um=pixel_size_um,
-                    metadata={**meta_common, "projection": proj_name},
-                )
+            p = write_tiff_2d(
+                out_root / f"{camera_id}_{suffix}.tif",
+                arr,
+                pixel_size_um=pixel_size_um,
+                metadata={**meta_common, "projection": proj_name},
             )
+            saved_tiffs[key] = str(p)
 
     bleach_vmax = max(5.0, float(np.percentile(bleach.map_pct[fg_mask], 98.0)) if np.any(fg_mask) else 10.0)
     previews = {
@@ -660,14 +617,12 @@ def _svg_frame(
     body: str,
     x_label: str,
     y_label: str,
-    *,
     x_range: tuple[float, float],
     x_fmt: str = ".0f",
 ) -> str:
     pad_l, pad_r, pad_t, pad_b = pad
     pw, ph = width - pad_l - pad_r, height - pad_t - pad_b
-    ymid = pad_t + ph / 2
-    xmin, xmax = x_range
+    ymid, (xmin, xmax) = pad_t + ph / 2, x_range
     ticks = "".join(
         f'<text x="{pad_l + (k / 4.0) * pw:.1f}" y="{height - 17}" text-anchor="middle" fill="#a1a1aa"'
         f' font-size="10">{xmin + (xmax - xmin) * (k / 4.0):{x_fmt}}</text>'
@@ -677,8 +632,7 @@ def _svg_frame(
         f'<svg viewBox="0 0 {width} {height}" class="chart-svg">'
         f'<line x1="{pad_l}" y1="{pad_t}" x2="{pad_l}" y2="{pad_t + ph}" stroke="#52525b" />'
         f'<line x1="{pad_l}" y1="{pad_t + ph}" x2="{width - pad_r}" y2="{pad_t + ph}" stroke="#52525b" />'
-        f"{body}{ticks}"
-        f'<text x="{pad_l + pw / 2:.1f}" y="{height - 3}" text-anchor="middle" fill="#a1a1aa"'
+        f'{body}{ticks}<text x="{pad_l + pw / 2:.1f}" y="{height - 3}" text-anchor="middle" fill="#a1a1aa"'
         f' font-size="11">{html.escape(x_label)}</text>'
         f'<text x="14" y="{ymid:.1f}" text-anchor="middle" fill="#a1a1aa" font-size="11"'
         f' transform="rotate(-90 14 {ymid:.1f})">{html.escape(y_label)}</text></svg>'
@@ -688,7 +642,6 @@ def _svg_frame(
 def _svg_line_chart(
     x_vals: Sequence[float | int],
     series: Sequence[tuple[str, Sequence[float], str, bool]],
-    *,
     x_label: str,
     y_label: str,
     width: int = 540,
@@ -707,25 +660,17 @@ def _svg_line_chart(
     ymin, ymax = float(min(all_y)), float(max(all_y))
     ymax = ymax if ymax > ymin else ymin + 1.0
     pad_y = 0.08 * (ymax - ymin)
-    ymin = max(0.0, ymin - pad_y) if ymin >= 0 else ymin - pad_y
-    ymax += pad_y
+    ymin, ymax = (max(0.0, ymin - pad_y) if ymin >= 0 else ymin - pad_y), ymax + pad_y
+    sx = lambda x: pad[0] + ((x - xmin) / (xmax - xmin)) * pw  # noqa: E731
+    sy = lambda y: pad[2] + ph - ((y - ymin) / (ymax - ymin)) * ph  # noqa: E731
 
-    def sx(x: float) -> float:
-        return pad[0] + ((x - xmin) / (xmax - xmin)) * pw
-
-    def sy(y: float) -> float:
-        return pad[2] + ph - ((y - ymin) / (ymax - ymin)) * ph
-
-    parts: list[str] = []
-    for i in range(5):
-        gy = ymin + (ymax - ymin) * (i / 4.0)
-        py = sy(gy)
-        parts.append(
-            f'<line x1="{pad[0]}" y1="{py:.1f}" x2="{width - pad[1]}" y2="{py:.1f}"'
-            ' stroke="#27272a" stroke-dasharray="3,3" />'
-            f'<text x="{pad[0] - 6}" y="{py + 4:.1f}" text-anchor="end" fill="#a1a1aa" font-size="10">{gy:.1f}</text>'
-        )
-
+    parts = [
+        f'<line x1="{pad[0]}" y1="{(py := sy(gy)):.1f}" x2="{width - pad[1]}" y2="{py:.1f}"'
+        ' stroke="#27272a" stroke-dasharray="3,3" />'
+        f'<text x="{pad[0] - 6}" y="{py + 4:.1f}" text-anchor="end" fill="#a1a1aa" font-size="10">{gy:.1f}</text>'
+        for i in range(5)
+        for gy in (ymin + (ymax - ymin) * (i / 4.0),)
+    ]
     lx = float(pad[0] + 6)
     for label, ys, color, dashed in series:
         pts = " ".join(f"{sx(float(x)):.1f},{sy(float(y)):.1f}" for x, y in zip(x_vals, ys, strict=False))
@@ -736,14 +681,12 @@ def _svg_line_chart(
             f'<text x="{lx + 20}" y="17" fill="#d4d4d8" font-size="11">{html.escape(label)}</text>'
         )
         lx += 28 + len(label) * 6.5
-
-    return _svg_frame(width, height, pad, "".join(parts), x_label, y_label, x_range=(xmin, xmax), x_fmt=".0f")
+    return _svg_frame(width, height, pad, "".join(parts), x_label, y_label, (xmin, xmax))
 
 
 def _svg_bar_histogram(
     centers: Sequence[float],
     counts: Sequence[int],
-    *,
     color: str,
     x_label: str,
     y_label: str = "Pixels (log10)",
@@ -753,190 +696,205 @@ def _svg_bar_histogram(
     if not centers or not counts:
         return '<div class="empty-chart">No histogram data</div>'
     pad = (52, 16, 18, 38)
-    pw, ph = width - pad[0] - pad[1], height - pad[2] - pad[3]
+    pw, ph, n = width - pad[0] - pad[1], height - pad[2] - pad[3], len(centers)
     log_counts = [math.log10(c + 1) for c in counts]
-    ymax = max(1.0, *log_counts)
-    n = len(centers)
-    bar_w = max(2.0, pw / max(1, n) - 1.5)
+    ymax, bar_w = max(1.0, *log_counts), max(2.0, pw / max(1, n) - 1.5)
     bars = "".join(
         f'<rect x="{pad[0] + (i / max(1, n)) * pw:.1f}" y="{pad[2] + ph - (lc / ymax) * ph:.1f}"'
         f' width="{bar_w:.1f}" height="{(lc / ymax) * ph:.1f}" fill="{color}" opacity="0.82" rx="1" />'
         for i, lc in enumerate(log_counts)
     )
-    return _svg_frame(width, height, pad, bars, x_label, y_label, x_range=(centers[0], centers[-1]), x_fmt=".1f")
-
-
-def _render_table(title: str, rows: Sequence[tuple[str, str]]) -> str:
-    body = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in rows)
-    return (
-        f'<table class="metrics-table"><thead><tr><th colspan="2">{title}</th></tr></thead>'
-        f"<tbody>{body}</tbody></table>"
-    )
+    return _svg_frame(width, height, pad, bars, x_label, y_label, (centers[0], centers[-1]), ".1f")
 
 
 def _render_camera_section(cam_id: str, c: CameraSnrAnalysis, output_dir: Path) -> str:
-    half_life = (
+    b = " &bull; "
+    hl = (
         f"{c.bleach_half_life_frames:.0f} frames ({c.bleach_half_life_exposure_s:.2f} s)"
         if c.bleach_half_life_frames is not None and c.bleach_half_life_exposure_s is not None
         else "Negligible bleaching"
     )
+    hl_esc = html.escape(hl)
     bin_desc = f"HW {c.hardware_binning}x{c.hardware_binning} | GPU {c.gpu_bin_y}x{c.gpu_bin_x} ({c.gpu_pre_filter})"
     gain_str = f"{c.effective_gain_adu_per_e:.3f} ADU/e-" if c.effective_gain_adu_per_e is not None else "N/A"
-    hl_esc = html.escape(half_life)
 
-    def kpi(lbl: str, val: str, sub: str, cls: str = "") -> str:
+    def kpi(lbl: str, val: str, sub: str, *, hi: bool = False) -> str:
+        cls = " highlight" if hi else ""
         return (
             f'<div class="kpi-card{cls}"><span class="kpi-label">{lbl}</span>'
             f'<span class="kpi-val">{val}</span><span class="kpi-sub">{sub}</span></div>'
         )
 
-    def mcard(title: str, tag: str, key: str, cap: str) -> str:
+    def mcard(title: str, tag: str, key: str, *caps: str) -> str:
         return (
             f'<div class="map-card"><div class="map-title">{title} <span class="tag">{tag}</span></div>'
             f'<img src="{c.previews.get(key, "")}" alt="{html.escape(tag)}" />'
-            f'<div class="map-caption">{cap}</div></div>'
+            f'<div class="map-caption">{b.join(caps)}</div></div>'
         )
 
-    snr_c_str = f"{c.snr_fg_mean_corrected:.1f} / {c.snr_fg_p95_corrected:.1f}"
-    kpi_html = (
-        kpi(
-            "Bleach-Corrected SNR (FG Mean / P95)",
-            snr_c_str,
-            f"{c.snr_fg_mean_corrected_db:.1f} dB (Raw: {c.snr_fg_mean_raw:.1f})",
-            " highlight",
-        )
-        + kpi(
-            f"Photobleaching ({c.num_signal_frames} frames)",
-            f"{c.bleach_total_pct:+.2f}%",
-            f"{c.bleach_rate_per_frame_pct:.3f}%/frame &bull; t1/2: {hl_esc}",
-        )
-        + kpi(
-            "Contrast (CNR / SBR)",
-            f"{c.cnr:.1f} / {c.sbr:.2f}x",
-            f"Weber: {c.weber_contrast:.2f} &bull; Michelson: {c.michelson_contrast:.3f}",
-        )
-        + kpi(
-            "Signal P95 / Well Fill",
-            f"{c.signal_p95_fg_adu:.0f} ADU",
-            f"Well Fill P99: {c.well_fill_p99_pct:.1f}% &bull; Sat: {c.saturated_pixel_pct:.3f}%",
-        )
-        + kpi(
-            "Sharpness (Tenengrad)",
-            f"{c.tenengrad_mean_fg:.1f}",
-            f"In-Focus Mask: {c.sharp_in_focus_area_pct:.1f}% of FOV",
-        )
-    )
+    def chart(title: str, svg: str) -> str:
+        return f'<div class="chart-card"><div class="chart-title">{title}</div>{svg}</div>'
 
-    cap_mean = (
-        f"FG Mean: {c.signal_mean_fg_adu:.1f} ADU &bull; BG Mean: {c.background_mean_adu:.1f} ADU"
-        f" &bull; Max: {c.signal_max_adu:.0f} ADU"
-    )
-    cap_noise = (
-        f"Read Floor: {c.read_noise_adu:.2f} ADU &bull; BG Temporal &sigma;: {c.background_noise_temporal_adu:.2f} ADU"
-    )
-    cap_snr = (
-        f"FG Median SNR: {c.snr_fg_median_corrected:.1f} &bull; P95 SNR: {c.snr_fg_p95_corrected:.1f}"
-        f" ({c.snr_fg_mean_corrected_db:.1f} dB)"
-    )
-    cap_bleach = (
-        f"Initial FG: {c.bleach_initial_fg_adu:.1f} ADU &rarr; Final FG: {c.bleach_final_fg_adu:.1f} ADU"
-        f" (R&sup2;={c.bleach_fit_r2:.3f})"
-    )
-    cap_masks = (
-        f'<span style="color:#4ade80">&#9632;</span> Sharp Focus ({c.sharp_in_focus_area_pct:.1f}%) &bull; '
-        f'<span style="color:#38bdf8">&#9632;</span> Foreground ({c.foreground_area_pct:.1f}%) &bull; '
-        f'<span style="color:#94a3b8">&#9632;</span> Background (Otsu={c.otsu_threshold_adu:.0f})'
-    )
-    cap_sharp = (
-        f"Tenengrad P95: {c.tenengrad_p95_fg:.1f} &bull; Laplacian Var: {c.laplacian_variance_fg:.1f}"
-        f" &bull; Brenner: {c.brenner_score_fg:.1f}"
-    )
-    map_html = (
-        mcard("Mean Projection &mu;(y, x)", "Viridis", "mean", cap_mean)
-        + mcard("Bleaching-Detrended Noise &sigma;_detrended(y, x)", "Magma", "std_detrended", cap_noise)
-        + mcard("Bleaching-Corrected Temporal SNR Map", "Inferno", "snr_corrected", cap_snr)
-        + mcard("Spatial Photobleaching Map (% Loss)", "Plasma", "bleach_map", cap_bleach)
-        + mcard("Signal, Background &amp; In-Focus Sharpness Masks", "Overlay", "masks", cap_masks)
-        + mcard("Local Normalized Sharpness Map", "Turbo", "sharpness", cap_sharp)
-    )
+    def tbl(title: str, *rows: tuple[str, str]) -> str:
+        body = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in rows)
+        return (
+            f'<table class="metrics-table"><thead><tr><th colspan="2">{title}</th></tr></thead>'
+            f"<tbody>{body}</tbody></table>"
+        )
 
-    bleach_svg = _svg_line_chart(
-        c.bleach_frame_indices,
-        [
-            ("Foreground Mean (ADU)", c.bleach_fg_mean_trace, "#38bdf8", False),
-            ("Exp Decay Fit", c.bleach_fit_trace, "#f43f5e", True),
-            ("Background Mean", c.bleach_bg_mean_trace, "#a1a1aa", True),
-        ],
-        x_label="Frame Index (Static Sample)",
-        y_label="Dark-Subtracted Intensity (ADU)",
+    kpi_html = "".join(
+        (
+            kpi(
+                "Bleach-Corrected SNR (FG Mean / P95)",
+                f"{c.snr_fg_mean_corrected:.1f} / {c.snr_fg_p95_corrected:.1f}",
+                f"{c.snr_fg_mean_corrected_db:.1f} dB (Raw: {c.snr_fg_mean_raw:.1f})",
+                hi=True,
+            ),
+            kpi(
+                f"Photobleaching ({c.num_signal_frames} frames)",
+                f"{c.bleach_total_pct:+.2f}%",
+                f"{c.bleach_rate_per_frame_pct:.3f}%/frame{b}t1/2: {hl_esc}",
+            ),
+            kpi(
+                "Contrast (CNR / SBR)",
+                f"{c.cnr:.1f} / {c.sbr:.2f}x",
+                f"Weber: {c.weber_contrast:.2f}{b}Michelson: {c.michelson_contrast:.3f}",
+            ),
+            kpi(
+                "Signal P95 / Well Fill",
+                f"{c.signal_p95_fg_adu:.0f} ADU",
+                f"Well Fill P99: {c.well_fill_p99_pct:.1f}%{b}Sat: {c.saturated_pixel_pct:.3f}%",
+            ),
+            kpi(
+                "Sharpness (Tenengrad)",
+                f"{c.tenengrad_mean_fg:.1f}",
+                f"In-Focus Mask: {c.sharp_in_focus_area_pct:.1f}% of FOV",
+            ),
+        )
     )
-    ptc_svg = _svg_line_chart(
-        [p.mean_adu for p in c.ptc_points],
-        [
-            ("Detrended Var (Shot+Read)", [p.var_detrended for p in c.ptc_points], "#10b981", False),
-            ("Raw Var (incl. Bleaching)", [p.var_raw for p in c.ptc_points], "#f59e0b", True),
-        ],
-        x_label="Mean Signal Above Dark (ADU)",
-        y_label="Temporal Variance (ADU^2)",
-    )
-    hist_svg = _svg_bar_histogram(
-        c.hist_bin_centers_adu, c.hist_counts, color="#38bdf8", x_label="Pixel Intensity (ADU)"
-    )
-    snr_svg = _svg_bar_histogram(
-        c.snr_hist_bin_centers, c.snr_hist_counts, color="#a855f7", x_label="Foreground Bleaching-Corrected SNR"
+    map_html = "".join(
+        (
+            mcard(
+                "Mean Projection &mu;(y, x)",
+                "Viridis",
+                "mean",
+                f"FG Mean: {c.signal_mean_fg_adu:.1f} ADU",
+                f"BG Mean: {c.background_mean_adu:.1f} ADU",
+                f"Max: {c.signal_max_adu:.0f} ADU",
+            ),
+            mcard(
+                "Bleaching-Detrended Noise &sigma;_detrended(y, x)",
+                "Magma",
+                "std_detrended",
+                f"Read Floor: {c.read_noise_adu:.2f} ADU",
+                f"BG Temporal &sigma;: {c.background_noise_temporal_adu:.2f} ADU",
+            ),
+            mcard(
+                "Bleaching-Corrected Temporal SNR Map",
+                "Inferno",
+                "snr_corrected",
+                f"FG Median SNR: {c.snr_fg_median_corrected:.1f}",
+                f"P95 SNR: {c.snr_fg_p95_corrected:.1f} ({c.snr_fg_mean_corrected_db:.1f} dB)",
+            ),
+            mcard(
+                "Spatial Photobleaching Map (% Loss)",
+                "Plasma",
+                "bleach_map",
+                f"Initial FG: {c.bleach_initial_fg_adu:.1f} ADU &rarr; Final FG: {c.bleach_final_fg_adu:.1f} ADU",
+                f"R&sup2;={c.bleach_fit_r2:.3f}",
+            ),
+            mcard(
+                "Signal, Background &amp; In-Focus Sharpness Masks",
+                "Overlay",
+                "masks",
+                f'<span style="color:#4ade80">&#9632;</span> Sharp Focus ({c.sharp_in_focus_area_pct:.1f}%)',
+                f'<span style="color:#38bdf8">&#9632;</span> Foreground ({c.foreground_area_pct:.1f}%)',
+                f'<span style="color:#94a3b8">&#9632;</span> Background (Otsu={c.otsu_threshold_adu:.0f})',
+            ),
+            mcard(
+                "Local Normalized Sharpness Map",
+                "Turbo",
+                "sharpness",
+                f"Tenengrad P95: {c.tenengrad_p95_fg:.1f}",
+                f"Laplacian Var: {c.laplacian_variance_fg:.1f}",
+                f"Brenner: {c.brenner_score_fg:.1f}",
+            ),
+        )
     )
     chart_html = "".join(
-        f'<div class="chart-card"><div class="chart-title">{t}</div>{svg}</div>'
-        for t, svg in (
-            (f"Stationary Photobleaching Decay Curve (N={c.num_signal_frames} frames)", bleach_svg),
-            (f"Photon Transfer Curve (Detrended vs. Raw Variance) &bull; Est. Gain: {html.escape(gain_str)}", ptc_svg),
-            ("Mean Projection Intensity Distribution", hist_svg),
-            ("Foreground Bleaching-Corrected Temporal SNR Distribution", snr_svg),
+        (
+            chart(
+                f"Stationary Photobleaching Decay Curve (N={c.num_signal_frames} frames)",
+                _svg_line_chart(
+                    c.bleach_frame_indices,
+                    [
+                        ("Foreground Mean (ADU)", c.bleach_fg_mean_trace, "#38bdf8", False),
+                        ("Exp Decay Fit", c.bleach_fit_trace, "#f43f5e", True),
+                        ("Background Mean", c.bleach_bg_mean_trace, "#a1a1aa", True),
+                    ],
+                    "Frame Index (Static Sample)",
+                    "Dark-Subtracted Intensity (ADU)",
+                ),
+            ),
+            chart(
+                f"Photon Transfer Curve (Detrended vs. Raw Variance){b}Est. Gain: {html.escape(gain_str)}",
+                _svg_line_chart(
+                    [p.mean_adu for p in c.ptc_points],
+                    [
+                        ("Detrended Var (Shot+Read)", [p.var_detrended for p in c.ptc_points], "#10b981", False),
+                        ("Raw Var (incl. Bleaching)", [p.var_raw for p in c.ptc_points], "#f59e0b", True),
+                    ],
+                    "Mean Signal Above Dark (ADU)",
+                    "Temporal Variance (ADU^2)",
+                ),
+            ),
+            chart(
+                "Mean Projection Intensity Distribution",
+                _svg_bar_histogram(c.hist_bin_centers_adu, c.hist_counts, "#38bdf8", "Pixel Intensity (ADU)"),
+            ),
+            chart(
+                "Foreground Bleaching-Corrected Temporal SNR Distribution",
+                _svg_bar_histogram(
+                    c.snr_hist_bin_centers, c.snr_hist_counts, "#a855f7", "Foreground Bleaching-Corrected SNR"
+                ),
+            ),
         )
     )
-
-    snr_c_row = (
+    snr_c = (
         f"<strong>{c.snr_fg_mean_corrected:.2f}</strong> / {c.snr_fg_median_corrected:.2f}"
-        f" / {c.snr_fg_p95_corrected:.2f} ({c.snr_fg_mean_corrected_db:.2f} dB)"
+        f" / {c.snr_fg_p95_corrected:.2f}"
     )
-    snr_r_row = (
-        f"{c.snr_fg_mean_raw:.2f} / {c.snr_fg_median_raw:.2f} / {c.snr_fg_p95_raw:.2f} ({c.snr_fg_mean_raw_db:.2f} dB)"
-    )
-    bleach_row = (
-        f"{c.bleach_total_pct:+.3f}% ({c.bleach_rate_per_frame_pct:.4f}% / frame, R&sup2;={c.bleach_fit_r2:.3f})"
-    )
-    left_table = _render_table(
+    snr_r = f"{c.snr_fg_mean_raw:.2f} / {c.snr_fg_median_raw:.2f} / {c.snr_fg_p95_raw:.2f}"
+    tables_html = tbl(
         "Signal, Noise &amp; Photobleaching Metrics",
-        [
-            ("Signal Mean / Median (Foreground)", f"{c.signal_mean_fg_adu:.2f} / {c.signal_median_fg_adu:.2f} ADU"),
-            (
-                "Signal P95 / P99 / Max",
-                f"{c.signal_p95_fg_adu:.1f} / {c.signal_p99_fg_adu:.1f} / {c.signal_max_adu:.1f} ADU",
-            ),
-            (
-                "Dark Offset / Read Noise Floor",
-                f"{c.dark_offset_adu:.2f} ADU / {c.read_noise_adu:.3f} ADU ({c.num_dark_frames} dark)",
-            ),
-            ("Bleach-Corrected Temporal SNR (Mean / Median / P95)", snr_c_row),
-            ("Uncorrected Raw Temporal SNR (Mean / Median / P95)", snr_r_row),
-            ("Photobleaching Total Loss / Rate per Frame", bleach_row),
-            ("Photobleaching Half-Life (t1/2)", hl_esc),
-        ],
-    )
-    right_table = _render_table(
+        ("Signal Mean / Median (Foreground)", f"{c.signal_mean_fg_adu:.2f} / {c.signal_median_fg_adu:.2f} ADU"),
+        (
+            "Signal P95 / P99 / Max",
+            f"{c.signal_p95_fg_adu:.1f} / {c.signal_p99_fg_adu:.1f} / {c.signal_max_adu:.1f} ADU",
+        ),
+        (
+            "Dark Offset / Read Noise Floor",
+            f"{c.dark_offset_adu:.2f} / {c.read_noise_adu:.3f} ADU ({c.num_dark_frames} dark)",
+        ),
+        ("Bleach-Corrected Temporal SNR (Mean / Median / P95)", f"{snr_c} ({c.snr_fg_mean_corrected_db:.2f} dB)"),
+        ("Uncorrected Raw Temporal SNR (Mean / Median / P95)", f"{snr_r} ({c.snr_fg_mean_raw_db:.2f} dB)"),
+        (
+            "Photobleaching Total Loss / Rate per Frame",
+            f"{c.bleach_total_pct:+.3f}% ({c.bleach_rate_per_frame_pct:.4f}% / frame, R&sup2;={c.bleach_fit_r2:.3f})",
+        ),
+        ("Photobleaching Half-Life (t1/2)", hl_esc),
+    ) + tbl(
         "Contrast, Dynamic Range &amp; Sharpness Metrics",
-        [
-            ("Contrast-to-Noise Ratio (CNR)", f"<strong>{c.cnr:.2f}</strong>"),
-            ("Signal-to-Background Ratio (SBR) / Weber Contrast", f"{c.sbr:.2f}x / {c.weber_contrast:.2f}"),
-            ("Michelson / RMS Contrast", f"{c.michelson_contrast:.4f} / {c.rms_contrast:.4f}"),
-            (
-                "Dynamic Range / Sensor Well Fill (P99)",
-                f"{c.dynamic_range_db:.2f} dB / {c.well_fill_p99_pct:.2f}% (Sat: {c.saturated_pixel_pct:.4f}%)",
-            ),
-            ("Tenengrad Sharpness (FG Mean / P95)", f"{c.tenengrad_mean_fg:.2f} / {c.tenengrad_p95_fg:.2f}"),
-            ("Laplacian Variance / Brenner Focus Score", f"{c.laplacian_variance_fg:.2f} / {c.brenner_score_fg:.2f}"),
-            ("Saved TIFF Projections", f"<code>{html.escape(str(output_dir))}</code>"),
-        ],
+        ("Contrast-to-Noise Ratio (CNR)", f"<strong>{c.cnr:.2f}</strong>"),
+        ("Signal-to-Background Ratio (SBR) / Weber Contrast", f"{c.sbr:.2f}x / {c.weber_contrast:.2f}"),
+        ("Michelson / RMS Contrast", f"{c.michelson_contrast:.4f} / {c.rms_contrast:.4f}"),
+        (
+            "Dynamic Range / Sensor Well Fill (P99)",
+            f"{c.dynamic_range_db:.2f} dB / {c.well_fill_p99_pct:.2f}% (Sat: {c.saturated_pixel_pct:.4f}%)",
+        ),
+        ("Tenengrad Sharpness (FG Mean / P95)", f"{c.tenengrad_mean_fg:.2f} / {c.tenengrad_p95_fg:.2f}"),
+        ("Laplacian Variance / Brenner Focus Score", f"{c.laplacian_variance_fg:.2f} / {c.brenner_score_fg:.2f}"),
+        ("Saved TIFF Projections", f"<code>{html.escape(str(output_dir))}</code>"),
     )
 
     return (
@@ -944,13 +902,13 @@ def _render_camera_section(cam_id: str, c: CameraSnrAnalysis, output_dir: Path) 
         f"<h2>Camera: <code>{html.escape(cam_id)}</code>"
         f' <span class="sub">Channel: {html.escape(c.channel_id)}</span></h2>'
         f'<p class="meta-line">Frame: <strong>{c.width} &times; {c.height} px</strong>'
-        f" ({html.escape(c.dtype)}, {c.valid_bits}-bit) &bull; "
-        f"Sampling: <strong>{c.pixel_size_um[0]:.3f} &times; {c.pixel_size_um[1]:.3f} &mu;m/px</strong> &bull; "
-        f"Exposure: <strong>{c.exposure_time_ms:.2f} ms</strong> &bull; "
-        f"Binning: <strong>{html.escape(bin_desc)}</strong></p>"
-        f'</div><div class="kpi-strip">{kpi_html}</div></div>'
+        f" ({html.escape(c.dtype)}, {c.valid_bits}-bit){b}"
+        f"Sampling: <strong>{c.pixel_size_um[0]:.3f} &times; {c.pixel_size_um[1]:.3f} &mu;m/px</strong>{b}"
+        f"Exposure: <strong>{c.exposure_time_ms:.2f} ms</strong>{b}"
+        f"Binning: <strong>{html.escape(bin_desc)}</strong></p></div>"
+        f'<div class="kpi-strip">{kpi_html}</div></div>'
         f'<div class="map-grid">{map_html}</div><div class="charts-grid">{chart_html}</div>'
-        f'<div class="tables-grid">{left_table}{right_table}</div></section>'
+        f'<div class="tables-grid">{tables_html}</div></section>'
     )
 
 

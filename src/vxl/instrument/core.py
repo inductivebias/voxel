@@ -607,20 +607,18 @@ class Instrument:
     def _camera_capture_info(self, cam: CameraHandle) -> tuple[tuple[float, float], float]:
         cam_idx = next((i for i, cid in enumerate(self._hal.topology.detection) if cid == cam.uid), 0)
         sampling = default_camera_sampling_yz(cam.uid, cam_idx)
-        exp_model = cam.props.cached_model("exposure_time_ms")
-        exp_val = exp_model.value if exp_model is not None else None
-        exp_ms = float(exp_val) if isinstance(exp_val, (int, float)) else 10.0
-        return (sampling.z, sampling.y), exp_ms
+        exp_val = m.value if (m := cam.props.cached_model("exposure_time_ms")) is not None else None
+        return (sampling.z, sampling.y), float(exp_val) if isinstance(exp_val, (int, float)) else 10.0
 
     def _laser_summary(self, laser_chans: Sequence[Illumination]) -> dict[str, dict[str, Any]]:
-        profile = self.active_profile
+        lasers = self.active_profile.lasers
         return {
             ch.uid: {
                 "wavelength": m.value if (m := ch.laser.props.cached_model("wavelength")) is not None else None,
                 "power_setpoint_mw": (
                     m.value if (m := ch.laser.props.cached_model("power_setpoint_mw")) is not None else None
                 ),
-                "modulation_mode": profile.lasers.get(ch.uid, "software"),
+                "modulation_mode": lasers.get(ch.uid, "software"),
             }
             for ch in laser_chans
         }

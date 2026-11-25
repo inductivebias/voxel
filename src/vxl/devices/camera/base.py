@@ -415,15 +415,12 @@ class CameraController(DeviceController["Camera"]):
         frame, min_adu, max_adu, mean_adu, std_adu = await self._run_sync(_bin_and_stats)
         bin_y, bin_x = int(self.device.gpu_bin_y), int(self.device.gpu_bin_x)
         eff_px = (float(pixel_size_um[0]) * bin_y, float(pixel_size_um[1]) * bin_x) if pixel_size_um else None
-        saved_str: str | None = None
-        if save_path is not None:
-            saved_path, _ = await asyncio.gather(
-                self._run_sync(write_tiff_2d, save_path, frame, pixel_size_um=eff_px, metadata=metadata),
-                self._emit_preview_sync(frame),
-            )
-            saved_str = str(saved_path)
-        else:
-            await self._emit_preview_sync(frame)
+        saved_path, _ = await asyncio.gather(
+            self._run_sync(write_tiff_2d, save_path, frame, pixel_size_um=eff_px, metadata=metadata)
+            if save_path is not None
+            else asyncio.sleep(0, result=None),
+            self._emit_preview_sync(frame),
+        )
 
         return SnapshotFrameInfo(
             camera_id=self.device.uid,
@@ -439,7 +436,7 @@ class CameraController(DeviceController["Camera"]):
             gpu_bin_x=bin_x,
             gpu_pre_filter=str(self.device.gpu_pre_filter),
             gpu_filter_size=int(self.device.gpu_filter_size),
-            saved_path=saved_str,
+            saved_path=str(saved_path) if saved_path is not None else None,
         )
 
     @describe(label="Analyze SNR Buffer")
