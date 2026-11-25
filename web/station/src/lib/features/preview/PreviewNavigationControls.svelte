@@ -29,23 +29,9 @@
     onCenterCrosshair?: () => void;
   }
 
-  const DIAGNOSTIC_ACTIONS = [
-    {
-      id: 'snapshot',
-      label: 'Take single-frame laser snapshot',
-      idleTitle: 'Take single-frame laser snapshot (saves .tif & keeps frame on screen)',
-      busyTitle: 'Stop live preview before taking a single-frame snapshot',
-      icon: Camera,
-      run: (p: PreviewSession) => void p.takeSnapshot()
-    },
-    {
-      id: 'snr',
-      label: 'Run stationary SNR & photobleaching diagnostics',
-      idleTitle: 'Run stationary SNR & photobleaching diagnostics (32 frames + 8 dark, opens HTML report)',
-      busyTitle: 'Stop live preview before running SNR diagnostics',
-      icon: Activity,
-      run: (p: PreviewSession) => void p.runSnrDiagnostics(32, 8)
-    }
+  const ACTIONS = [
+    ['snapshot', Camera, 'Take single-frame laser snapshot', 'saves .tif & keeps frame on screen'],
+    ['snr', Activity, 'Run stationary SNR & photobleaching diagnostics', '32 frames + 8 dark, opens HTML report']
   ] as const;
 
   let {
@@ -186,17 +172,16 @@
     >
       <Crosshair width="14" height="14" />
     </button>
-    {#each DIAGNOSTIC_ACTIONS as action (action.id)}
-      {@const Icon = action.icon}
+    {#each ACTIONS as [id, Icon, label, detail] (id)}
       <button
         type="button"
-        onclick={() => action.run(previewer)}
+        onclick={() => void (id === 'snapshot' ? previewer.takeSnapshot() : previewer.runSnrDiagnostics(32, 8))}
         disabled={previewer.pendingAction !== null || previewer.previewing}
         class="flex h-6 w-5 shrink-0 cursor-pointer items-center justify-center rounded text-fg-muted transition-colors hover:bg-element-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
-        aria-label={action.label}
-        title={previewer.previewing ? action.busyTitle : action.idleTitle}
+        aria-label={label}
+        title={previewer.previewing ? `Stop live preview first (${label.toLowerCase()})` : `${label} (${detail})`}
       >
-        {#if previewer.pendingAction === action.id}
+        {#if previewer.pendingAction === id}
           <Loader width="14" height="14" class="animate-spin text-fg" />
         {:else}
           <Icon width="14" height="14" />

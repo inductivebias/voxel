@@ -355,48 +355,42 @@ export class PreviewSession {
     return this.#client.post(`${this.#instrumentBase}/preview/stop`);
   }
 
-  async #runAction(kind: 'snapshot' | 'snr', fn: () => Promise<void>): Promise<void> {
-    if (this.pendingAction !== null) return;
+  async #runAction(kind: 'snapshot' | 'snr', fn: () => Promise<unknown>): Promise<boolean> {
+    if (this.pendingAction !== null) return false;
     this.pendingAction = kind;
     this.error = null;
     try {
       await fn();
+      return true;
     } catch (error) {
       this.error = error instanceof Error ? error.message : String(error);
+      return false;
     } finally {
       this.pendingAction = null;
     }
   }
 
-  takeSnapshot(): Promise<void> {
-    return this.#runAction('snapshot', async () => {
-      await this.#client.post(`${this.#instrumentBase}/preview/snapshot`);
-    });
+  async takeSnapshot(): Promise<void> {
+    await this.#runAction('snapshot', () => this.#client.post(`${this.#instrumentBase}/preview/snapshot`));
   }
 
-  runSnrDiagnostics(numFrames = 32, darkFrames = 8): Promise<void> {
-    return this.#runAction('snr', async () => {
-      const reportWindow = typeof window !== 'undefined' ? window.open('about:blank', '_blank') : null;
-      if (reportWindow) {
-        reportWindow.document.title = 'Generating Voxel SNR & Photobleaching Report...';
-        reportWindow.document.body.style.cssText =
-          'background:#09090b;color:#e4e4e7;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh';
-        reportWindow.document.body.innerHTML = `<div style="text-align:center"><h2 style="font-size:18px;margin-bottom:8px">Acquiring ${numFrames} stationary frames (+ ${darkFrames} dark) & computing SNR report...</h2><p style="color:#a1a1aa;font-size:13px">Lasers turn off immediately after frame capture completes.</p></div>`;
-      }
-      try {
-        const res = await this.#client.post<{ report_url?: string }>(`${this.#instrumentBase}/diagnostics/snr`, {
-          num_frames: numFrames,
-          dark_frames: darkFrames
-        });
-        if (res?.report_url) {
-          if (reportWindow && !reportWindow.closed) reportWindow.location.href = res.report_url;
-          else if (typeof window !== 'undefined') window.open(res.report_url, '_blank');
-        }
-      } catch (error) {
-        if (reportWindow && !reportWindow.closed) reportWindow.close();
-        throw error;
-      }
+  async runSnrDiagnostics(numFrames = 32, darkFrames = 8): Promise<void> {
+    if (this.pendingAction !== null) return;
+    const win = typeof window !== 'undefined' ? window.open('about:blank', '_blank') : null;
+    if (win) {
+      win.document.title = 'Generating Voxel SNR & Photobleaching Report...';
+      win.document.body.style.cssText =
+        'background:#09090b;color:#e4e4e7;font-family:system-ui,sans-serif;display:flex;align-items:center;justify-content:center;height:100vh';
+      win.document.body.innerHTML = `<div style="text-align:center"><h2 style="font-size:18px;margin-bottom:8px">Acquiring ${numFrames} stationary frames (+ ${darkFrames} dark) & computing SNR report...</h2><p style="color:#a1a1aa;font-size:13px">Lasers turn off immediately after frame capture completes.</p></div>`;
+    }
+    const payload = { num_frames: numFrames, dark_frames: darkFrames };
+    const ok = await this.#runAction('snr', async () => {
+      const res = await this.#client.post<{ report_url?: string }>(`${this.#instrumentBase}/diagnostics/snr`, payload);
+      if (!res?.report_url) return;
+      if (win && !win.closed) win.location.href = res.report_url;
+      else if (typeof window !== 'undefined') window.open(res.report_url, '_blank');
     });
+    if (!ok && win && !win.closed) win.close();
   }
 
   setChannelVisible(name: string, visible: boolean): void {
