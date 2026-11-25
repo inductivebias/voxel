@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from pathlib import Path
+from typing import Literal
 
 import numpy as np
 import pytest
@@ -27,10 +28,10 @@ from ome_zarr_writer import (
 )
 from ome_zarr_writer.array import ArrayWriter
 from ome_zarr_writer.array.gpu import GPUArrayWriter, _has_nvcomp, max_batch_chunks_for
+from ome_zarr_writer.array.ts import TSArrayWriter
 from ome_zarr_writer.pyramid_gpu import is_gpu_available, pyramids_3d_gpu
 from ome_zarr_writer.sizing import gpu_workspace_bytes, per_slot_bytes
 from ome_zarr_writer.slot import _gpu_worker_slot
-from ome_zarr_writer.viewer.zarr_server.base import neuroglancer_compatible_zarr_json
 
 
 def _write_stack(tmp_path: Path, name: str, cfg: WriterConfig, vol: np.ndarray, *, backend=None) -> Path:
@@ -144,7 +145,7 @@ def test_preprocess_config_spatial_metadata():
 
 
 # ---------------------------------------------------------------------------
-# End-to-end writer: preprocessing, codec knobs, VRAM fallback & Neuroglancer
+# End-to-end writer: preprocessing, codec knobs & VRAM fallback
 # ---------------------------------------------------------------------------
 
 
@@ -212,51 +213,23 @@ def test_vram_fallback_downgrades_gpu_backend_and_ring_reuse_skips_sizer(
         writer.close()
 
 
-def test_neuroglancer_compatible_zarr_json_preserves_all_multiscales(tmp_path: Path):
-    zarr_json = tmp_path / "zarr.json"
-    doc = {
-        "zarr_format": 3,
-        "node_type": "group",
-        "attributes": {
-            "ome": {
-                "version": "0.6",
-                "multiscales": [
-                    {
-                        "type": "gaussian",
-                        "coordinateSystems": [{"name": "physical", "axes": [{"name": "z", "type": "space"}]}],
-                        "datasets": [
-                            {
-                                "path": "0",
-                                "coordinateTransformations": [
-                                    {"type": "sequence", "transformations": [{"type": "scale", "scale": [1, 1, 1, 1]}]}
-                                ],
-                            }
-                        ],
-                    },
-                    {
-                        "type": "mean",
-                        "coordinateSystems": [{"name": "physical", "axes": [{"name": "z", "type": "space"}]}],
-                        "datasets": [],
-                    },
-                ],
-            }
-        },
-    }
-    zarr_json.write_text(json.dumps(doc))
-    payload = neuroglancer_compatible_zarr_json(zarr_json)
-    assert payload is not None
-    out = json.loads(payload.decode())
-    assert out["attributes"]["ome"]["version"] == "0.5"
-    assert len(out["attributes"]["ome"]["multiscales"]) == 2
-    assert [m["type"] for m in out["attributes"]["ome"]["multiscales"]] == ["gaussian", "mean"]
-
-
 @pytest.mark.skipif(not _has_nvcomp(), reason="requires CUDA + nvidia.nvcomp")
 @pytest.mark.parametrize(
-    "compression",
-    [Compression.BLOSC_LZ4, Compression.BLOSC_ZSTD, Compression.ZSTD, Compression.GZIP, Compression.NONE],
+    ("compression", "compression_shuffle"),
+    [
+        (Compression.BLOSC_LZ4, "shuffle"),
+        (Compression.BLOSC_LZ4, "noshuffle"),
+        (Compression.BLOSC_ZSTD, "shuffle"),
+        (Compression.BLOSC_ZSTD, "noshuffle"),
+        (Compression.ZSTD, None),
+        (Compression.NONE, None),
+    ],
 )
-def test_gpu_array_writer_roundtrip_and_incompressible_noise(tmp_path: Path, compression: Compression):
+def test_gpu_array_writer_roundtrip_and_incompressible_noise(
+    tmp_path: Path,
+    compression: Compression,
+    compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None,
+):
     rng = np.random.default_rng(99)
     vol = rng.integers(0, 65535, size=(64, 64, 64), dtype=np.uint16)
     cfg = WriterConfig(
@@ -264,9 +237,11 @@ def test_gpu_array_writer_roundtrip_and_incompressible_noise(tmp_path: Path, com
         voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
         max_level=ScaleLevel.L1,
         compression=compression,
+        compression_shuffle=compression_shuffle,
         use_gpu=True,
     )
-    target = _write_stack(tmp_path, f"gpu_{compression.value}", cfg, vol, backend=ArrayWriter.Backend.GPU)
+    suffix = f"{compression.value}_{compression_shuffle or 'default'}"
+    target = _write_stack(tmp_path, f"gpu_{suffix}", cfg, vol, backend=ArrayWriter.Backend.GPU)
     np.testing.assert_array_equal(_read_level(target, 0), vol)
 
 
@@ -295,4 +270,41 @@ def test_gpu_array_writer_falls_back_cleanly_without_nvcomp(tmp_path: Path, monk
     w.open(target / "0")
     w.write_slice(0, 0, vol)
     w.close()
+    np.testing.assert_array_equal(_read_level(target, 0), vol)
+
+
+@pytest.mark.parametrize(
+    ("compression", "compression_shuffle"),
+    [
+        (Compression.GZIP, None),
+        (Compression.BLOSC_ZSTD, "bitshuffle"),
+        (Compression.BLOSC_ZSTD, None),
+        (Compression.BLOSC_LZ4, "bitshuffle"),
+    ],
+)
+def test_gpu_array_writer_falls_back_to_ts_for_gzip_and_bitshuffle(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    compression: Compression,
+    compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None,
+):
+    monkeypatch.setattr("ome_zarr_writer.array.gpu._has_nvcomp", lambda: True)
+    cfg = WriterConfig(
+        volume_shape=UIVec3D(z=64, y=64, x=64),
+        voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
+        max_level=ScaleLevel.L0,
+        compression=compression,
+        compression_shuffle=compression_shuffle,
+    )
+    target = tmp_path / f"fb_{compression.value}_{compression_shuffle or 'default'}.ome.zarr"
+    cfg.dataset.write_metadata(target)
+    vol = np.arange(64 * 64 * 64, dtype=np.uint16).reshape(64, 64, 64)
+    w = GPUArrayWriter()
+    w.open(target / "0")
+    try:
+        assert w._spec is None
+        assert isinstance(w._fallback, TSArrayWriter)
+        w.write_slice(0, 0, vol)
+    finally:
+        w.close()
     np.testing.assert_array_equal(_read_level(target, 0), vol)
