@@ -595,12 +595,8 @@ async def set_preview_channels(body: _PreviewChannels, instrument: InstrumentDep
 
 
 @instrument_router.post("/preview/snapshot")
-async def take_snapshot(
-    instrument: InstrumentDep,
-    body: _SnapshotRequest | None = None,
-) -> SnapshotResult:
-    req = body if body is not None else _SnapshotRequest()
-    return await instrument.snapshot(save_tiff=req.save_tiff)
+async def take_snapshot(instrument: InstrumentDep, body: _SnapshotRequest | None = None) -> SnapshotResult:
+    return await instrument.snapshot(save_tiff=(body or _SnapshotRequest()).save_tiff)
 
 
 @instrument_router.post("/diagnostics/snr")
@@ -611,14 +607,12 @@ async def run_snr_diagnostics(
     instrument: InstrumentDep,
     body: _SnrDiagnosticsRequest | None = None,
 ) -> SnrReportResult:
-    req = body if body is not None else _SnrDiagnosticsRequest()
+    req = body or _SnrDiagnosticsRequest()
     return await instrument.run_snr_diagnostics(
         num_frames=req.num_frames,
         dark_frames=req.dark_frames,
-        report_url_for=lambda report_id: (
-            request.url_for(
-                "get_snr_report_html", station_id=station_id, session_id=session_id, report_id=report_id
-            ).path
+        report_url_for=lambda rid: (
+            request.url_for("get_snr_report_html", station_id=station_id, session_id=session_id, report_id=rid).path
         ),
     )
 

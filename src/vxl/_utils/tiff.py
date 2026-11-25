@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 import tifffile
 
-_SUPPORTED_DTYPES = (np.uint8, np.uint16, np.float32)
+_DTYPES = (np.uint8, np.uint16, np.float32)
 
 
 def write_tiff_2d(
@@ -23,25 +23,17 @@ def write_tiff_2d(
     arr = np.asarray(image)
     if arr.ndim != 2:
         raise ValueError(f"Expected 2D image for TIFF write, got shape {arr.shape}")
-    if arr.dtype not in _SUPPORTED_DTYPES:
+    if arr.dtype not in _DTYPES:
         raise TypeError(f"Unsupported TIFF dtype {arr.dtype}; expected uint8, uint16, or float32")
-
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    ij_meta: dict[str, Any] = {}
-    resolution: tuple[float, float] | None = None
-    if pixel_size_um is not None and pixel_size_um[0] > 0 and pixel_size_um[1] > 0:
-        resolution = (1.0 / float(pixel_size_um[1]), 1.0 / float(pixel_size_um[0]))
-        ij_meta["unit"] = "um"
+    px = pixel_size_um
+    res = (1.0 / float(px[1]), 1.0 / float(px[0])) if px is not None and px[0] > 0 and px[1] > 0 else None
+    meta: dict[str, Any] = {"unit": "um"} if res is not None else {}
     if metadata:
-        ij_meta["Info"] = json.dumps(metadata, sort_keys=True, default=str)
-
-    tifffile.imwrite(
-        out,
-        np.ascontiguousarray(arr),
-        imagej=True,
-        resolution=resolution,
-        resolutionunit="NONE" if resolution is not None else None,
-        metadata=ij_meta or None,
-    )
+        meta["Info"] = json.dumps(metadata, sort_keys=True, default=str)
+    kw: dict[str, Any] = {"imagej": True, "resolution": res, "metadata": meta or None}
+    if res is not None:
+        kw["resolutionunit"] = "NONE"
+    tifffile.imwrite(out, np.ascontiguousarray(arr), **kw)
     return out
