@@ -1,4 +1,11 @@
-import type { AcquisitionTask, Bounds, Point2D } from './types';
+import type { AcquisitionTask, Bounds, CameraSamplingYZ, Point2D } from './types';
+
+export function defaultCameraSamplingYZ(cameraId: string, index = 0): CameraSamplingYZ {
+  const key = cameraId.trim().toLowerCase();
+  return key !== 'cam1' && key !== 'camera_1' && (key.endsWith('2') || key.endsWith('_1') || index === 1)
+    ? { y: 0.293, z: 0.254 }
+    : { y: 0.195, z: 0.169 };
+}
 
 export interface RegionBounds {
   minX: number;

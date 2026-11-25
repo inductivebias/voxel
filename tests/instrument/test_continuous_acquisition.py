@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock
 import pytest
 from vxl_records import (
     AcquisitionStatus,
+    CameraSamplingYZ,
     DatasetStatus,
     LineScan,
     LocalLocation,
@@ -17,12 +18,15 @@ from vxl_records import (
     StorageSpec,
     VolumeStatus,
 )
+from vxl_records.models.acquisition import YScanRows
 
 from vxl.devices.camera import CaptureState
 from vxl.devices.daq.clocked import EdgeDivision
 from vxl.instrument import (
+    AcquisitionPhase,
     AcquisitionRequest,
     AcquisitionTask,
+    CaptureActivity,
     Instrument,
     InstrumentConfig,
     OperationRejectedError,
@@ -81,12 +85,14 @@ class _Writer:
         self._root = root
         self._closing = False
         self.batches: list[int] = []
+        self.opened_kwargs: list[dict[str, object]] = []
 
     async def check_writable(self, _storage: StorageSpec) -> None:
         return
 
     async def open_stack(self, *, storage: StorageSpec, subpath: PurePosixPath, **_kwargs: object) -> LocalLocation:
         self._closing = False
+        self.opened_kwargs.append(_kwargs)
         target = self._root / storage.path.as_posix() / f"{subpath.as_posix()}.ome.zarr"
         return LocalLocation(role=LocationRole.DESTINATION, status=LocationStatus.WRITING, host="h", path=str(target))
 
@@ -598,11 +604,7 @@ async def test_x_scan_array_positions_y_between_sweeps_and_keeps_z_fixed(
     start_warning: bool,
 ) -> None:
     instrument = opened_instrument
-    await add_line(instrument)
-    task = instrument.state.value.plan[0]
-    assert task.scan is not None
-    scan = LineScan.model_validate({**task.scan.model_dump(), "y_stack": {"start": 0, "end": 250, "step": 100}})
-    await instrument.update_task(task.id, TaskPatch(scan=scan))
+    await _add_y_stack(instrument, end=250.0, step=100.0)
     rows = instrument.planned_volumes.value
     assert [v.y for v in rows] == [0, 100, 200]
     y_moves, sweep_y = [], []
@@ -659,20 +661,7 @@ async def test_cancelling_array_during_y_positioning_halts_y(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     instrument = opened_instrument
-    await add_line(instrument)
-    task = instrument.state.value.plan[0]
-    assert task.scan is not None
-    await instrument.update_task(
-        task.id,
-        TaskPatch(
-            scan=LineScan.model_validate(
-                {
-                    **task.scan.model_dump(),
-                    "y_stack": {"start": 100, "end": 100},
-                }
-            )
-        ),
-    )
+    await _add_y_stack(instrument, start=100.0, end=100.0)
     moving = asyncio.Event()
     halt = AsyncMock()
 
@@ -726,20 +715,7 @@ async def test_diagnostic_run_continues_after_strip_error_and_logs_it_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     instrument = opened_instrument
-    await add_line(instrument)
-    task = instrument.state.value.plan[0]
-    assert task.scan is not None
-    await instrument.update_task(
-        task.id,
-        TaskPatch(
-            scan=LineScan.model_validate(
-                {
-                    **task.scan.model_dump(),
-                    "y_stack": {"start": 0, "end": 200, "step": 100},
-                }
-            )
-        ),
-    )
+    await _add_y_stack(instrument, end=200.0, step=100.0)
     recorder = instrument._hal.recorders["scan_recorder"]
     finish = recorder.finish
     calls = 0
@@ -779,20 +755,7 @@ async def test_diagnostic_mode_does_not_continue_after_cleanup_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     instrument = opened_instrument
-    await add_line(instrument)
-    task = instrument.state.value.plan[0]
-    assert task.scan is not None
-    await instrument.update_task(
-        task.id,
-        TaskPatch(
-            scan=LineScan.model_validate(
-                {
-                    **task.scan.model_dump(),
-                    "y_stack": {"start": 0, "end": 100, "step": 100},
-                }
-            )
-        ),
-    )
+    await _add_y_stack(instrument, end=100.0, step=100.0)
     teardown = instrument._teardown_capture
 
     async def cleanup_failure(*args, **kwargs):
@@ -830,3 +793,134 @@ async def test_diagnostic_mode_never_swallows_operator_cancellation(
     manifest = await records.acquisitions.get(started.id)
     assert manifest.status is AcquisitionStatus.CANCELLED
     assert writer.batches == []
+
+
+async def _add_y_stack(instrument: Instrument, *, start: float = 0.0, end: float = 100.0, step: float = 100.0) -> None:
+    await add_line(instrument)
+    task = instrument.state.value.plan[0]
+    assert task.scan is not None
+    scan = task.scan.model_copy(update={"y_stack": YScanRows(start=start, end=end, step=step)})
+    await instrument.update_task(task.id, TaskPatch(scan=scan))
+
+
+async def _wait_paused(instrument: Instrument) -> None:
+    paused = asyncio.Event()
+
+    def check(activity: object) -> None:
+        if (
+            isinstance(activity, CaptureActivity)
+            and activity.acquisition is not None
+            and activity.acquisition.phase is AcquisitionPhase.PAUSED
+        ):
+            paused.set()
+
+    check(instrument.activity.value)
+    unsub = instrument.activity.subscribe(check)
+    try:
+        await asyncio.wait_for(paused.wait(), timeout=5)
+    finally:
+        unsub()
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+@pytest.mark.parametrize("action", ["resume", "stop"])
+async def test_xy_scan_pause_then_resume_or_stop(
+    opened_instrument: Instrument,
+    records: SQLiteRecords,
+    writer: _Writer,
+    monkeypatch: pytest.MonkeyPatch,
+    action: str,
+) -> None:
+    instrument = opened_instrument
+    await _add_y_stack(instrument, end=200.0)
+    first_started = asyncio.Event()
+    release_first = asyncio.Event()
+    original_capture = instrument._capture_continuous
+    calls = 0
+
+    async def gated_capture(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            first_started.set()
+            await release_first.wait()
+        return await original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(instrument, "_capture_continuous", gated_capture)
+    started = await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(first_started.wait(), timeout=5)
+    await instrument.pause_acquisition()
+    release_first.set()
+    await _wait_paused(instrument)
+    assert writer.batches == [2]
+
+    if action == "resume":
+        await instrument.resume_acquisition()
+        await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+        manifest = await records.acquisitions.get(started.id)
+        assert manifest.status is AcquisitionStatus.COMPLETED, manifest.failure
+        assert [v.status for v in manifest.volumes] == [VolumeStatus.COMPLETED] * 3
+        assert writer.batches == [2, 2, 2]
+    else:
+        await instrument.stop_acquisition()
+        manifest = await records.acquisitions.get(started.id)
+        assert manifest.status is AcquisitionStatus.CANCELLED
+        assert [v.status for v in manifest.volumes] == [
+            VolumeStatus.COMPLETED,
+            VolumeStatus.CANCELLED,
+            VolumeStatus.CANCELLED,
+        ]
+        assert writer.batches == [2]
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+async def test_line_scan_writes_camera_sampling_yz_to_open_stack_and_scan_json(
+    opened_instrument: Instrument,
+    writer: _Writer,
+    tmp_path: Path,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    task = instrument.state.value.plan[0]
+    assert task.scan is not None
+    await instrument.update_task(
+        task.id,
+        TaskPatch(
+            scan=task.scan.model_copy(update={"camera_sampling_yz": {"camera_1": CameraSamplingYZ(y=0.21, z=0.18)}})
+        ),
+    )
+    await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    assert writer.opened_kwargs[0]["voxel_size_yx"] == (0.18, 0.21)
+    scan_json = json.loads((tmp_path / "data/run/volumes/000001/single_gfp/scan.json").read_text())
+    assert scan_json["camera_sampling_yz"]["camera_1"] == {"y": 0.21, "z": 0.18}
+
+
+@pytest.mark.parametrize("scan_options", [{"axis": "x"}], indirect=True)
+@pytest.mark.usefixtures("writer")
+async def test_continuous_capture_disables_lasers_before_window_disarm(
+    opened_instrument: Instrument,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    instrument = opened_instrument
+    await add_line(instrument)
+    events: list[str] = []
+    axis = instrument._hal.stage.x
+    laser = instrument._all_lasers()[0].laser
+    orig_disarm, orig_call = axis.disarm_scan_window, laser.call
+
+    async def track_disarm() -> None:
+        events.append("disarm")
+        await orig_disarm()
+
+    async def track_laser_call(cmd: str, *args: object, **kwargs: object) -> object:
+        if cmd == "output_disable":
+            events.append("laser_off")
+        return await orig_call(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(axis, "disarm_scan_window", track_disarm)
+    monkeypatch.setattr(laser, "call", track_laser_call)
+    await instrument.start_acquisition(AcquisitionRequest(storage=STORAGE))
+    await asyncio.wait_for(instrument.wait_acquisition(), timeout=10)
+    assert "disarm" in events
+    assert events.index("laser_off") < events.index("disarm")

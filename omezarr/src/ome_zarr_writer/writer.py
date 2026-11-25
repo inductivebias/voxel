@@ -120,6 +120,7 @@ class WriterConfig(WriterSettings):
     shear_yz: float = 0.0
     channel_label: str = "channel 0"
     channel_color: str = "FFFFFF"
+    darkfield: dict[str, Any] | None = None
 
     @cached_property
     def shard_shape(self) -> UIVec3D:
@@ -179,6 +180,7 @@ class WriterConfig(WriterSettings):
             shear_yz=self.shear_yz,
             channel_label=self.channel_label,
             channel_color=self.channel_color,
+            darkfield=self.darkfield,
         )
 
         return OmeZarrDataset(group=group, arrays=arrays)

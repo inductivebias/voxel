@@ -457,6 +457,8 @@ class AcquisitionTask(FrozenModel):
     z: ZDefinition
     traversal: TileOrder = TileOrder.SNAKE_ROW
     iteration: IterationOrder = IterationOrder.POSITION_MAJOR
+    acquire_dark_frames: bool = False
+    dark_frame_count: int = Field(default=256, ge=1, le=4096)
 
     @model_validator(mode="after")
     def _check_line_scan(self) -> Self:
@@ -482,6 +484,8 @@ class TaskPatch(Patch):
     z: ZDefinition | None = None
     traversal: TileOrder | None = None
     iteration: IterationOrder | None = None
+    acquire_dark_frames: bool | None = None
+    dark_frame_count: Annotated[int, Field(ge=1, le=4096)] | None = None
 
 
 class WriterPatch(Patch):

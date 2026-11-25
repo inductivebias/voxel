@@ -688,6 +688,7 @@ class OmeMeta(SparseModel):
 
 class ZarrGroupAttributes(SparseModel):
     ome: OmeMeta
+    darkfield: dict[str, Any] | None = None
 
 
 class Zarr3GroupMeta(SparseModel):
@@ -711,6 +712,7 @@ class Zarr3GroupMeta(SparseModel):
         shear_yz: float = 0.0,
         channel_label: str = "channel 0",
         channel_color: str = "FFFFFF",
+        darkfield: dict[str, Any] | None = None,
     ) -> "Zarr3GroupMeta":
         """A Zarr v3 group with OME-NGFF v0.6 multiscale attributes for a CZYX
         dataset. Builds the `physical` coordinate system, per-level sequence
@@ -776,7 +778,8 @@ class Zarr3GroupMeta(SparseModel):
                         )
                     ],
                     omero=Omero.default(dtype=dtype, label=channel_label, color=channel_color),
-                )
+                ),
+                darkfield=darkfield,
             )
         )
 

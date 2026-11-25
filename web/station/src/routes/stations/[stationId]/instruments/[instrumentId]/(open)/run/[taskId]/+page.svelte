@@ -4,7 +4,9 @@
   import { page } from '$app/state';
   import { getPageInstrument } from '$lib/context.svelte';
   import {
+    type CameraSamplingYZ,
     convexHull,
+    defaultCameraSamplingYZ,
     type EditContext,
     type IterationOrder,
     type LineScan,
@@ -23,6 +25,7 @@
   import {
     Button,
     buttonVariants,
+    Checkbox,
     Dialog,
     DropdownMenu,
     NumberBox,
@@ -121,11 +124,36 @@
     if (task?.scan?.y_stack) updateScan({ y_stack: { ...task.scan.y_stack, ...patch } }, context);
   }
 
+  const cameraIds = $derived(instrument ? Object.keys(instrument.hal.detection) : []);
+
+  function cameraSampling(cameraId: string, index: number): CameraSamplingYZ {
+    return task?.scan?.camera_sampling_yz?.[cameraId] ?? defaultCameraSamplingYZ(cameraId, index);
+  }
+
+  function updateCameraSampling(
+    cameraId: string,
+    index: number,
+    patch: Partial<CameraSamplingYZ>,
+    context: EditContext = {}
+  ): void {
+    if (!task?.scan) return;
+    const next = { ...cameraSampling(cameraId, index), ...patch };
+    updateScan({ camera_sampling_yz: { ...task.scan.camera_sampling_yz, [cameraId]: next } }, context);
+  }
+
   const sweepCount = $derived(
     task?.scan?.y_stack
       ? Math.floor((task.scan.y_stack.end - task.scan.y_stack.start) / task.scan.y_stack.step + 1e-9) + 1
       : 1
   );
+  const zChunkEdge = $derived(instrument ? Math.max(64, 1 << instrument.state.output.max_level) : 128);
+  const suggestedDarkFrames = $derived(Math.max(256, zChunkEdge));
+  const acquireDarkFrames = $derived(Boolean(task?.acquire_dark_frames));
+  const darkFrameCount = $derived(task?.dark_frame_count ?? suggestedDarkFrames);
+
+  function setDarkFrameCount(count: number, context: EditContext = {}): void {
+    patchTask({ dark_frame_count: Math.max(1, Math.min(4096, Math.round(count))) }, context);
+  }
 
   function updateHold(axis: 'x' | 'y' | 'z', value: number, context: EditContext): void {
     if (!task) return;
@@ -368,6 +396,25 @@
               {disabled}
             />
           </FieldRow>
+          {#each cameraIds as cameraId, camIndex (cameraId)}
+            {@const sampling = cameraSampling(cameraId, camIndex)}
+            <FieldRow label={`${displayName(cameraId)} YZ`}>
+              {#each ['y', 'z'] as const as axis (axis)}
+                <NumberBox
+                  value={sampling[axis]}
+                  min={0.001}
+                  step={0.001}
+                  bigStep={0.01}
+                  prefix={axis.toUpperCase()}
+                  suffix="µm"
+                  aria-label={`${displayName(cameraId)} ${axis.toUpperCase()} sampling in micrometres`}
+                  onEditStart={() => instrument.edits.hold()}
+                  onChange={(value, edit) => updateCameraSampling(cameraId, camIndex, { [axis]: value }, edit)}
+                  {disabled}
+                />
+              {/each}
+            </FieldRow>
+          {/each}
           <FieldRow label="Targeted framerate">
             <NumberBox
               value={task.scan.target_frame_rate_hz ??
@@ -432,6 +479,7 @@
               </FieldRow>
             {/if}
           {/each}
+          {@render darkFramesField()}
           <p class="text-sm text-fg-muted">
             {#if task.scan.y_stack}
               Each X end is exclusive. Y moves between sweeps, up to the inclusive Y end in whole steps. Z must already
@@ -808,9 +856,52 @@
               onChange={(traversal) => patchTask({ traversal })}
             />
           </FieldRow>
+          {@render darkFramesField()}
         </div>
       </Section>
     {/if}
+
+    {#snippet darkFramesField()}
+      {@const chunks = suggestedDarkFrames / zChunkEdge}
+      <FieldRow label="Dark-frames">
+        <label class="flex h-ui-sm items-center gap-2 text-sm whitespace-nowrap text-fg">
+          <Checkbox
+            value={acquireDarkFrames}
+            onChange={(checked) => patchTask({ acquire_dark_frames: checked })}
+            {disabled}
+          />
+          Acquire dark-frames
+        </label>
+        <NumberBox
+          value={darkFrameCount}
+          min={1}
+          max={4096}
+          step={zChunkEdge}
+          bigStep={zChunkEdge}
+          decimals={0}
+          suffix="frames"
+          aria-label="Dark-frame count"
+          onEditStart={() => instrument?.edits.hold()}
+          onChange={setDarkFrameCount}
+          disabled={disabled || !acquireDarkFrames}
+        />
+      </FieldRow>
+      <p class="text-xs text-fg-muted">
+        Suggested: {suggestedDarkFrames} frames ({chunks} × {zChunkEdge}-frame Z-chunk{chunks > 1 ? 's' : ''} at L{instrument
+          ?.state.output.max_level}). Saved with lasers off to <code>dark/before.ome.zarr</code> (and
+        <code>dark/after.ome.zarr</code> if &gt;10 min).
+        {#if acquireDarkFrames && darkFrameCount !== suggestedDarkFrames}
+          <button
+            type="button"
+            class="ml-1 underline hover:text-fg"
+            {disabled}
+            onclick={() => setDarkFrameCount(suggestedDarkFrames)}
+          >
+            Use {suggestedDarkFrames}
+          </button>
+        {/if}
+      </p>
+    {/snippet}
 
     <section
       class="flex min-h-40 flex-1 flex-col overflow-hidden rounded-t-lg border-x border-t border-line-muted bg-tint"

@@ -42,7 +42,9 @@ async def test_return_to_start_resets_window_before_moving():
 @pytest.mark.asyncio
 @pytest.mark.parametrize("finished", [False, True])
 @pytest.mark.parametrize("disarm_fails", [False, True])
-async def test_teardown_closes_window_first_and_continues_after_failure(monkeypatch, finished, disarm_fails):
+async def test_teardown_inhibits_lasers_before_window_disarm_and_continues_after_failure(
+    monkeypatch, finished, disarm_fails
+):
     events = []
 
     async def disarm():
@@ -72,7 +74,7 @@ async def test_teardown_closes_window_first_and_continues_after_failure(monkeypa
         cast("ContinuousAxisHandle", axis),
         _PassProgress(prepared=True, finished=finished),
     )
-    assert events[:3] == ["window", "laser/halt", "daq"]
+    assert events[:3] == ["laser/halt", "window", "daq"]
     assert ("abort/retry" in events) is not finished
     assert len(errors) == int(disarm_fails)
     inst._close_stacks.assert_awaited_once()

@@ -103,6 +103,25 @@ class YScanRows(RecordModel):
         return [self.start + i * self.step for i in range(count)]
 
 
+class CameraSamplingYZ(RecordModel):
+    """Per-camera specimen-space (y, z) sampling in micrometres for line-scan volumes."""
+
+    y: float = Field(gt=0, allow_inf_nan=False)
+    z: float = Field(gt=0, allow_inf_nan=False)
+
+
+_DEFAULT_CAM1_YZ = CameraSamplingYZ(y=0.195, z=0.169)
+_DEFAULT_CAM2_YZ = CameraSamplingYZ(y=0.293, z=0.254)
+
+
+def default_camera_sampling_yz(camera_id: str, index: int = 0) -> CameraSamplingYZ:
+    """Return the default (y, z) sampling in µm for a camera."""
+    key = camera_id.strip().lower()
+    if key not in ("camera_1", "cam1") and (key.endswith(("2", "_1")) or index == 1):
+        return _DEFAULT_CAM2_YZ
+    return _DEFAULT_CAM1_YZ
+
+
 class LineScan(RecordModel):
     """Positive, encoder-paced sweep in micrometres; the acquisition end is exclusive."""
 
@@ -110,10 +129,15 @@ class LineScan(RecordModel):
     start: float = Field(allow_inf_nan=False)
     end: float = Field(allow_inf_nan=False)
     spacing: float = Field(gt=0, allow_inf_nan=False)
+    camera_sampling_yz: dict[str, CameraSamplingYZ] = Field(default_factory=dict)
     runway_s: float = Field(default=1, gt=0, allow_inf_nan=False)
     camera_rate_fraction: float | None = Field(default=0.95, gt=0, lt=1, allow_inf_nan=False)
     target_frame_rate_hz: float | None = Field(default=None, gt=0, allow_inf_nan=False)
     y_stack: YScanRows | None = None
+
+    def resolve_camera_sampling_yz(self, camera_id: str, index: int = 0) -> CameraSamplingYZ:
+        """Return the configured or default (y, z) sampling in µm for ``camera_id``."""
+        return self.camera_sampling_yz.get(camera_id) or default_camera_sampling_yz(camera_id, index)
 
     @model_validator(mode="after")
     def _check_window(self) -> Self:
@@ -141,6 +165,8 @@ class PlannedVolume(RecordModel):
     z_end: float = Field(allow_inf_nan=False)
     routes: dict[str, str] = Field(default_factory=dict)
     scan: LineScan | None = None
+    acquire_dark_frames: bool = False
+    dark_frame_count: int = Field(default=256, ge=1, le=4096)
 
     @model_validator(mode="after")
     def _check_z_range(self) -> Self:
@@ -162,6 +188,7 @@ class AcquisitionVolume(PlannedVolume):
     status: VolumeStatus = VolumeStatus.PENDING
     datasets: dict[ChannelName, Dataset] = Field(default_factory=dict)
     warnings: list[str] = Field(default_factory=list)
+    darkfield: dict[str, JsonValue] | None = None
 
     def transition(self, status: VolumeStatus) -> Self:
         """Return this volume in a valid next lifecycle state."""
@@ -313,6 +340,13 @@ class AcquisitionManifest(RecordModel):
         """Register the channel datasets for one volume."""
         volume = self._get_volume(volume_index).register_datasets(datasets)
         return self._replace_volume(volume_index, volume)
+
+    def set_volumes_darkfield(self, darkfields: Mapping[int, Mapping[str, JsonValue]]) -> Self:
+        """Attach or update darkfield calibration metadata for one or more volumes."""
+        volumes = list(self.volumes)
+        for volume_index, darkfield in darkfields.items():
+            volumes[volume_index] = self._get_volume(volume_index).model_copy(update={"darkfield": dict(darkfield)})
+        return self.model_copy(update={"volumes": volumes})
 
     def complete_volume(self, volume_index: int, *, warnings: list[str] | None = None) -> Self:
         """Complete one volume and all of its datasets."""

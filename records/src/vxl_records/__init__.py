@@ -21,6 +21,7 @@ from .models import (
     AcquisitionOrigin,
     AcquisitionStatus,
     AcquisitionVolume,
+    CameraSamplingYZ,
     Dataset,
     DatasetFormat,
     DatasetLocation,
@@ -37,6 +38,7 @@ from .models import (
     RemoteTarget,
     StorageSpec,
     VolumeStatus,
+    default_camera_sampling_yz,
 )
 from .presets import PresetCatalog
 from .records import SQLiteRecords, VoxelRecords
@@ -48,6 +50,7 @@ __all__ = [
     "AcquisitionOrigin",
     "AcquisitionStatus",
     "AcquisitionVolume",
+    "CameraSamplingYZ",
     "DatabaseIdentityError",
     "DatabaseVersionError",
     "Dataset",
@@ -81,4 +84,5 @@ __all__ = [
     "StorageSpec",
     "VolumeStatus",
     "VoxelRecords",
+    "default_camera_sampling_yz",
 ]

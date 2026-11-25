@@ -197,6 +197,29 @@
   const blockers = $derived(checks.filter((check) => check.tone === 'block').length);
 
   let starting = $state(false);
+  let togglingPause = $state(false);
+  const stripLabel = $derived(manifest?.volumes.some((item) => item.scan?.axis === 'x') ? 'X-strip' : 'volume');
+  const pauseAction = $derived.by(() => {
+    if (!manifest || !active || manifest.volumes.length <= 1 || active.phase === 'stopping') return null;
+    const isPaused = active.phase === 'paused';
+    const pending = Boolean(active.pause_requested);
+    const resume = isPaused || pending;
+    const onFinal = !resume && active.volume_index >= manifest.volumes.length - 1;
+    const variant = isPaused ? ('default' as const) : ('outline' as const);
+    let label = `Pause after ${stripLabel}`;
+    let title = onFinal
+      ? `Already on the final ${stripLabel}`
+      : `Finish the current ${stripLabel} and pause before starting the next one`;
+    if (isPaused) [label, title] = ['Continue scan', 'Continue to the next volume'];
+    else if (pending) {
+      [label, title] = [
+        `Pausing after ${stripLabel} — Continue scan`,
+        'Cancel the pending pause and keep scanning continuously'
+      ];
+    }
+    if (togglingPause) label = resume ? 'Continuing…' : 'Pausing…';
+    return { variant, disabled: togglingPause || onFinal, resume, label, title };
+  });
 
   function defaultPath(): string {
     const date = new Date();
@@ -392,6 +415,17 @@
     }
   }
 
+  async function togglePause(source: Instrument, resume: boolean): Promise<void> {
+    togglingPause = true;
+    try {
+      await (resume ? source.resumeAcquisition() : source.pauseAcquisition());
+    } catch (error) {
+      reportFailure(error);
+    } finally {
+      togglingPause = false;
+    }
+  }
+
   function newRun(): void {
     lastRunId = null;
     path = defaultPath();
@@ -502,6 +536,9 @@
               >
                 <span class="flex min-w-0 items-center gap-2">
                   <span class="min-w-0 flex-1 truncate text-base text-fg">Task {index + 1}</span>
+                  {#if task.acquire_dark_frames}
+                    <Badge tone="neutral">Dark ({task.dark_frame_count ?? 256})</Badge>
+                  {/if}
                   <Badge>{task.scan?.y_stack ? 'XY-Scan' : task.scan ? 'X-Scan' : TASK_TYPES[task.xy.mode]}</Badge>
                   {#if instrument}
                     <span class="text-sm text-fg-muted tabular-nums">{plural(taskVolumes(task.id), 'volume')}</span>
@@ -649,9 +686,17 @@
 <footer class="shrink-0 px-4 pt-4">
   <div class="max-w-4xl">
     {#if capture}
-      <Section heading="Acquiring" variant="raised" class="frame-docked-bottom">
+      <Section
+        heading={active?.phase === 'paused' ? 'Paused' : 'Acquiring'}
+        variant="raised"
+        class="frame-docked-bottom"
+      >
         {#snippet trailing()}
-          {#if active}<Badge>{displayName(active.phase)}</Badge>{/if}
+          {#if active}
+            <Badge tone={active.phase === 'paused' || active.pause_requested ? 'warning' : 'neutral'}>
+              {active.pause_requested ? `Pausing after ${stripLabel}` : displayName(active.phase)}
+            </Badge>
+          {/if}
           <span class="text-sm text-fg-muted tabular-nums">{percent}%</span>
         {/snippet}
         <progress
@@ -688,6 +733,17 @@
             <dd class="font-mono wrap-anywhere">{storageLabel(manifest)}</dd>
           </dl>
           {@render volumes(manifest)}
+          {#if pauseAction}
+            <Button
+              variant={pauseAction.variant}
+              class="w-full"
+              disabled={pauseAction.disabled}
+              title={pauseAction.title}
+              onclick={() => togglePause(instrument, pauseAction.resume)}
+            >
+              {pauseAction.label}
+            </Button>
+          {/if}
         {:else}
           <p class="text-sm text-fg-muted" role="status">Preparing the acquisition…</p>
         {/if}

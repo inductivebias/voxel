@@ -261,6 +261,11 @@ export interface XYDefinition {
 /** Whether a task iterates positions or profiles in its outer loop. */
 export type IterationOrder = 'position_major' | 'profile_major';
 
+export interface CameraSamplingYZ {
+  y: number;
+  z: number;
+}
+
 export interface LineScan {
   axis: 'x' | 'y' | 'z';
   start: number;
@@ -270,6 +275,7 @@ export interface LineScan {
   camera_rate_fraction?: number | null;
   target_frame_rate_hz?: number | null;
   y_stack?: { start: number; end: number; step: number } | null;
+  camera_sampling_yz?: Record<string, CameraSamplingYZ>;
 }
 
 /** Persisted acquisition intent expanded into concrete volumes by the instrument. */
@@ -281,6 +287,8 @@ export interface AcquisitionTask {
   z: ZDefinition;
   traversal: TileOrder;
   iteration: IterationOrder;
+  acquire_dark_frames?: boolean;
+  dark_frame_count?: number;
 }
 
 /** Tile acquisition ordering strategy. */
@@ -377,6 +385,8 @@ export interface TaskPatch {
   z?: ZDefinition;
   traversal?: TileOrder;
   iteration?: IterationOrder;
+  acquire_dark_frames?: boolean;
+  dark_frame_count?: number;
 }
 
 // ---- preview control payloads ----
@@ -482,6 +492,8 @@ export interface PlannedVolume {
   z_step: number;
   z_end: number;
   routes: Record<string, string>;
+  acquire_dark_frames?: boolean;
+  dark_frame_count?: number;
 }
 
 /** One task/profile capture and its channel datasets. */
@@ -489,6 +501,7 @@ export interface AcquisitionVolume extends PlannedVolume {
   status: VolumeStatus;
   datasets: Record<string, AcquisitionDataset>;
   warnings?: string[];
+  darkfield?: Record<string, unknown> | null;
 }
 
 /** Parameters of an acquisition run; `task_ids=null` → every planned task in traversal order. */
@@ -497,6 +510,8 @@ export interface AcquisitionRequest {
   task_ids?: string[] | null;
   operator?: string | null;
   continue_on_error?: boolean | null;
+  acquire_dark_frames?: boolean | null;
+  dark_frame_count?: number | null;
 }
 
 export interface AcquisitionFailure {
@@ -662,7 +677,7 @@ export interface InstrumentStatus {
   history: HistoryState;
 }
 
-export type AcquisitionPhase = 'positioning' | 'configuring' | 'capturing' | 'finalizing' | 'stopping';
+export type AcquisitionPhase = 'positioning' | 'configuring' | 'capturing' | 'finalizing' | 'paused' | 'stopping';
 
 /** Transient execution progress linked to a durable acquisition manifest. */
 export interface ActiveAcquisition {
@@ -670,6 +685,7 @@ export interface ActiveAcquisition {
   manifest_revision: number;
   volume_index: number;
   phase: AcquisitionPhase;
+  pause_requested?: boolean;
   frames_captured: number;
 }
 
