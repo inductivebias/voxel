@@ -91,7 +91,7 @@ class WriterSettings(BaseModel):
         default=None, ge=0, le=9, description="Codec compression level (defaults to 3)"
     )
     compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = Field(
-        default=None, description="Blosc shuffle mode (defaults to 'bitshuffle')"
+        default=None, description="Blosc shuffle mode (defaults to 'shuffle' for GPU writer, 'bitshuffle' for CPU)"
     )
     skip_empty_chunks: bool = Field(
         default=False, description="Omit all-fill_value chunks from Zarr v3 shard index and skip empty shards"
@@ -453,6 +453,15 @@ class DatasetWriter:
             )
         if len(ring) < 2:
             raise ValueError(f"ring needs at least 2 slots, got {len(ring)}")
+
+        if (
+            backend == ArrayWriter.Backend.GPU
+            and config.compression_shuffle is None
+            and config.compression in (Compression.LZ4, Compression.BLOSC_LZ4, Compression.BLOSC_ZSTD)
+        ):
+            config = config.model_copy(update={"compression_shuffle": "shuffle"})
+            if "dataset" in config.__dict__:
+                object.__delattr__(config, "dataset")
 
         self._config = config
         self._storage = storage

@@ -27,11 +27,13 @@ from ome_zarr_writer import (
     vram_fits_batch,
 )
 from ome_zarr_writer.array import ArrayWriter
-from ome_zarr_writer.array.gpu import GPUArrayWriter, _has_nvcomp, max_batch_chunks_for
+from ome_zarr_writer.array.gpu import GPUArrayWriter, _has_nvcomp, _parse_array_meta, max_batch_chunks_for
 from ome_zarr_writer.array.ts import TSArrayWriter
+from ome_zarr_writer.dataset import Zarr3ArrayMeta
 from ome_zarr_writer.pyramid_gpu import is_gpu_available, pyramids_3d_gpu
 from ome_zarr_writer.sizing import gpu_workspace_bytes, per_slot_bytes
 from ome_zarr_writer.slot import _gpu_worker_slot
+from ome_zarr_writer.writer import DatasetWriter, Ring
 
 
 def _write_stack(tmp_path: Path, name: str, cfg: WriterConfig, vol: np.ndarray, *, backend=None) -> Path:
@@ -217,9 +219,9 @@ def test_vram_fallback_downgrades_gpu_backend_and_ring_reuse_skips_sizer(
 @pytest.mark.parametrize(
     ("compression", "compression_shuffle"),
     [
-        (Compression.BLOSC_LZ4, "shuffle"),
+        (Compression.BLOSC_LZ4, None),
         (Compression.BLOSC_LZ4, "noshuffle"),
-        (Compression.BLOSC_ZSTD, "shuffle"),
+        (Compression.BLOSC_ZSTD, None),
         (Compression.BLOSC_ZSTD, "noshuffle"),
         (Compression.ZSTD, None),
         (Compression.NONE, None),
@@ -243,6 +245,67 @@ def test_gpu_array_writer_roundtrip_and_incompressible_noise(
     suffix = f"{compression.value}_{compression_shuffle or 'default'}"
     target = _write_stack(tmp_path, f"gpu_{suffix}", cfg, vol, backend=ArrayWriter.Backend.GPU)
     np.testing.assert_array_equal(_read_level(target, 0), vol)
+
+
+@pytest.mark.parametrize("compression", [Compression.BLOSC_LZ4, Compression.BLOSC_ZSTD])
+def test_dataset_writer_defaults_blosc_shuffle_by_backend(tmp_path: Path, compression: Compression):
+    cfg_default = WriterConfig(
+        volume_shape=UIVec3D(z=64, y=64, x=64),
+        voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
+        max_level=ScaleLevel.L0,
+        compression=compression,
+    )
+    _ = cfg_default.dataset  # pre-populate cached_property to verify invalidation on GPU override
+
+    cfg_explicit = WriterConfig(
+        volume_shape=UIVec3D(z=64, y=64, x=64),
+        voxel_size=UVec3D(z=1.0, y=0.5, x=0.5),
+        max_level=ScaleLevel.L0,
+        compression=compression,
+        compression_shuffle="bitshuffle",
+    )
+
+    ring = Ring.allocate(
+        slots=2,
+        prefix=f"shuffle_test_{compression.value}",
+        batch_shape=cfg_default.batch_shape,
+        max_level=cfg_default.max_level,
+        dtype=cfg_default.dtype,
+    )
+    try:
+        # GPU backend with default compression_shuffle=None -> byte-shuffle ('shuffle'), GPU fast-path compatible.
+        gpu_ds = DatasetWriter(
+            cfg_default, Local(target=tmp_path / f"gpu_def_{compression.value}"), ring, backend=ArrayWriter.Backend.GPU
+        )
+        gpu_ds.close()
+        gpu_meta = Zarr3ArrayMeta.model_validate_json((gpu_ds.target / "0" / "zarr.json").read_text())
+        gpu_blosc = json.loads((gpu_ds.target / "0" / "zarr.json").read_text())["codecs"][0]["configuration"]["codecs"][
+            1
+        ]["configuration"]
+        assert gpu_blosc["shuffle"] == "shuffle"
+        assert _parse_array_meta(gpu_meta).shuffle_flag == 0x01
+
+        # CPU TS backend with default compression_shuffle=None -> 'bitshuffle'.
+        ts_ds = DatasetWriter(
+            cfg_default, Local(target=tmp_path / f"ts_def_{compression.value}"), ring, backend=ArrayWriter.Backend.TS
+        )
+        ts_ds.close()
+        ts_blosc = json.loads((ts_ds.target / "0" / "zarr.json").read_text())["codecs"][0]["configuration"]["codecs"][
+            1
+        ]["configuration"]
+        assert ts_blosc["shuffle"] == "bitshuffle"
+
+        # GPU backend with explicit compression_shuffle='bitshuffle' preserves 'bitshuffle' (falls back to TS).
+        exp_ds = DatasetWriter(
+            cfg_explicit, Local(target=tmp_path / f"gpu_exp_{compression.value}"), ring, backend=ArrayWriter.Backend.GPU
+        )
+        exp_ds.close()
+        exp_blosc = json.loads((exp_ds.target / "0" / "zarr.json").read_text())["codecs"][0]["configuration"]["codecs"][
+            1
+        ]["configuration"]
+        assert exp_blosc["shuffle"] == "bitshuffle"
+    finally:
+        ring.close()
 
 
 @pytest.mark.skipif(not is_gpu_available(), reason="requires CUDA GPU")
@@ -278,7 +341,6 @@ def test_gpu_array_writer_falls_back_cleanly_without_nvcomp(tmp_path: Path, monk
     [
         (Compression.GZIP, None),
         (Compression.BLOSC_ZSTD, "bitshuffle"),
-        (Compression.BLOSC_ZSTD, None),
         (Compression.BLOSC_LZ4, "bitshuffle"),
     ],
 )
