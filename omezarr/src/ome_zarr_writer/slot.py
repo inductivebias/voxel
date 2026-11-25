@@ -27,8 +27,8 @@ from pydantic import BaseModel, ConfigDict, Field
 from vxlib.vector import UIVec3D
 
 from ome_zarr_writer.array import ArrayWriter
-from ome_zarr_writer.dataset import DownscaleType, Dtype, LossyDomain, ScaleLevel
-from ome_zarr_writer.preprocess import PreprocessConfig, estimate_noise_sigma, filter_and_bin_volume, preprocess_volume
+from ome_zarr_writer.dataset import DownscaleType, Dtype, ScaleLevel
+from ome_zarr_writer.preprocess import PreprocessConfig, filter_and_bin_volume
 from ome_zarr_writer.storage import S3Store
 
 from .pyramid import pyramids_3d_numba
@@ -137,7 +137,6 @@ _LAYER_WARNED: list[bool] = []
 _WORKER_GPU_WS: dict[str, Any] = {}
 _WORKER_PINNED_L0: list[np.ndarray] = []
 _GPU_FALLBACK_WARNED: list[bool] = []
-_WORKER_LOCKED_NOISE: dict[str, float] = {}
 
 
 def _worker_init(shm_layout: list[tuple[int, str, tuple[int, int, int]]], dtype_str: str) -> None:
@@ -161,7 +160,6 @@ def _worker_bind_output(setup: OutputSetup) -> None:
     for writer in _WORKER_WRITERS.values():
         writer.close()
     _WORKER_WRITERS.clear()
-    _WORKER_LOCKED_NOISE.clear()
     for level in setup.levels:
         writer = setup.backend()
         writer.open(setup.author_root / str(level.value), setup.store)
@@ -197,7 +195,6 @@ def _worker_close_output() -> None:
     for writer in _WORKER_WRITERS.values():
         writer.close()
     _WORKER_WRITERS.clear()
-    _WORKER_LOCKED_NOISE.clear()
     if _WORKER_GPU_WS or _WORKER_PINNED_L0:
         from ome_zarr_writer.array.gpu import release_shared_encoder_buffers  # noqa: PLC0415
         from ome_zarr_writer.pyramid_gpu import (  # noqa: PLC0415
@@ -265,27 +262,6 @@ def _worker_process_and_write(max_level_value: int, filled_l0: int, batch_idx: i
             bin_mode=pp.bin_mode,
             highpass_add=pp.highpass_add,
             use_gpu=False,
-        )
-        _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0] = block
-
-    if pp.has_uint_op or pp.has_lossy:
-        sigma_val, offset_val = pp.noise_sigma, None
-        if pp.has_lossy and (sigma_val is None or sigma_val <= 0.0 or pp.lossy_domain == LossyDomain.SQRT):
-            if "sigma" not in _WORKER_LOCKED_NOISE:
-                est_sigma, est_off = estimate_noise_sigma(block, domain=pp.lossy_domain)
-                locked_sigma = est_sigma if (sigma_val is None or sigma_val <= 0.0) else float(sigma_val)
-                _WORKER_LOCKED_NOISE["sigma"] = locked_sigma
-                _WORKER_LOCKED_NOISE["offset"] = est_off
-            sigma_val = _WORKER_LOCKED_NOISE["sigma"]
-            offset_val = _WORKER_LOCKED_NOISE.get("offset", 0.0)
-        block = preprocess_volume(
-            block,
-            keep_bits=pp.keep_bits,
-            dark_floor=pp.dark_floor,
-            lossy_step_noise=pp.lossy_step_noise,
-            lossy_domain=pp.lossy_domain,
-            noise_sigma=sigma_val,
-            sqrt_offset=offset_val,
         )
         _WORKER_ARRAYS[ScaleLevel.L0][:filled_l0] = block
 
@@ -373,7 +349,7 @@ def _worker_process_and_write_gpu(max_level_value: int, filled_l0: int, batch_id
                     reduction=setup.reduction,
                     preprocess=setup.preprocess,
                     copy_levels_to=None if all_gpu_writers else _WORKER_ARRAYS,
-                    copy_l0_to=(l0_full if (not all_gpu_writers and setup.preprocess.has_any) else None),
+                    copy_l0_to=(l0_full if (not all_gpu_writers and setup.preprocess.has_spatial_op) else None),
                     return_host_f32=False,
                 )
                 process_ended = datetime.now(UTC)

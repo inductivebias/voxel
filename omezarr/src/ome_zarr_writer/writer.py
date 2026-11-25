@@ -47,7 +47,6 @@ from ome_zarr_writer.dataset import (
     Compression,
     DownscaleType,
     Dtype,
-    LossyDomain,
     OmeZarrDataset,
     PreFilterType,
     ScaleLevel,
@@ -94,21 +93,8 @@ class WriterSettings(BaseModel):
     compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = Field(
         default=None, description="Blosc shuffle mode (defaults to 'bitshuffle')"
     )
-    keep_bits: int | None = Field(
-        default=None, ge=1, le=16, description="Keep top N significant bits before compression"
-    )
-    dark_floor: int = Field(default=0, ge=0, description="Clamp pixel values <= dark_floor to 0 (0 disables)")
     skip_empty_chunks: bool = Field(
         default=False, description="Omit all-fill_value chunks from Zarr v3 shard index and skip empty shards"
-    )
-    lossy_step_noise: float | None = Field(
-        default=None, ge=0.0, le=10.0, description="Quantisation step as multiple of estimated noise sigma"
-    )
-    lossy_domain: LossyDomain = Field(
-        default=LossyDomain.SQRT, description="Domain for noise estimation and quantisation ('sqrt' or 'linear')"
-    )
-    noise_sigma: float | None = Field(
-        default=None, ge=0.0, description="Explicit noise sigma override (None auto-estimates from first batch)"
     )
     downscale_type: DownscaleType = Field(
         default=DownscaleType.GAUSSIAN,
@@ -164,17 +150,12 @@ class WriterConfig(WriterSettings):
     @cached_property
     def preprocess_config(self) -> PreprocessConfig:
         return PreprocessConfig(
-            keep_bits=self.keep_bits,
-            dark_floor=self.dark_floor,
             bin_y=self.bin_y,
             bin_x=self.bin_x,
             pre_filter=self.pre_filter,
             filter_size=self.filter_size,
             bin_mode=self.bin_mode,
             highpass_add=self.highpass_add,
-            lossy_step_noise=self.lossy_step_noise,
-            lossy_domain=self.lossy_domain,
-            noise_sigma=self.noise_sigma,
         )
 
     @cached_property
@@ -1019,9 +1000,7 @@ class OMEZarrWriter:
                 else (ArrayWriter.Backend.GPU if effective_use_gpu else ArrayWriter.Backend.TS)
             )
         )
-        self._active = DatasetWriter(
-            config, storage, self._ring, backend=effective_backend, use_gpu=effective_use_gpu
-        )
+        self._active = DatasetWriter(config, storage, self._ring, backend=effective_backend, use_gpu=effective_use_gpu)
         return self._active
 
     @contextmanager

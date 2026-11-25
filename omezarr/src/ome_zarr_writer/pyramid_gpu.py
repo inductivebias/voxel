@@ -12,18 +12,15 @@ from numba import cuda
 from numba.core.errors import NumbaPerformanceWarning
 from vxlib.vector import UIVec3D
 
-from ome_zarr_writer.dataset import DownscaleType, Dtype, LossyDomain, ScaleLevel
+from ome_zarr_writer.dataset import DownscaleType, Dtype, ScaleLevel
 from ome_zarr_writer.preprocess import (
     _BINMODE_TO_CODE,
     _PREFILTER_TO_CODE,
     _THREADS_3D,
     PreprocessConfig,
-    _cuda_lossy_quantize_kernel,
     _cuda_prefilter_and_bin_kernel,
-    _cuda_preprocess_uint_kernel,
     _dtype_int_bounds,
     _grid_3d,
-    estimate_noise_sigma,
 )
 
 log = logging.getLogger(__name__)
@@ -182,9 +179,7 @@ def _cuda_gauss_z_cast(xy_in: Any, out_f32: Any, out_cast: Any) -> None:
     out_cast[zo, yo, xo] = val
 
 
-def _run_step_gpu(
-    d_vol: Any, d_xy_scratch: Any, d_out_f32: Any, d_out_cast: Any, reduction: DownscaleType
-) -> None:
+def _run_step_gpu(d_vol: Any, d_xy_scratch: Any, d_out_f32: Any, d_out_cast: Any, reduction: DownscaleType) -> None:
     zo, yo, xo = d_out_f32.shape
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", NumbaPerformanceWarning)
@@ -224,8 +219,6 @@ class GpuPyramidWorkspace:
         self.d_levels: dict[ScaleLevel, Any] = {}
         self.d_f32_levels: dict[ScaleLevel, Any] = {}
         self.d_xy_scratch: Any = None
-        self.locked_noise_sigma: float | None = None
-        self.locked_sqrt_offset: float | None = None
         self.ensure_device_buffers()
 
     def ensure_device_buffers(self) -> None:
@@ -250,9 +243,9 @@ class GpuPyramidWorkspace:
         self.d_f32_levels.clear()
         self.d_xy_scratch = None
 
-    def _upload_and_preprocess_l0(self, block: np.ndarray, pp: PreprocessConfig, sqrt_offset: float | None) -> Any:
-        is_int, max_val_f = _dtype_int_bounds(self.dtype)
+    def _upload_and_preprocess_l0(self, block: np.ndarray, pp: PreprocessConfig) -> Any:
         if pp.has_spatial_op:
+            is_int, max_val_f = _dtype_int_bounds(self.dtype)
             z_raw, y_raw, x_raw = block.shape
             z0, y0, x0 = z_raw, y_raw // pp.bin_y, x_raw // pp.bin_x
             if self.d_raw is None or any(self.d_raw.shape[i] < d for i, d in enumerate((z_raw, y_raw, x_raw))):
@@ -278,39 +271,6 @@ class GpuPyramidWorkspace:
             z0, y0, x0 = block.shape
             d_l0 = self.d_levels[ScaleLevel.L0][:z0, :y0, :x0]
             d_l0.copy_to_device(np.ascontiguousarray(block))
-
-        if pp.has_uint_op and self.dtype.kind == "u" and self.dtype.itemsize in (1, 2):
-            bits = self.dtype.itemsize * 8
-            max_val = (1 << bits) - 1
-            shift = min(bits, max(0, bits - pp.keep_bits)) if pp.keep_bits is not None else 0
-            if pp.dark_floor > 0 or shift > 0:
-                half = (1 << (shift - 1)) if shift > 0 else 0
-                mask = max_val ^ ((1 << shift) - 1) if shift > 0 else max_val
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", NumbaPerformanceWarning)
-                    _cuda_preprocess_uint_kernel[_grid_3d(z0, y0, x0), _THREADS_3D](  # type: ignore[index]
-                        d_l0, pp.dark_floor, shift, half, mask, max_val
-                    )
-
-        if pp.has_lossy:
-            sigma = pp.noise_sigma if (pp.noise_sigma is not None and pp.noise_sigma > 0.0) else self.locked_noise_sigma
-            offset = sqrt_offset if sqrt_offset is not None else self.locked_sqrt_offset
-            if sigma is None or sigma <= 0.0 or (pp.lossy_domain == LossyDomain.SQRT and offset is None):
-                z_step = max(1, z0 // max(1, min(4, z0)))
-                sample = d_l0[::z_step].copy_to_host() if pp.has_spatial_op else block[::z_step]
-                est_sigma, est_off = estimate_noise_sigma(sample, domain=pp.lossy_domain, offset=offset)
-                if sigma is None or sigma <= 0.0:
-                    sigma = self.locked_noise_sigma = est_sigma
-                if offset is None:
-                    offset = self.locked_sqrt_offset = est_off
-            step_val = float(pp.lossy_step_noise or 0.0) * float(sigma)
-            if step_val > 0.0:
-                dom_code = 1 if pp.lossy_domain == LossyDomain.SQRT else 2
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore", NumbaPerformanceWarning)
-                    _cuda_lossy_quantize_kernel[_grid_3d(z0, y0, x0), _THREADS_3D](  # type: ignore[index]
-                        d_l0, dom_code, step_val, float(offset or 0.0), is_int, max_val_f
-                    )
         return d_l0
 
     def compute_from_host(
@@ -323,13 +283,12 @@ class GpuPyramidWorkspace:
         copy_levels_to: dict[ScaleLevel, np.ndarray] | None = None,
         copy_l0_to: np.ndarray | None = None,
         return_host_f32: bool = False,
-        sqrt_offset: float | None = None,
     ) -> dict[ScaleLevel, Any]:
         """Upload ``block``, apply optional preprocessing, build pyramid levels, and optionally copy to host."""
         if reduction not in _SUPPORTED_REDUCTIONS:
             raise ValueError(f"Unsupported downscale type: {reduction}")
         self.ensure_device_buffers()
-        d_l0 = self._upload_and_preprocess_l0(block, preprocess or PreprocessConfig(), sqrt_offset)
+        d_l0 = self._upload_and_preprocess_l0(block, preprocess or PreprocessConfig())
         z0, y0, x0 = d_l0.shape
 
         if copy_l0_to is not None:
@@ -341,9 +300,7 @@ class GpuPyramidWorkspace:
         current_vol: Any = d_l0
         host_f32: dict[ScaleLevel, np.ndarray] = {}
         device_cast: dict[ScaleLevel, Any] = {ScaleLevel.L0: d_l0}
-        sorted_levels = sorted(
-            (lvl for lvl in max_level.levels if lvl != ScaleLevel.L0), key=lambda lvl: lvl.factor
-        )
+        sorted_levels = sorted((lvl for lvl in max_level.levels if lvl != ScaleLevel.L0), key=lambda lvl: lvl.factor)
         for target_level in sorted_levels:
             steps = int(math.log2(target_level.factor)) - int(math.log2(current_factor))
             for _ in range(steps):
@@ -398,9 +355,6 @@ def warmup_gpu_pyramid(dtype: Dtype | np.dtype, reduction: DownscaleType = Downs
         _cuda_prefilter_and_bin_kernel[_grid_3d(4, 4, 4), _THREADS_3D](  # type: ignore[index]
             d_in, d_in[:, :4, :4], 2, 2, 0, 3, 0, 100.0, is_int, max_val_f
         )
-        _cuda_lossy_quantize_kernel[_grid_3d(4, 4, 4), _THREADS_3D](  # type: ignore[index]
-            d_in[:, :4, :4], 1, 1.0, 0.0, is_int, max_val_f
-        )
     if dt != np.dtype(np.float32):
         _run_step_gpu(
             d_f32,
@@ -427,9 +381,6 @@ def pyramids_3d_gpu(
     block: np.ndarray,
     max_level: ScaleLevel,
     reduction: DownscaleType = DownscaleType.MEAN,
-    *,
-    keep_bits: int | None = None,
-    dark_floor: int = 0,
 ) -> dict[ScaleLevel, np.ndarray]:
     """Compute a 3D multi-scale pyramid on the GPU; drop-in counterpart to ``pyramids_3d_numba``."""
     if reduction not in _SUPPORTED_REDUCTIONS:
@@ -446,6 +397,5 @@ def pyramids_3d_gpu(
         block,
         max_level,
         reduction=reduction,
-        preprocess=PreprocessConfig(keep_bits=keep_bits, dark_floor=dark_floor),
         return_host_f32=True,
     )

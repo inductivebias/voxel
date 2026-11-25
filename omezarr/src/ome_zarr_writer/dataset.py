@@ -342,12 +342,6 @@ class BinningMode(StrEnum):
     NEAREST = "nearest"
 
 
-class LossyDomain(StrEnum):
-    NONE = "none"
-    SQRT = "sqrt"
-    LINEAR = "linear"
-
-
 class SpaceAxis(SparseModel):
     name: Literal[AxisName.X, AxisName.Y, AxisName.Z]
     type: Literal[AxisType.SPACE] = AxisType.SPACE

@@ -1,4 +1,4 @@
-"""Unit and integration tests for GPU/CPU preprocessing, lossy quantization, sizing, and GPU OME-Zarr writer."""
+"""Unit and integration tests for GPU/CPU spatial preprocessing, sizing, and GPU OME-Zarr writer."""
 
 import json
 import threading
@@ -14,7 +14,6 @@ from ome_zarr_writer import (
     DownscaleType,
     Dtype,
     Local,
-    LossyDomain,
     OMEZarrWriter,
     PreFilterType,
     PreprocessConfig,
@@ -22,12 +21,8 @@ from ome_zarr_writer import (
     UIVec3D,
     UVec3D,
     WriterConfig,
-    cutoff_to_sigma_px,
-    estimate_noise_sigma,
     filter_and_bin_2d,
     filter_and_bin_volume,
-    preprocess_volume,
-    quantize_lossy_volume,
     vram_fits_batch,
 )
 from ome_zarr_writer.array import ArrayWriter
@@ -102,7 +97,7 @@ def test_gpu_worker_slot_bounds_concurrency():
 
 
 # ---------------------------------------------------------------------------
-# Spatial pre-filtering, rectangular binning & noise-bounded lossy quantization
+# Spatial pre-filtering & rectangular binning
 # ---------------------------------------------------------------------------
 
 
@@ -134,33 +129,18 @@ def test_median_binning_supports_large_bin_factors_without_truncation():
     assert int(out[0, 0, 0]) == 50  # median of 0..99 is 49.5 -> rounds to 50
 
 
-def test_lossy_quantization_and_preprocessing_pipeline():
-    assert cutoff_to_sigma_px(2.0, voxel_size_um=0.5) == pytest.approx(0.1873906 * 4.0, rel=1e-4)
-    rng = np.random.default_rng(42)
-    vol = np.clip(rng.normal(500.0, 25.0, size=(8, 64, 64)), 0, 65535).astype(np.uint16)
-
-    sigma_lin, off_lin = estimate_noise_sigma(vol, domain=LossyDomain.LINEAR)
-    assert off_lin == 0.0
-    assert 15.0 < sigma_lin < 35.0
-    q_lin = quantize_lossy_volume(vol, lossy_step_noise=1.0, lossy_domain=LossyDomain.LINEAR, use_gpu=False)
-    assert len(np.unique(q_lin)) < len(np.unique(vol))
-
-    sigma_sq, off_sq = estimate_noise_sigma(vol, domain=LossyDomain.SQRT)
-    assert sigma_sq > 0.0
-    assert off_sq > 0.0
-    q_sq = quantize_lossy_volume(vol, lossy_step_noise=1.0, lossy_domain=LossyDomain.SQRT, use_gpu=False)
-    assert len(np.unique(q_sq)) < len(np.unique(vol))
-
-    clamped = preprocess_volume(vol, dark_floor=500, keep_bits=10)
-    assert np.all(clamped[vol <= 500] == 0)
-    assert np.all((clamped & 0x3F) == 0)
-
-    pp = PreprocessConfig(bin_y=2, bin_x=1, dark_floor=100, keep_bits=12, lossy_step_noise=1.0)
+def test_preprocess_config_spatial_metadata():
+    assert PreprocessConfig().to_metadata() is None
+    pp = PreprocessConfig(bin_y=2, bin_x=1, pre_filter=PreFilterType.HIGHPASS, filter_size=5, highpass_add=50.0)
     meta = pp.to_metadata()
-    assert meta is not None
-    assert meta["bin_y"] == 2
-    assert meta["keep_bits"] == 12
-    assert meta["lossy_domain"] == "sqrt"
+    assert meta == {
+        "bin_y": 2,
+        "bin_x": 1,
+        "bin_mode": "mean",
+        "pre_filter": "highpass",
+        "filter_size": 5,
+        "highpass_add": 50.0,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -178,8 +158,6 @@ def test_writer_applies_preprocessing_codec_knobs_and_records_metadata(tmp_path:
         compression=Compression.BLOSC_ZSTD,
         compression_level=5,
         compression_shuffle="shuffle",
-        dark_floor=100,
-        keep_bits=12,
         bin_y=2,
         bin_x=1,
         bin_mode=BinningMode.MEAN,
@@ -190,11 +168,10 @@ def test_writer_applies_preprocessing_codec_knobs_and_records_metadata(tmp_path:
     target = _write_stack(tmp_path, "proc", cfg, vol, backend=ArrayWriter.Backend.TS)
     readback = _read_level(target, 0)
     assert readback.shape == (64, 32, 64)
-    assert np.all((readback & 0xF) == 0)
 
     group_meta = json.loads((target / "zarr.json").read_text())
     assert group_meta["attributes"]["preprocessing"]["bin_y"] == 2
-    assert group_meta["attributes"]["preprocessing"]["keep_bits"] == 12
+    assert group_meta["attributes"]["preprocessing"]["bin_mode"] == "mean"
     arr_meta = json.loads((target / "0" / "zarr.json").read_text())
     blosc_cfg = arr_meta["codecs"][0]["configuration"]["codecs"][1]["configuration"]
     assert blosc_cfg["cname"] == "zstd"

@@ -3,7 +3,7 @@ from collections.abc import Iterable, Mapping
 from enum import StrEnum
 from typing import Annotated, Any, Literal, Self
 
-from ome_zarr_writer import Compression, DownscaleType, LossyDomain, ScaleLevel, WriterSettings
+from ome_zarr_writer import Compression, DownscaleType, ScaleLevel, WriterSettings
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from vxl_records import LineScan
 from vxlib.schema import FrozenModel, identifier
@@ -496,12 +496,7 @@ class WriterPatch(Patch):
     compression: Compression | None = None
     compression_level: Annotated[int, Field(ge=0, le=9)] | None = None
     compression_shuffle: Literal["noshuffle", "shuffle", "bitshuffle"] | None = None
-    keep_bits: Annotated[int, Field(ge=1, le=16)] | None = None
-    dark_floor: Annotated[int, Field(ge=0)] | None = None
     skip_empty_chunks: bool | None = None
-    lossy_step_noise: Annotated[float, Field(ge=0.0, le=10.0)] | None = None
-    lossy_domain: LossyDomain | None = None
-    noise_sigma: Annotated[float, Field(ge=0.0)] | None = None
     use_gpu: bool | None = None
     downscale_type: DownscaleType | None = None
     target_shard_gb: Annotated[float, Field(gt=0)] | None = None

@@ -2000,9 +2000,7 @@ class Instrument:
         """Collect ``volume.dark_frame_count`` dark frames (all lasers off) into ``dark/<phase_tag>.ome.zarr``."""
         num_frames = volume.dark_frame_count
         channels = {uid: self._channels[uid] for uid in self._store.value.imaging.profiles[volume.profile].channels}
-        dark_settings = self._store.value.output.model_copy(
-            update={"dark_floor": 0, "skip_empty_chunks": False, "keep_bits": None, "lossy_step_noise": None}
-        )
+        dark_settings = self._store.value.output.model_copy(update={"skip_empty_chunks": False})
         base_subpath = PurePosixPath("volumes", f"{first_volume_index + 1:06d}", volume.profile)
         logger.info(
             "Capturing %d %s-scan dark frames (all lasers off) for task %s / profile %s",

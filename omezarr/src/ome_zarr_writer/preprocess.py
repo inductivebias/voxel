@@ -1,5 +1,5 @@
 # pyright: reportArgumentType=false
-"""2D spatial pre-filtering, rectangular binning, and noise-bounded lossy quantization (CPU & CUDA)."""
+"""2D spatial pre-filtering and rectangular binning (CPU & CUDA)."""
 
 import math
 import warnings
@@ -12,7 +12,7 @@ from numba.core.errors import NumbaPerformanceWarning
 from pydantic import ConfigDict, Field
 from vxlib.schema import SparseModel
 
-from ome_zarr_writer.dataset import BinningMode, LossyDomain, PreFilterType
+from ome_zarr_writer.dataset import BinningMode, PreFilterType
 
 _PREFILTER_TO_CODE: dict[PreFilterType, int] = {
     PreFilterType.NONE: 0,
@@ -36,40 +36,19 @@ class PreprocessConfig(SparseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    keep_bits: int | None = Field(default=None, ge=1, le=16)
-    dark_floor: int = Field(default=0, ge=0)
     bin_y: int = Field(default=1, ge=1, le=16)
     bin_x: int = Field(default=1, ge=1, le=16)
     pre_filter: PreFilterType = PreFilterType.NONE
     filter_size: int = Field(default=3, ge=3, le=5)
     bin_mode: BinningMode = BinningMode.MEAN
     highpass_add: float = 100.0
-    lossy_step_noise: float | None = Field(default=None, ge=0.0, le=10.0)
-    lossy_domain: LossyDomain = LossyDomain.SQRT
-    noise_sigma: float | None = Field(default=None, ge=0.0)
 
     @property
     def has_spatial_op(self) -> bool:
         return self.bin_y > 1 or self.bin_x > 1 or self.pre_filter != PreFilterType.NONE
 
-    @property
-    def has_uint_op(self) -> bool:
-        return self.dark_floor > 0 or self.keep_bits is not None
-
-    @property
-    def has_lossy(self) -> bool:
-        return (
-            self.lossy_step_noise is not None
-            and self.lossy_step_noise > 0.0
-            and self.lossy_domain != LossyDomain.NONE
-        )
-
-    @property
-    def has_any(self) -> bool:
-        return self.has_spatial_op or self.has_uint_op or self.has_lossy
-
     def to_metadata(self) -> dict[str, Any] | None:
-        if not self.has_any:
+        if not self.has_spatial_op:
             return None
         meta: dict[str, Any] = {}
         if self.bin_y > 1 or self.bin_x > 1:
@@ -78,23 +57,7 @@ class PreprocessConfig(SparseModel):
             meta.update(pre_filter=self.pre_filter.value, filter_size=self.filter_size)
             if self.pre_filter == PreFilterType.HIGHPASS:
                 meta["highpass_add"] = self.highpass_add
-        if self.dark_floor > 0:
-            meta["dark_floor"] = self.dark_floor
-        if self.keep_bits is not None:
-            meta["keep_bits"] = self.keep_bits
-        if self.has_lossy:
-            meta.update(lossy_step_noise=self.lossy_step_noise, lossy_domain=self.lossy_domain.value)
-            if self.noise_sigma is not None:
-                meta["noise_sigma"] = self.noise_sigma
         return meta or None
-
-
-def cutoff_to_sigma_px(cutoff: float, voxel_size_um: float = 1.0, units: str = "um") -> float:
-    """Convert spatial cut-off ``cutoff`` (um or voxels) to Gaussian std-dev in voxels."""
-    if cutoff <= 0.0:
-        return 0.0
-    c_vox = (cutoff / max(voxel_size_um, 1e-9)) if units == "um" else float(cutoff)
-    return float(math.sqrt(math.log(2.0) / 2.0) / math.pi * c_vox)
 
 
 def _dtype_int_bounds(dt: np.dtype) -> tuple[int, float]:
@@ -117,107 +80,9 @@ def _cuda_ready(use_gpu: bool | None) -> bool:
         return False
 
 
-def estimate_noise_sigma(
-    arr: np.ndarray,
-    *,
-    domain: LossyDomain | str = LossyDomain.SQRT,
-    offset: float | None = None,
-    max_sample_slices: int = 8,
-) -> tuple[float, float]:
-    """Estimate noise std-dev from MAD of first differences along X; returns ``(sigma, offset)``."""
-    dom = LossyDomain(domain) if not isinstance(domain, LossyDomain) else domain
-    if arr.size < 2 or dom == LossyDomain.NONE:
-        return 0.0, 0.0
-    sample = arr
-    if sample.ndim >= 3 and sample.shape[0] > max_sample_slices:
-        sample = sample[:: max(1, sample.shape[0] // max_sample_slices)]
-    if sample.ndim >= 2 and sample.shape[-2] > 512:
-        sample = sample[..., ::2, :]
-    sample_f32 = sample.astype(np.float32, copy=False)
-    if dom == LossyDomain.SQRT:
-        off = float(np.percentile(sample_f32, 0.1)) if offset is None else float(offset)
-        transformed = 2.0 * np.sqrt(np.maximum(0.0, sample_f32 - off) + 0.375)
-    else:
-        off = 0.0 if offset is None else float(offset)
-        transformed = sample_f32
-    if transformed.shape[-1] < 2:
-        return 0.0, off
-    diffs = np.diff(transformed, axis=-1)
-    med = float(np.median(diffs))
-    mad = float(np.median(np.abs(diffs - med)))
-    return float(1.4826 * mad / math.sqrt(2.0)), off
-
-
 # ---------------------------------------------------------------------------
 # Scalar & device helpers shared by CPU and CUDA kernels
 # ---------------------------------------------------------------------------
-
-
-def _make_quantize_scalar(jit_dec: Any) -> Any:
-    @jit_dec
-    def _quant(val: float, domain_code: int, step: float, offset: float, is_int: int, max_val: float) -> float:
-        v = np.float32(val)
-        step_f = np.float32(step)
-        off_f = np.float32(offset)
-        if domain_code == 1:
-            shifted = v - off_f
-            if shifted < np.float32(0.0):  # noqa: PLR1730
-                shifted = np.float32(0.0)
-            t = np.float32(2.0) * math.sqrt(shifted + np.float32(0.375))
-            tq = math.floor(t / step_f + np.float32(0.5)) * step_f
-            rec = np.float32(0.25) * tq * tq - np.float32(0.375) + off_f
-        else:
-            rec = math.floor(v / step_f + np.float32(0.5)) * step_f
-        if is_int == 1:
-            r = math.floor(rec + np.float32(0.5))
-            if r < 0.0:
-                return 0.0
-            if r > max_val:
-                return max_val
-            return r
-        return float(rec)
-
-    return _quant
-
-
-_cpu_quant = _make_quantize_scalar(numba.njit)
-_cuda_quant = _make_quantize_scalar(cuda.jit(device=True, fastmath=True))
-
-
-@cuda.jit(fastmath=True)
-def _cuda_lossy_quantize_kernel(
-    arr: Any, domain_code: int, step: float, offset: float, is_int: int, max_val: float
-) -> None:
-    x, y, z = cuda.grid(3)  # type: ignore[misc]
-    z_dim, y_dim, x_dim = arr.shape
-    if z < z_dim and y < y_dim and x < x_dim:
-        arr[z, y, x] = _cuda_quant(arr[z, y, x], domain_code, step, offset, is_int, max_val)
-
-
-@numba.njit(parallel=True, cache=True)
-def _cpu_lossy_quantize_kernel(
-    arr: np.ndarray, domain_code: int, step: float, offset: float, is_int: int, max_val: float
-) -> None:
-    z_dim, y_dim, x_dim = arr.shape
-    for z in prange(z_dim):
-        for y in range(y_dim):
-            for x in range(x_dim):
-                arr[z, y, x] = _cpu_quant(arr[z, y, x], domain_code, step, offset, is_int, max_val)
-
-
-@cuda.jit
-def _cuda_preprocess_uint_kernel(arr: Any, dark_floor: int, shift: int, half: int, mask: int, max_val: int) -> None:
-    x, y, z = cuda.grid(3)  # type: ignore[misc]
-    z_dim, y_dim, x_dim = arr.shape
-    if z >= z_dim or y >= y_dim or x >= x_dim:
-        return
-    val = np.int32(arr[z, y, x])
-    if dark_floor > 0 and val <= dark_floor:
-        arr[z, y, x] = 0
-        return
-    if shift > 0:
-        rounded = val + half
-        arr[z, y, x] = (max_val if rounded > max_val else rounded) & mask  # noqa: FURB136
 
 
 def _make_base_ops(jit_dec: Any) -> tuple[Any, Any, Any]:
@@ -373,8 +238,20 @@ def _cuda_prefilter_and_bin_kernel(
     med_buf = cuda.local.array(25, numba.float32)  # type: ignore[misc]
     bin_buf = cuda.local.array(256, numba.float32)  # type: ignore[misc]  # supports up to 16x16 binning
     vol_out[z, yo, xo] = _cuda_reduce_block(
-        vol_in, z, yo, xo, bin_y, bin_x, filter_mode, filter_size, bin_mode, highpass_add, is_int, max_val,
-        med_buf, bin_buf,
+        vol_in,
+        z,
+        yo,
+        xo,
+        bin_y,
+        bin_x,
+        filter_mode,
+        filter_size,
+        bin_mode,
+        highpass_add,
+        is_int,
+        max_val,
+        med_buf,
+        bin_buf,
     )
 
 
@@ -398,97 +275,26 @@ def _cpu_prefilter_and_bin_kernel(
         for yo in range(y_out):
             for xo in range(x_out):
                 vol_out[z, yo, xo] = _cpu_reduce_block(
-                    vol_in, z, yo, xo, bin_y, bin_x, filter_mode, filter_size, bin_mode, highpass_add, is_int, max_val,
-                    med_buf, bin_buf,
+                    vol_in,
+                    z,
+                    yo,
+                    xo,
+                    bin_y,
+                    bin_x,
+                    filter_mode,
+                    filter_size,
+                    bin_mode,
+                    highpass_add,
+                    is_int,
+                    max_val,
+                    med_buf,
+                    bin_buf,
                 )
 
 
 # ---------------------------------------------------------------------------
 # Public host & device-dispatch entry points
 # ---------------------------------------------------------------------------
-
-
-def quantize_lossy_volume(
-    arr: np.ndarray,
-    *,
-    lossy_step_noise: float | None = None,
-    lossy_domain: LossyDomain | str = LossyDomain.SQRT,
-    noise_sigma: float | None = None,
-    offset: float | None = None,
-    use_gpu: bool | None = None,
-    in_place: bool = False,
-) -> np.ndarray:
-    """Quantize ``arr`` in ``sqrt`` (Anscombe) or ``linear`` domain to multiples of ``lossy_step_noise * sigma``."""
-    dom = LossyDomain(lossy_domain) if not isinstance(lossy_domain, LossyDomain) else lossy_domain
-    if lossy_step_noise is None or lossy_step_noise <= 0.0 or dom == LossyDomain.NONE:
-        return arr
-    if noise_sigma is None or noise_sigma <= 0.0 or (dom == LossyDomain.SQRT and offset is None):
-        est_sigma, est_off = estimate_noise_sigma(arr, domain=dom, offset=offset)
-        sigma = est_sigma if (noise_sigma is None or noise_sigma <= 0.0) else float(noise_sigma)
-        off = est_off if offset is None else float(offset)
-    else:
-        sigma = float(noise_sigma)
-        off = 0.0 if offset is None else float(offset)
-    step = float(lossy_step_noise) * sigma
-    if step <= 0.0:
-        return arr
-
-    out = arr if (in_place and arr.flags.c_contiguous) else np.ascontiguousarray(arr).copy()
-    orig_shape = out.shape
-    if out.ndim == 2:
-        out = out[np.newaxis, ...]
-    domain_code = 1 if dom == LossyDomain.SQRT else 2
-    is_int, max_val = _dtype_int_bounds(out.dtype)
-    if _cuda_ready(use_gpu):
-        z, y, x = out.shape
-        with warnings.catch_warnings():
-            warnings.simplefilter("ignore", NumbaPerformanceWarning)
-            d_arr = cuda.to_device(out)
-            _cuda_lossy_quantize_kernel[_grid_3d(z, y, x), _THREADS_3D](  # type: ignore[index]
-                d_arr, domain_code, step, off, is_int, max_val
-            )
-            d_arr.copy_to_host(out)
-    else:
-        _cpu_lossy_quantize_kernel(out, domain_code, step, off, is_int, max_val)
-    return out.reshape(orig_shape)
-
-
-def preprocess_volume(
-    arr: np.ndarray,
-    *,
-    keep_bits: int | None = None,
-    dark_floor: int = 0,
-    lossy_step_noise: float | None = None,
-    lossy_domain: LossyDomain | str = LossyDomain.SQRT,
-    noise_sigma: float | None = None,
-    sqrt_offset: float | None = None,
-) -> np.ndarray:
-    """Apply dark-floor clamping, bit-rounding, and/or noise-bounded lossy rounding on the host."""
-    res = arr
-    if (dark_floor > 0 or keep_bits is not None) and res.dtype.kind == "u" and res.dtype.itemsize in (1, 2):
-        bits = res.dtype.itemsize * 8
-        max_val = (1 << bits) - 1
-        shift = min(bits, max(0, bits - keep_bits)) if keep_bits is not None else 0
-        if shift > 0:
-            half = 1 << (shift - 1)
-            mask = max_val ^ ((1 << shift) - 1)
-            rounded = np.minimum(max_val, res.astype(np.uint32) + half) & mask
-            if dark_floor > 0:
-                rounded = np.where(res <= dark_floor, np.uint32(0), rounded)
-            res = rounded.astype(res.dtype)
-        elif dark_floor > 0:
-            res = np.where(res <= dark_floor, res.dtype.type(0), res)
-    if lossy_step_noise is not None and lossy_step_noise > 0.0:
-        res = quantize_lossy_volume(
-            res,
-            lossy_step_noise=lossy_step_noise,
-            lossy_domain=lossy_domain,
-            noise_sigma=noise_sigma,
-            offset=sqrt_offset,
-            use_gpu=False,
-            in_place=(res is not arr),
-        )
-    return res
 
 
 def filter_and_bin_volume(
