@@ -1,4 +1,5 @@
 import asyncio
+import copy
 from types import SimpleNamespace
 from typing import Any
 
@@ -8,7 +9,20 @@ pytest.importorskip("zaber_motion", reason="needs the vxl-drivers `zaber` extra"
 
 from vxl_drivers.axes import zaber
 from vxl_drivers.axes.zaber_probe import diagnose_zaber, probe_zaber
-from zaber_motion.exceptions import CommandFailedException, CommandFailedExceptionData, RequestTimeoutException
+from zaber_motion.ascii import (
+    ParamsetInfo,
+    PidTuning,
+    ServoTuningParam,
+    ServoTuningParamset,
+    SimpleTuning,
+    SimpleTuningParamDefinition,
+)
+from zaber_motion.exceptions import (
+    CommandFailedException,
+    CommandFailedExceptionData,
+    NotSupportedException,
+    RequestTimeoutException,
+)
 
 from rigup import DeviceConfig, Rig, RigConfig
 from vxl.devices.axes.continuous import StepMode, TriggerMode, TTLStepperConfig
@@ -159,6 +173,120 @@ class FakeStorage:
         return self.values.pop(key, None) is not None
 
 
+class FakeServoTuner:
+    def __init__(self) -> None:
+        self.startup_paramset = ServoTuningParamset.DEFAULT
+        self.param_definitions = [
+            SimpleTuningParamDefinition(
+                name="Stiffness", min_label="Smooth", max_label="Stiff", data_type="0..1", default_value=0.5
+            )
+        ]
+        self.calls: list[tuple[Any, ...]] = []
+        self.pid_error: Exception | None = None
+        self.simple_error: Exception | None = None
+        base = {
+            "info": ParamsetInfo(
+                type="ffpid",
+                version=4,
+                params=[ServoTuningParam(name="kp", value=100.0), ServoTuningParam(name="ki", value=20.0)],
+            ),
+            "pid": PidTuning(type="ffpid", version=4, p=100.0, i=20.0, d=2.5, fc=200.0),
+            "simple": SimpleTuning(
+                is_used=True,
+                is_set=True,
+                load_inertia=0.5,
+                tuning_params=[ServoTuningParam(name="Stiffness", value=0.5)],
+                enable_feed_forward=True,
+                carriage_inertia=0.2,
+            ),
+        }
+        self._paramsets = {ps: copy.deepcopy(base) for ps in ServoTuningParamset}
+
+    def get_tuning(self, paramset: ServoTuningParamset) -> ParamsetInfo:
+        return self._paramsets[paramset]["info"]
+
+    def get_pid_tuning(self, paramset: ServoTuningParamset) -> PidTuning:
+        if self.pid_error is not None:
+            raise self.pid_error
+        return self._paramsets[paramset]["pid"]
+
+    def get_simple_tuning(self, paramset: ServoTuningParamset) -> SimpleTuning:
+        if self.simple_error is not None:
+            raise self.simple_error
+        return self._paramsets[paramset]["simple"]
+
+    def get_simple_tuning_param_definitions(self) -> list[SimpleTuningParamDefinition]:
+        self.calls.append(("get_simple_tuning_param_definitions",))
+        return list(self.param_definitions)
+
+    def set_simple_tuning(
+        self,
+        paramset: ServoTuningParamset,
+        tuning_params: list[ServoTuningParam],
+        load_inertia: float,
+        load_inertia_units: object = zaber.Units.NATIVE,
+        enable_feed_forward: bool = True,
+        **_unused: Any,
+    ) -> None:
+        self.calls.append(
+            (
+                "set_simple_tuning",
+                paramset,
+                [(p.name, p.value) for p in tuning_params],
+                load_inertia,
+                load_inertia_units,
+                enable_feed_forward,
+            )
+        )
+        prev = self._paramsets[paramset]
+        params = [ServoTuningParam(name=p.name, value=p.value) for p in tuning_params]
+        self._paramsets[paramset] = {
+            "info": ParamsetInfo(type=prev["info"].type, version=prev["info"].version, params=params),
+            "pid": prev["pid"],
+            "simple": SimpleTuning(
+                is_used=True,
+                is_set=True,
+                load_inertia=load_inertia,
+                tuning_params=params,
+                enable_feed_forward=enable_feed_forward,
+                carriage_inertia=prev["simple"].carriage_inertia,
+            ),
+        }
+
+    def set_pid_tuning(self, paramset: ServoTuningParamset, p: float, i: float, d: float, fc: float) -> PidTuning:
+        self.calls.append(("set_pid_tuning", paramset, p, i, d, fc))
+        prev = self._paramsets[paramset]
+        pid = PidTuning(type=prev["info"].type, version=prev["info"].version, p=p, i=i, d=d, fc=fc)
+        self._paramsets[paramset] = {
+            "info": ParamsetInfo(
+                type=prev["info"].type,
+                version=prev["info"].version,
+                params=[ServoTuningParam(name=k, value=v) for k, v in (("kp", p), ("ki", i), ("kd", d), ("fc", fc))],
+            ),
+            "pid": pid,
+            "simple": SimpleTuning(
+                is_used=False,
+                is_set=prev["simple"].is_set,
+                load_inertia=prev["simple"].load_inertia,
+                tuning_params=list(prev["simple"].tuning_params),
+                enable_feed_forward=prev["simple"].enable_feed_forward,
+                carriage_inertia=prev["simple"].carriage_inertia,
+            ),
+        }
+        return pid
+
+    def load_paramset(self, to_paramset: ServoTuningParamset, from_paramset: ServoTuningParamset) -> None:
+        self.calls.append(("load_paramset", to_paramset, from_paramset))
+        self._paramsets[to_paramset] = copy.deepcopy(self._paramsets[from_paramset])
+
+    def get_startup_paramset(self) -> ServoTuningParamset:
+        return self.startup_paramset
+
+    def set_startup_paramset(self, paramset: ServoTuningParamset) -> None:
+        self.calls.append(("set_startup_paramset", paramset))
+        self.startup_paramset = paramset
+
+
 class FakeAxis:
     def __init__(self, axis_number: int, position: float = 25_000.0) -> None:
         self.axis_number = axis_number
@@ -166,6 +294,7 @@ class FakeAxis:
         self.device: FakeDevice | None = None
         self.identity = SimpleNamespace(peripheral_name="X-LSM100A", peripheral_serial_number=axis_number + 1000)
         self.storage = FakeStorage()
+        self.servo_tuner = FakeServoTuner()
         self.settings = FakeSettings(
             {
                 zaber.SettingConstants.LIMIT_MIN: 0.0,
@@ -320,6 +449,7 @@ def install_connection(monkeypatch: pytest.MonkeyPatch, connection: FakeConnecti
         return connection
 
     monkeypatch.setattr(zaber, "open_zaber_connection", open_connection)
+    monkeypatch.setattr(zaber, "ServoTuner", lambda axis: axis.servo_tuner)
 
 
 def test_probe_zaber_reads_identity_without_axis_writes_and_closes_connection(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1478,24 +1608,71 @@ def test_window_disarm_forces_off_even_if_one_trigger_disable_fails(controller, 
     axis.close()
 
 
-def test_zaber_setting_and_command_accessors(controller):
+def test_zaber_get_setting_and_servo_tuner_commands(controller, monkeypatch):
     hub, _, sdk, _ = controller
-    axis = zaber.ZaberLinearAxis(uid="x", hub=hub, device_serial=12345, axis_number=1)
-    sdk.settings.values["cloop.servo.p"] = 1234.0
+    axis, scanner = scan_axis(hub, monkeypatch)
+    sdk.settings.values["driver.current.servo"] = 420.0
 
-    assert axis.get_setting(" cloop.servo.p ") == 1234.0
-    assert axis.set_setting("cloop.servo.p", 1500.0) == 1500.0
-    assert sdk.settings.values["cloop.servo.p"] == 1500.0
-
+    # Read-only get_setting kept; raw set_setting/command removed.
+    assert axis.get_setting(" driver.current.servo ") == 420.0
     with pytest.raises(ValueError, match="empty"):
         axis.get_setting("   ")
-    with pytest.raises(ValueError, match="empty"):
-        axis.set_setting("", 1.0)
-    with pytest.raises(ValueError, match="finite"):
-        axis.set_setting("cloop.servo.p", float("nan"))
-    with pytest.raises(ValueError, match="empty"):
-        axis.command("  ")
+    assert not hasattr(axis, "set_setting")
+    assert not hasattr(axis, "command")
 
-    assert axis.command("get pos") == "250000"
+    # get_servo_tuning + paramset parsing + non-timeout vs timeout error handling.
+    tuning = axis.get_servo_tuning("p_1")
+    assert tuning["paramset"] == "1"
+    assert tuning["startup_paramset"] == "default"
+    assert tuning["pid"] == {"p": 100.0, "i": 20.0, "d": 2.5, "fc": 200.0}
+    with pytest.raises(ValueError, match="Unknown servo paramset"):
+        axis.get_servo_tuning("bad")
+
+    sdk.servo_tuner.pid_error = NotSupportedException("unsupported")
+    assert axis.get_servo_tuning("live")["pid"] is None
+    sdk.servo_tuner.pid_error = RequestTimeoutException("timeout")
+    with pytest.raises(RequestTimeoutException):
+        axis.get_servo_tuning("live")
+    sdk.servo_tuner.pid_error = None
+
+    # Simple tuning & PID tuning stage via STAGING -> LIVE and invalidate _settings cache.
+    _ = axis.speed
+    assert axis._settings
+    res = axis.set_simple_servo_tuning(load_mass_kg=1.25, stiffness=0.8, enable_feed_forward=False)
+    assert not axis._settings
+    assert sdk.servo_tuner.calls[-1] == ("load_paramset", ServoTuningParamset.LIVE, ServoTuningParamset.STAGING)
+    assert res["simple"]["load_mass_kg"] == 1.25
+    assert res["simple"]["params"] == {"Stiffness": 0.8}
+
+    pid_res = axis.set_pid_servo_tuning(p=150.0, i=30.0, d=4.0, fc=250.0)
+    assert pid_res["pid"] == {"p": 150.0, "i": 30.0, "d": 4.0, "fc": 250.0}
+
+    # Paramset copy + startup persistence + validation.
+    assert axis.load_servo_paramset("P_3", "live")["paramset"] == "3"
+    assert axis.set_servo_startup_paramset("p_3") == "3"
+    assert axis.load_servo_paramset("live", "default")["pid"] == {"p": 100.0, "i": 20.0, "d": 2.5, "fc": 200.0}
+    for bad_call, match in (
+        (lambda: axis.set_simple_servo_tuning(load_mass_kg=-1.0, stiffness=0.5), "load_mass_kg"),
+        (lambda: axis.set_simple_servo_tuning(load_mass_kg=1.0, stiffness=1.5), "stiffness"),
+        (lambda: axis.set_pid_servo_tuning(p=1.0, i=0.0, d=0.0, fc=0.0), "fc"),
+        (lambda: axis.load_servo_paramset("default", "live"), "default"),
+        (lambda: axis.set_servo_startup_paramset("live"), "stored paramset"),
+    ):
+        with pytest.raises(ValueError, match=match):
+            bad_call()
+
+    # Mutations rejected while busy or scan-prepared; reads remain allowed.
+    for setup, teardown, match in (
+        (lambda: setattr(sdk, "busy", True), lambda: setattr(sdk, "busy", False), "busy"),
+        (lambda: scanner.prepare(start=SCAN_START, speed=2000), scanner.reset, "prepared"),
+    ):
+        setup()
+        assert axis.get_servo_tuning("live")["paramset"] == "live"
+        with pytest.raises(RuntimeError, match=match):
+            axis.set_simple_servo_tuning(load_mass_kg=1.0, stiffness=0.5)
+        with pytest.raises(RuntimeError, match=match):
+            axis.load_servo_paramset("live", "default")
+        teardown()
+
     axis.close()
     hub.close()

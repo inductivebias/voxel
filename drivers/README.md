@@ -139,10 +139,13 @@ See the [driver module](src/vxl_drivers/power_meters/thorlabs.py) for setup note
 moving or un-homing any stage, and tests whether a `WV` (Voltage Out of Range) warning is a stale
 latched flag or actively re-asserted while idle.
 
-`ZaberLinearAxis` also exposes `get_setting(name)`, `set_setting(name, value)`, and `command(cmd)`
-as `rigup` device commands (in native controller units under the hub lock) so closed-loop servo and
-feedforward parameters (for example `ictrl.pidff.*` and `ictrl.ff.*`) can be read and tuned
-programmatically while `vxl` is running.
+`ZaberLinearAxis` also exposes read-only `get_setting(name)` (in native controller units under the
+hub lock) and typed `ServoTuner` device commands — `get_servo_tuning(paramset)`,
+`set_simple_servo_tuning(load_mass_kg, stiffness, enable_feed_forward, paramset)`,
+`set_pid_servo_tuning(p, i, d, fc, paramset)`, `load_servo_paramset(to_paramset, from_paramset)`,
+and `set_servo_startup_paramset(paramset)` — so position/velocity servo paramsets (`live`,
+`staging`, `default`, `1`..`9`) can be inspected and tuned atomically via `STAGING` while `vxl` is
+running (mutations are rejected while the axis is busy or a continuous scan is prepared).
 
 ## Install vendor support
 
