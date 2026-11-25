@@ -197,11 +197,9 @@ class CameraHandle(DeviceHandle[Camera]):
         trigger_mode: TriggerMode = TriggerMode.ON,
         trigger_polarity: TriggerPolarity = TriggerPolarity.RISING_EDGE,
     ) -> None:
-        """Arm the camera for ``num_frames`` hardware-triggered frames."""
         await self.call("arm_capture", num_frames, trigger_mode, trigger_polarity)
 
     async def capture_frames_raw(self, num_frames: int = 1, *, slot_key: str = "snapshot") -> int:
-        """Grab ``num_frames`` armed frames into RAM and immediately stop the camera."""
         return int(await self.call("capture_frames_raw", num_frames, slot_key=slot_key))
 
     async def process_snapshot(
@@ -212,16 +210,10 @@ class CameraHandle(DeviceHandle[Camera]):
         pixel_size_um: tuple[float, float] | None = None,
         metadata: dict[str, Any] | None = None,
     ) -> SnapshotFrameInfo:
-        """Process a buffered raw snapshot frame, optionally save as TIFF, and emit preview."""
-        return SnapshotFrameInfo.model_validate(
-            await self.call(
-                "process_snapshot",
-                slot_key=slot_key,
-                save_path=save_path,
-                pixel_size_um=pixel_size_um,
-                metadata=metadata,
-            )
+        res = await self.call(
+            "process_snapshot", slot_key=slot_key, save_path=save_path, pixel_size_um=pixel_size_um, metadata=metadata
         )
+        return SnapshotFrameInfo.model_validate(res)
 
     async def analyze_snr_buffer(
         self,
@@ -232,19 +224,17 @@ class CameraHandle(DeviceHandle[Camera]):
         pixel_size_um: tuple[float, float],
         exposure_ms: float,
     ) -> "CameraSnrAnalysis":
-        """Analyze buffered signal + dark frames and return stationary SNR + photobleaching metrics."""
         from vxl.instrument.snr import CameraSnrAnalysis  # noqa: PLC0415
 
-        return CameraSnrAnalysis.model_validate(
-            await self.call(
-                "analyze_snr_buffer",
-                output_dir=output_dir,
-                channel_id=channel_id,
-                profile_id=profile_id,
-                pixel_size_um=pixel_size_um,
-                exposure_ms=exposure_ms,
-            )
+        res = await self.call(
+            "analyze_snr_buffer",
+            output_dir=output_dir,
+            channel_id=channel_id,
+            profile_id=profile_id,
+            pixel_size_um=pixel_size_um,
+            exposure_ms=exposure_ms,
         )
+        return CameraSnrAnalysis.model_validate(res)
 
     @staticmethod
     def _parse_vec2d(value: object) -> Vec2D:

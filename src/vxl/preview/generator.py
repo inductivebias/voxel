@@ -150,13 +150,7 @@ class PreviewGenerator:
         valid_bits: ValidBits = 16,
         force_overview: bool = False,
     ) -> None:
-        """Process a new raw frame: dispatch overview and viewport work in the background.
-
-        The viewport uses cancel-stale (latest viewport invalidates prior work). Overview
-        uses skip-if-busy — if the previous overview hasn't finished, drop this
-        frame's preview rather than queueing (unless ``force_overview=True``). Returns immediately
-        so callers (preview loop, acquisition grab loop) are not gated by preview work.
-        """
+        """Dispatch background overview (skip-if-busy unless ``force_overview``) and viewport (cancel-stale) work."""
         if force_overview and self._overview_future is not None and not self._overview_future.done():
             self._work_epoch += 1
             self._overview_future.cancel()
@@ -217,7 +211,7 @@ class PreviewGenerator:
         *,
         valid_bits: ValidBits = 16,
     ) -> None:
-        """Submit a frame (such as a single-frame snapshot) and await overview + viewport emission."""
+        """Submit a frame and await overview + viewport emission."""
         self.submit_frame(frame, idx, valid_bits=valid_bits, force_overview=True)
         pending: list[asyncio.Future[Any]] = [t for t in (self._overview_future, self._viewport_task) if t is not None]
         if pending:
