@@ -20,6 +20,26 @@
     select?: boolean;
   };
 
+  const formatTimes = (v: unknown) => `${v}×`;
+  const formatDisplay = (v: unknown) => displayName(String(v));
+  const formatSquare = (v: unknown) => `${v}×${v}`;
+
+  const GPU_SETTINGS = [
+    { name: 'GPU Bin Y', prop: 'gpu_bin_y', select: true, format: formatTimes },
+    { name: 'GPU Bin X', prop: 'gpu_bin_x', select: true, format: formatTimes },
+    { name: 'GPU Bin mode', prop: 'gpu_bin_mode', select: true, format: formatDisplay },
+    { name: 'GPU Pre-filter', prop: 'gpu_pre_filter', select: true, format: formatDisplay },
+    { name: 'GPU Filter size', prop: 'gpu_filter_size', select: false, format: formatSquare }
+  ] as const;
+
+  function formatFrameDims(frame: { x: number; y: number } | null, outFrame: { x: number; y: number } | null): string {
+    if (!frame) return '— × —';
+    const base = `${frame.x} × ${frame.y}`;
+    return outFrame && (outFrame.x !== frame.x || outFrame.y !== frame.y)
+      ? `${base} → ${outFrame.x} × ${outFrame.y}`
+      : base;
+  }
+
   const instrument = $derived.by(getOpenInstrument());
 
   function reading(value: unknown): string {
@@ -204,7 +224,7 @@
             deviceId: camera.id,
             prop: camera.getProp('binning'),
             locked,
-            format: (value) => `${value}×${value}`
+            format: formatSquare
           })}
           {@render setting({
             name: 'Pixel format',
@@ -213,7 +233,7 @@
             locked,
             select: true
           })}
-          {#each [{ name: 'GPU Bin Y', prop: 'gpu_bin_y', select: true, format: (v: unknown) => `${v}×` }, { name: 'GPU Bin X', prop: 'gpu_bin_x', select: true, format: (v: unknown) => `${v}×` }, { name: 'GPU Bin mode', prop: 'gpu_bin_mode', select: true, format: (v: unknown) => displayName(String(v)) }, { name: 'GPU Pre-filter', prop: 'gpu_pre_filter', select: true, format: (v: unknown) => displayName(String(v)) }, { name: 'GPU Filter size', prop: 'gpu_filter_size', select: false, format: (v: unknown) => `${v}×${v}` }] as gpuSetting (gpuSetting.prop)}
+          {#each GPU_SETTINGS as gpuSetting (gpuSetting.prop)}
             {@render setting({
               name: gpuSetting.name,
               deviceId: camera.id,
@@ -230,13 +250,7 @@
             class="grid min-w-0 grid-cols-[minmax(0,1fr)_--spacing(24)] overflow-hidden rounded-sm border border-control-line bg-element-bg font-mono text-[10px] tabular-nums"
           >
             <span class="flex h-6 min-w-0 items-center gap-1 px-1.5" title="Frame dimensions (sensor → output)">
-              <span class="truncate"
-                >{frame
-                  ? outFrame && (outFrame.x !== frame.x || outFrame.y !== frame.y)
-                    ? `${frame.x} × ${frame.y} → ${outFrame.x} × ${outFrame.y}`
-                    : `${frame.x} × ${frame.y}`
-                  : '— × —'}</span
-              >
+              <span class="truncate">{formatFrameDims(frame, outFrame)}</span>
               <span class="text-fg-muted">px</span>
             </span>
             <span
