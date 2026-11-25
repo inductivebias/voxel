@@ -110,22 +110,16 @@ class CameraSamplingYZ(RecordModel):
     z: float = Field(gt=0, allow_inf_nan=False)
 
 
-DEFAULT_CAMERA_SAMPLING_YZ: dict[str, CameraSamplingYZ] = {
-    "camera_1": CameraSamplingYZ(y=0.195, z=0.169),
-    "cam1": CameraSamplingYZ(y=0.195, z=0.169),
-    "camera_2": CameraSamplingYZ(y=0.293, z=0.254),
-    "cam2": CameraSamplingYZ(y=0.293, z=0.254),
-}
+_DEFAULT_CAM1_YZ = CameraSamplingYZ(y=0.195, z=0.169)
+_DEFAULT_CAM2_YZ = CameraSamplingYZ(y=0.293, z=0.254)
 
 
 def default_camera_sampling_yz(camera_id: str, index: int = 0) -> CameraSamplingYZ:
     """Return the default (y, z) sampling in µm for a camera."""
     key = camera_id.strip().lower()
-    if key in DEFAULT_CAMERA_SAMPLING_YZ:
-        return DEFAULT_CAMERA_SAMPLING_YZ[key]
-    if key.endswith(("2", "_1")) or index == 1:
-        return DEFAULT_CAMERA_SAMPLING_YZ["camera_2"]
-    return DEFAULT_CAMERA_SAMPLING_YZ["camera_1"]
+    if key not in ("camera_1", "cam1") and (key.endswith(("2", "_1")) or index == 1):
+        return _DEFAULT_CAM2_YZ
+    return _DEFAULT_CAM1_YZ
 
 
 class LineScan(RecordModel):
@@ -347,10 +341,12 @@ class AcquisitionManifest(RecordModel):
         volume = self._get_volume(volume_index).register_datasets(datasets)
         return self._replace_volume(volume_index, volume)
 
-    def set_volume_darkfield(self, volume_index: int, darkfield: Mapping[str, JsonValue]) -> Self:
-        """Attach or update darkfield calibration metadata for one volume."""
-        volume = self._get_volume(volume_index).model_copy(update={"darkfield": dict(darkfield)})
-        return self._replace_volume(volume_index, volume)
+    def set_volumes_darkfield(self, darkfields: Mapping[int, Mapping[str, JsonValue]]) -> Self:
+        """Attach or update darkfield calibration metadata for one or more volumes."""
+        volumes = list(self.volumes)
+        for volume_index, darkfield in darkfields.items():
+            volumes[volume_index] = self._get_volume(volume_index).model_copy(update={"darkfield": dict(darkfield)})
+        return self.model_copy(update={"volumes": volumes})
 
     def complete_volume(self, volume_index: int, *, warnings: list[str] | None = None) -> Self:
         """Complete one volume and all of its datasets."""

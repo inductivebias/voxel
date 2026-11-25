@@ -193,17 +193,15 @@ class AcquisitionCatalog:
 
         return await self._commit(acquisition_id, edit)
 
-    async def set_volume_darkfield(
+    async def set_volumes_darkfield(
         self,
         acquisition_id: UUID,
-        *,
-        volume_index: int,
-        darkfield: Mapping[str, JsonValue],
+        darkfields: Mapping[int, Mapping[str, JsonValue]],
     ) -> AcquisitionManifest:
-        """Attach or update darkfield calibration metadata for one volume."""
+        """Attach or update darkfield calibration metadata for one or more volumes."""
 
         def edit(manifest: AcquisitionManifest) -> AcquisitionManifest:
-            return manifest.set_volume_darkfield(volume_index, darkfield)
+            return manifest.set_volumes_darkfield(darkfields)
 
         return await self._commit(acquisition_id, edit)
 

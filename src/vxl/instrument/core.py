@@ -114,13 +114,7 @@ class _DarkfieldTracker:
         )
         return rel, acq
 
-    def channel_meta(self, volume_index: int, profile_id: str, channel_id: str) -> dict[str, Any]:
-        rel_before, acq_before = self._paths(volume_index, profile_id, channel_id, "before")
-        rel_after, acq_after = (
-            self._paths(volume_index, profile_id, channel_id, "after")
-            if self.after_acquired_at is not None
-            else (None, None)
-        )
+    def _base_meta(self, rel_before: str | None, rel_after: str | None) -> dict[str, Any]:
         return {
             "enabled": True,
             "frames": self.frames,
@@ -129,9 +123,20 @@ class _DarkfieldTracker:
             "task_scan_duration_s": self.task_scan_duration_s,
             "before": rel_before,
             "before_acquired_at": self.before_acquired_at,
-            "acquisition_before": acq_before,
             "after": rel_after,
             "after_acquired_at": self.after_acquired_at,
+        }
+
+    def channel_meta(self, volume_index: int, profile_id: str, channel_id: str) -> dict[str, Any]:
+        rel_before, acq_before = self._paths(volume_index, profile_id, channel_id, "before")
+        rel_after, acq_after = (
+            self._paths(volume_index, profile_id, channel_id, "after")
+            if self.after_acquired_at is not None
+            else (None, None)
+        )
+        return {
+            **self._base_meta(rel_before, rel_after),
+            "acquisition_before": acq_before,
             "acquisition_after": acq_after,
         }
 
@@ -139,15 +144,7 @@ class _DarkfieldTracker:
         per_channel = {ch_id: self.channel_meta(volume_index, profile_id, ch_id) for ch_id in channel_ids}
         first_ch = next(iter(per_channel.values()), {})
         return {
-            "enabled": True,
-            "frames": self.frames,
-            "lasers_off": True,
-            "post_scan_threshold_s": self.threshold_s,
-            "task_scan_duration_s": self.task_scan_duration_s,
-            "before": first_ch.get("before"),
-            "before_acquired_at": self.before_acquired_at,
-            "after": first_ch.get("after"),
-            "after_acquired_at": self.after_acquired_at,
+            **self._base_meta(first_ch.get("before"), first_ch.get("after")),
             "channels": per_channel,
         }
 
@@ -317,7 +314,6 @@ class Instrument:
         self._lock = asyncio.Lock()  # Serializes the hardware-driving state machine(s)
         self._history = UndoHistory()
         self._acq_task: asyncio.Task[None] | None = None  # the in-flight acquisition run, if any
-        self._pause_requested = False
         self._resume_event = asyncio.Event()
         self._resume_event.set()
         self._continue_on_error_next = False
@@ -847,22 +843,16 @@ class Instrument:
             selected = None if request.task_ids is None else set(request.task_ids)
             if selected is not None and (unknown := selected - known):
                 raise OperationRejectedError("; ".join(f"No such task '{task_id}'" for task_id in sorted(unknown)))
-            volumes = [
-                AcquisitionVolume.model_validate(
-                    {
-                        **volume.model_dump(),
-                        **(
-                            {"acquire_dark_frames": request.acquire_dark_frames}
-                            if request.acquire_dark_frames is not None
-                            else {}
-                        ),
-                        **(
-                            {"dark_frame_count": request.dark_frame_count}
-                            if request.dark_frame_count is not None
-                            else {}
-                        ),
-                    }
+            overrides = {
+                k: v
+                for k, v in (
+                    ("acquire_dark_frames", request.acquire_dark_frames),
+                    ("dark_frame_count", request.dark_frame_count),
                 )
+                if v is not None
+            }
+            volumes = [
+                AcquisitionVolume.model_validate({**volume.model_dump(), **overrides})
                 for volume in self.planned_volumes.value
                 if selected is None or volume.task in selected
             ]
@@ -911,7 +901,6 @@ class Instrument:
             await self._activity.set(IdleActivity())
             raise
 
-        self._pause_requested = False
         self._resume_event.set()
         acquisition = ActiveAcquisition(
             id=manifest.id,
@@ -931,16 +920,20 @@ class Instrument:
             raise OperationRejectedError("No acquisition is running")
         return activity, activity.acquisition
 
+    async def _set_pause_requested(
+        self, activity: CaptureActivity, acquisition: ActiveAcquisition, pause_requested: bool
+    ) -> None:
+        if acquisition.pause_requested != pause_requested:
+            updated = acquisition.model_copy(update={"pause_requested": pause_requested})
+            await self._activity.set(activity.model_copy(update={"acquisition": updated}))
+
     async def pause_acquisition(self) -> None:
         """Pause the active acquisition after the current volume finishes."""
         activity, acquisition = self._running_acquisition()
         if acquisition.phase in (AcquisitionPhase.STOPPING, AcquisitionPhase.PAUSED):
             raise OperationRejectedError("Acquisition cannot be paused in its current state")
-        self._pause_requested = True
         self._resume_event.clear()
-        if not acquisition.pause_requested:
-            updated = acquisition.model_copy(update={"pause_requested": True})
-            await self._activity.set(activity.model_copy(update={"acquisition": updated}))
+        await self._set_pause_requested(activity, acquisition, True)
 
     async def resume_acquisition(self) -> None:
         """Resume a paused acquisition or cancel a pending pause request."""
@@ -949,16 +942,12 @@ class Instrument:
             acquisition.phase is not AcquisitionPhase.PAUSED and not acquisition.pause_requested
         ):
             raise OperationRejectedError("Acquisition is not paused")
-        self._pause_requested = False
         self._resume_event.set()
-        if acquisition.pause_requested:
-            updated = acquisition.model_copy(update={"pause_requested": False})
-            await self._activity.set(activity.model_copy(update={"acquisition": updated}))
+        await self._set_pause_requested(activity, acquisition, False)
 
     async def stop_acquisition(self) -> None:
         """Cancel the active acquisition and await its cleanup."""
         if (task := self._acq_task) is not None and not task.done():
-            self._pause_requested = False
             activity = self._activity.value
             if (
                 isinstance(activity, CaptureActivity)
@@ -1853,19 +1842,13 @@ class Instrument:
     def _voxel_size_yx(self, volume: PlannedVolume, camera_id: str) -> tuple[float, float] | None:
         if volume.scan is None:
             return None
-        detection_ids = list(self._hal.topology.detection)
-        cam_idx = detection_ids.index(camera_id) if camera_id in detection_ids else 0
+        cam_idx = next((i for i, cid in enumerate(self._hal.topology.detection) if cid == camera_id), 0)
         sampling = volume.scan.resolve_camera_sampling_yz(camera_id, cam_idx)
         return (sampling.z, sampling.y)
 
     async def _await_pause_if_requested(self, manifest: AcquisitionManifest, volume_index: int) -> None:
-        if not self._pause_requested or volume_index + 1 >= len(manifest.volumes):
+        if self._resume_event.is_set() or volume_index + 1 >= len(manifest.volumes):
             return
-        vol = manifest.volumes[volume_index]
-        if self._uses_continuous(vol):
-            with suppress(Exception):
-                await self._volume_scan_axis(vol).reset_continuous_scan()
-        self._pause_requested = False
         await self._update_acquisition(manifest, phase=AcquisitionPhase.PAUSED, pause_requested=False)
         logger.info("Acquisition paused after strip %d of %d", volume_index + 1, len(manifest.volumes))
         await self._resume_event.wait()
@@ -1909,17 +1892,12 @@ class Instrument:
     async def _execute_acquisition(self, manifest: AcquisitionManifest) -> None:
         """Execute every volume in a running manifest and finalize the acquisition."""
         diagnostics: list[dict[str, Any]] = []
-        first_vol: dict[tuple[str, str], int] = {}
-        last_vol: dict[tuple[str, str], int] = {}
-        for idx, vol in enumerate(manifest.volumes):
-            key = (vol.task, vol.profile)
-            first_vol.setdefault(key, idx)
-            last_vol[key] = idx
+        last_vol = {(vol.task, vol.profile): idx for idx, vol in enumerate(manifest.volumes) if vol.acquire_dark_frames}
         trackers: dict[tuple[str, str], _DarkfieldTracker] = {}
         try:
             for volume_index, vol in enumerate(manifest.volumes):
                 key = (vol.task, vol.profile)
-                tracker = await self._ensure_darkfield_started(manifest, vol, first_vol[key], trackers)
+                tracker = await self._ensure_darkfield_started(manifest, vol, volume_index, trackers)
                 try:
                     manifest = await self._execute_volume(manifest, volume_index, darkfield=tracker)
                     if tracker is not None:
@@ -1978,7 +1956,6 @@ class Instrument:
                 await self._activity.set(IdleActivity())
             else:
                 await self._update_acquisition(manifest, phase=AcquisitionPhase.STOPPING, pause_requested=False)
-            self._pause_requested = False
             self._resume_event.set()
             self._acq_task = None
             try:
@@ -2023,13 +2000,14 @@ class Instrument:
                         subpath=base_subpath / f"{ch_id}.ome.zarr" / "dark" / phase_tag,
                         num_frames=num_frames,
                         z_step=volume.z_step,
-                        magnification=self._hal.topology.detection[self._channel_config(ch_id).detection].magnification,
+                        magnification=self._hal.topology.detection[cfg.detection].magnification,
                         settings=dark_settings,
-                        voxel_size_yx=self._voxel_size_yx(volume, self._channel_config(ch_id).detection),
-                        channel_label=f"{self._channel_config(ch_id).label or ch_id} (dark {phase_tag})",
+                        voxel_size_yx=self._voxel_size_yx(volume, cfg.detection),
+                        channel_label=f"{cfg.label or ch_id} (dark {phase_tag})",
                         channel_color="FFFFFF",
                     )
                     for ch_id, ch in channels.items()
+                    for cfg in (self._channel_config(ch_id),)
                 )
             )
             await self._capture_batches(
@@ -2044,8 +2022,6 @@ class Instrument:
         except BaseException as error:
             capture_error = error
         finally:
-            with suppress(Exception):
-                await self._inhibit_laser_outputs()
             with suppress(Exception):
                 await self._stop_signal_generators()
             close_errors = await self._close_stacks(list(channels.values()))
@@ -2066,31 +2042,37 @@ class Instrument:
         tracker: _DarkfieldTracker,
     ) -> AcquisitionManifest:
         """Persist final before/after darkfield metadata into OME-Zarr, ``scan.json``, and manifest records."""
+        if not tracker.completed_volumes:
+            return manifest
         channels = {uid: self._channels[uid] for uid in self._store.value.imaging.profiles[profile_id].channels}
-        for vol_idx in tracker.completed_volumes:
-            vol_subpath = PurePosixPath("volumes", f"{vol_idx + 1:06d}", profile_id)
-            await _gather_hardware(
-                *(
-                    ch.camera.update_dataset_darkfield(
-                        storage=manifest.storage,
-                        subpath=vol_subpath / ch_id,
-                        darkfield=tracker.channel_meta(vol_idx, profile_id, ch_id),
-                    )
-                    for ch_id, ch in channels.items()
+        channel_ids = list(channels)
+        vol_subpaths = {v: PurePosixPath("volumes", f"{v + 1:06d}", profile_id) for v in tracker.completed_volumes}
+        vol_metas = {v: tracker.volume_meta(v, profile_id, channel_ids) for v in tracker.completed_volumes}
+        await _gather_hardware(
+            *(
+                ch.camera.update_dataset_darkfield(
+                    storage=manifest.storage,
+                    subpath=vol_subpaths[v] / ch_id,
+                    darkfield=vol_metas[v]["channels"][ch_id],
                 )
+                for v in tracker.completed_volumes
+                for ch_id, ch in channels.items()
             )
-            vol_darkfield = tracker.volume_meta(vol_idx, profile_id, list(channels))
-            scan_json = self._system.resolve_storage(manifest.storage, vol_subpath).target / "scan.json"
-            if scan_json.exists():
-                def _patch_scan_json(p: Path | S3Path = scan_json, df: dict[str, Any] = vol_darkfield) -> None:
-                    raw = json.loads(p.read_text(encoding="utf-8"))
-                    raw["darkfield"] = df
-                    _write_json(p, raw)
+        )
+        scan_targets = [
+            (self._system.resolve_storage(manifest.storage, vol_subpaths[v]).target / "scan.json", vol_metas[v])
+            for v in tracker.completed_volumes
+        ]
 
-                await asyncio.to_thread(_patch_scan_json)
-            manifest = await self._records.acquisitions.set_volume_darkfield(
-                manifest.id, volume_index=vol_idx, darkfield=vol_darkfield
-            )
+        def _patch_all_scan_jsons() -> None:
+            for scan_json, darkfield in scan_targets:
+                if scan_json.exists():
+                    raw = json.loads(scan_json.read_text(encoding="utf-8"))
+                    raw["darkfield"] = darkfield
+                    _write_json(scan_json, raw)
+
+        await asyncio.to_thread(_patch_all_scan_jsons)
+        manifest = await self._records.acquisitions.set_volumes_darkfield(manifest.id, vol_metas)
         await self._update_acquisition(manifest)
         return manifest
 
@@ -2592,17 +2574,16 @@ class Instrument:
             raise
 
         # Inhibit emission before potentially waiting for serial retries while closing the window.
-        await _gather_hardware(*(ch.disable_laser_output() for ch in self._all_lasers()))
+        await self._inhibit_laser_outputs()
         await axis.disarm_scan_window()
         recorded = await recorder.finish(_RECORDER_FINISH_TIMEOUT_S)
         progress.recording = False
         final = await axis.finish_continuous_scan(planned.end)
         progress.finished = True
-        detection_ids = list(self._hal.topology.detection)
         camera_sampling_yz = (
             {
                 cam_id: volume.scan.resolve_camera_sampling_yz(cam_id, idx).model_dump()
-                for idx, cam_id in enumerate(detection_ids)
+                for idx, cam_id in enumerate(self._hal.topology.detection)
             }
             if volume.scan is not None
             else None
@@ -2614,9 +2595,7 @@ class Instrument:
             "line_scan": volume.scan.model_dump() if volume.scan else None,
             "camera_sampling_yz": camera_sampling_yz,
             "darkfield": (
-                darkfield.volume_meta(volume_index, volume.profile, list(channels))
-                if darkfield is not None
-                else None
+                darkfield.volume_meta(volume_index, volume.profile, list(channels)) if darkfield is not None else None
             ),
             "plan": {
                 "window": planned.window,
