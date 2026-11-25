@@ -131,3 +131,22 @@ async def test_reset_stream_changes_capture_identity() -> None:
         gen.close()
 
     assert first.header.source_stream_id != second.header.source_stream_id == source_stream_id
+
+
+async def test_submit_frame_and_wait_forces_overview_and_delivers() -> None:
+    captured: list[PreviewFrame] = []
+    gen = _gen(
+        sink=captured.append,
+        uid="camera-1",
+        target_width=64,
+        viewport=PreviewViewport(x=0.25, y=0.25, w=0.5, h=0.5),
+    )
+    try:
+        # Submit an initial frame so an overview future is in flight, then force a snapshot frame
+        gen.submit_frame(_frame(w=128, h=96), 0)
+        await gen.submit_frame_and_wait(_frame(w=128, h=96), 7)
+    finally:
+        gen.close()
+
+    layers = {f.header.layer for f in captured if f.header.frame_idx == 7}
+    assert layers == {PreviewLayer.OVERVIEW, PreviewLayer.VIEWPORT}

@@ -1,11 +1,13 @@
 """Station-scoped REST and WebSocket routes."""
 
+import asyncio
 import datetime
 from collections.abc import AsyncIterator
 from typing import Annotated, Any
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, WebSocket
+from fastapi.responses import HTMLResponse
 from pydantic import AnyWebsocketUrl, BaseModel, Field, ValidationError
 from vxl_records import (
     AcquisitionManifest,
@@ -26,6 +28,8 @@ from vxl.instrument import (
     InstrumentConfig,
     InstrumentInspection,
     InstrumentPreset,
+    SnapshotResult,
+    SnrReportResult,
 )
 from vxl.instrument.config import (
     AcquisitionTask,
@@ -143,6 +147,15 @@ class _SelectRoute(BaseModel):
 
 class _PreviewChannels(BaseModel):
     channel_ids: list[str]
+
+
+class _SnapshotRequest(BaseModel):
+    save_tiff: bool = True
+
+
+class _SnrDiagnosticsRequest(BaseModel):
+    num_frames: int = Field(default=32, ge=2, le=256)
+    dark_frames: int = Field(default=8, ge=0, le=128)
 
 
 async def _get_preset(station: Station, preset_id: UUID) -> PresetRecord:
@@ -579,6 +592,37 @@ async def stop_preview(instrument: InstrumentDep) -> None:
 @instrument_router.put("/preview/channels", status_code=204)
 async def set_preview_channels(body: _PreviewChannels, instrument: InstrumentDep) -> None:
     await instrument.set_preview_channels(body.channel_ids)
+
+
+@instrument_router.post("/preview/snapshot")
+async def take_snapshot(instrument: InstrumentDep, body: _SnapshotRequest | None = None) -> SnapshotResult:
+    return await instrument.snapshot(save_tiff=(body or _SnapshotRequest()).save_tiff)
+
+
+@instrument_router.post("/diagnostics/snr")
+async def run_snr_diagnostics(
+    station_id: UUID,
+    session_id: UUID,
+    request: Request,
+    instrument: InstrumentDep,
+    body: _SnrDiagnosticsRequest | None = None,
+) -> SnrReportResult:
+    req = body or _SnrDiagnosticsRequest()
+    return await instrument.run_snr_diagnostics(
+        num_frames=req.num_frames,
+        dark_frames=req.dark_frames,
+        report_url_for=lambda rid: (
+            request.url_for("get_snr_report_html", station_id=station_id, session_id=session_id, report_id=rid).path
+        ),
+    )
+
+
+@instrument_router.get("/diagnostics/reports/{report_id}", response_class=HTMLResponse)
+async def get_snr_report_html(report_id: str, instrument: InstrumentDep) -> HTMLResponse:
+    try:
+        return HTMLResponse(content=await asyncio.to_thread(instrument.get_snr_report_html, report_id))
+    except FileNotFoundError as error:
+        raise HTTPException(status_code=404, detail=str(error)) from error
 
 
 @instrument_router.get("/devices/{device_id}/properties")

@@ -5,7 +5,7 @@
   import { prefs } from '$lib/core/prefs';
   import { clampTopLeft } from '$lib/core/utils/vec';
   import { NumberBox } from '@voxel/kit';
-  import { ChevronDown, Crosshair, RotateCw } from '@voxel/kit/icons';
+  import { Activity, Camera, ChevronDown, Crosshair, Loader, RotateCw } from '@voxel/kit/icons';
 
   import { isFullViewport } from './render';
   import {
@@ -28,6 +28,11 @@
     onSelectCrosshairCamera?: (cameraId: string | 'all') => void;
     onCenterCrosshair?: () => void;
   }
+
+  const ACTIONS = [
+    ['snapshot', Camera, 'Take single-frame laser snapshot', 'saves .tif & keeps frame on screen'],
+    ['snr', Activity, 'Run stationary SNR & photobleaching diagnostics', '32 frames + 8 dark, opens HTML report']
+  ] as const;
 
   let {
     previewer,
@@ -167,6 +172,22 @@
     >
       <Crosshair width="14" height="14" />
     </button>
+    {#each ACTIONS as [id, Icon, label, detail] (id)}
+      <button
+        type="button"
+        onclick={() => void (id === 'snapshot' ? previewer.takeSnapshot() : previewer.runSnrDiagnostics(32, 8))}
+        disabled={previewer.pendingAction !== null || previewer.previewing}
+        class="flex h-6 w-5 shrink-0 cursor-pointer items-center justify-center rounded text-fg-muted transition-colors hover:bg-element-hover hover:text-fg disabled:cursor-not-allowed disabled:opacity-40"
+        aria-label={label}
+        title={previewer.previewing ? `Stop live preview first (${label.toLowerCase()})` : `${label} (${detail})`}
+      >
+        {#if previewer.pendingAction === id}
+          <Loader width="14" height="14" class="animate-spin text-fg" />
+        {:else}
+          <Icon width="14" height="14" />
+        {/if}
+      </button>
+    {/each}
     <button
       type="button"
       onclick={() => navigatorVisible.set(!navigatorVisible.get())}

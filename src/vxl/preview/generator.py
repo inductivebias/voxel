@@ -6,6 +6,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from functools import partial
+from typing import Any
 from uuid import uuid4
 
 import numpy as np
@@ -141,14 +142,19 @@ class PreviewGenerator:
             )
         return None
 
-    def submit_frame(self, frame: np.ndarray | FrameLease, idx: int, *, valid_bits: ValidBits = 16) -> None:
-        """Process a new raw frame: dispatch overview and viewport work in the background.
-
-        The viewport uses cancel-stale (latest viewport invalidates prior work). Overview
-        uses skip-if-busy — if the previous overview hasn't finished, drop this
-        frame's preview rather than queueing. Returns immediately so callers
-        (preview loop, acquisition grab loop) are not gated by preview work.
-        """
+    def submit_frame(
+        self,
+        frame: np.ndarray | FrameLease,
+        idx: int,
+        *,
+        valid_bits: ValidBits = 16,
+        force_overview: bool = False,
+    ) -> None:
+        """Dispatch background overview (skip-if-busy unless ``force_overview``) and viewport (cancel-stale) work."""
+        if force_overview and self._overview_future is not None and not self._overview_future.done():
+            self._work_epoch += 1
+            self._overview_future.cancel()
+            self._overview_future = None
         source = _PreviewSource(frame)
         previous = self._current_source
         self._frame_idx = idx
@@ -197,6 +203,20 @@ class PreviewGenerator:
             self.health.record_overview_drop()  # Gate 1 drop: prior overview still generating
         if previous is not None:
             previous.release()
+
+    async def submit_frame_and_wait(
+        self,
+        frame: np.ndarray | FrameLease,
+        idx: int,
+        *,
+        valid_bits: ValidBits = 16,
+    ) -> None:
+        """Submit a frame and await overview + viewport emission."""
+        self.submit_frame(frame, idx, valid_bits=valid_bits, force_overview=True)
+        pending: list[asyncio.Future[Any]] = [t for t in (self._overview_future, self._viewport_task) if t is not None]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await asyncio.sleep(0)  # allow done callbacks (_on_overview_done) to invoke sink
 
     def reset_stream(self) -> str:
         """Start and return a new camera capture identity."""

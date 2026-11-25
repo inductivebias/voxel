@@ -416,7 +416,7 @@
 
   <!-- Center the ui-sm toolbar, including its p-1 padding and panel border; the minimap expands below it. -->
   <!-- top-[calc((var(--pane-header-height)-var(--ui-sm))/2-var(--spacing)-1px)] -->
-  <div class="pointer-events-none absolute top-2 left-3 z-10 w-58">
+  <div class="pointer-events-none absolute top-2 left-3 z-10 w-68">
     <PreviewNavigationControls
       {previewer}
       cameras={cameraOptions}

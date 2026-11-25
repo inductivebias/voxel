@@ -22,9 +22,11 @@ from .core import (
     IdleActivity,
     Instrument,
     PreviewActivity,
+    SnapshotResult,
 )
 from .errors import InstrumentBusyError, InstrumentError, OperationRejectedError, StartupError, Violation
 from .metadata import ExaspimMetadata, ExperimentMetadata, annotation
+from .snr import SnrReportResult
 from .store import InstrumentInspection, InstrumentStore
 
 __all__ = [
@@ -50,6 +52,8 @@ __all__ = [
     "OperationRejectedError",
     "Point2D",
     "PreviewActivity",
+    "SnapshotResult",
+    "SnrReportResult",
     "StartupError",
     "TaskPatch",
     "TileOrder",

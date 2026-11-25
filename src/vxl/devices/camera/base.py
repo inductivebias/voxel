@@ -7,16 +7,20 @@ from abc import abstractmethod
 from contextlib import suppress
 from enum import StrEnum
 from pathlib import Path, PurePosixPath
-from typing import Any, Literal, cast
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import numpy as np
 from ome_zarr_writer import (
+    BinningMode,
     FrameLease,
     OMEZarrWriter,
+    PreFilterType,
     UIVec3D,
     UVec3D,
     WriterConfig,
     WriterSettings,
+    filter_and_bin_2d,
+    filter_and_bin_volume,
 )
 from ome_zarr_writer.sizing import per_slot_bytes, slots_for_budget
 from ome_zarr_writer.writer import BatchMetrics
@@ -27,9 +31,13 @@ from vxlib.schema import FrozenModel
 from vxlib.vector import IVec2D, Vec2D, Vec3D
 
 from rigup import Device, DeviceController, describe, enumerated, numeric, numeric_int
+from vxl._utils.tiff import write_tiff_2d
 from vxl.devices.base import DeviceType
 from vxl.preview import PreviewFrame, PreviewGenerator, PreviewLayer, PreviewViewport, ValidBits
 from vxl.system import System, remote_store_fingerprint
+
+if TYPE_CHECKING:
+    from vxl.instrument.snr import CameraSnrAnalysis
 
 log = logging.getLogger(__name__)
 
@@ -135,6 +143,29 @@ PIXEL_FMT_TO_VALID_BITS: dict[PixelFormat, ValidBits] = {
 }
 
 BINNING_OPTIONS = [1, 2, 4, 8]
+GPU_BINNING_OPTIONS = [1, 2, 3, 4, 6, 8]
+GPU_BIN_MODE_OPTIONS = [mode.value for mode in BinningMode]
+GPU_FILTER_OPTIONS = [flt.value for flt in PreFilterType]
+GPU_FILTER_SIZE_OPTIONS = [3, 5]
+
+
+class SnapshotFrameInfo(FrozenModel):
+    """Metadata returned by a camera controller after capturing a single-frame snapshot."""
+
+    camera_id: str
+    width: int
+    height: int
+    dtype: str
+    min_adu: float
+    max_adu: float
+    mean_adu: float
+    std_adu: float
+    hardware_binning: int = 1
+    gpu_bin_y: int = 1
+    gpu_bin_x: int = 1
+    gpu_pre_filter: str = "none"
+    gpu_filter_size: int = 3
+    saved_path: str | None = None
 
 
 class CaptureState(StrEnum):
@@ -163,6 +194,7 @@ class CameraController(DeviceController["Camera"]):
         self._task: asyncio.Task[None] | None = None
         self._task_kind: Literal["batch", "close"] | None = None
         self._publish_tasks: dict[PreviewLayer, asyncio.Task[None]] = {}
+        self._diag_buffers: dict[str, np.ndarray] = {}
         # Preview-publish counters (best-effort publish is skip-if-busy); reported per stack.
         System.Ram.reserve(self.device.uid, weight=1.0)
 
@@ -176,6 +208,7 @@ class CameraController(DeviceController["Camera"]):
             task.cancel()
         await asyncio.gather(*self._publish_tasks.values(), return_exceptions=True)
         self._publish_tasks.clear()
+        self._diag_buffers.clear()
         await self.release_writer()
         System.Ram.release(self.device.uid)
         await super().close()
@@ -259,17 +292,21 @@ class CameraController(DeviceController["Camera"]):
                 frame = await self._run_sync(self.device.grab_frame_owned)
                 if self._mode != CameraMode.PREVIEW:
                     break
-                self._previewer.submit_frame(
-                    frame,
-                    idx=self._frame_idx,
-                    valid_bits=PIXEL_FMT_TO_VALID_BITS[cast("PixelFormat", str(self.device.pixel_format))],
-                )
+                if self.device.has_gpu_binning:
+                    frame = await self._run_sync(self.device.apply_gpu_binning_2d, frame)
+                self._previewer.submit_frame(frame, idx=self._frame_idx, valid_bits=self._valid_bits())
                 self._frame_idx += 1
         except asyncio.CancelledError:
             pass
         except Exception:
             self.log.exception("Preview loop error")
             self._mode = CameraMode.IDLE
+
+    def _stop_and_free(self) -> None:
+        try:
+            self.device.stop()
+        finally:
+            self.device.free_buffer()
 
     @describe(label="Stop Preview")
     async def stop_preview(self):
@@ -281,8 +318,155 @@ class CameraController(DeviceController["Camera"]):
             await self._preview_task
             self._preview_task = None
         self._previewer.cancel_pending()
-        await self._run_sync(self.device.stop)
-        await self._run_sync(self.device.free_buffer)
+        await self._run_sync(self._stop_and_free)
+
+    def _valid_bits(self) -> ValidBits:
+        return PIXEL_FMT_TO_VALID_BITS[cast("PixelFormat", str(self.device.pixel_format))]
+
+    def _gpu_meta(self) -> dict[str, Any]:
+        return {
+            "hardware_binning": int(self.device.binning),
+            "gpu_bin_y": int(self.device.gpu_bin_y),
+            "gpu_bin_x": int(self.device.gpu_bin_x),
+            "gpu_pre_filter": str(self.device.gpu_pre_filter),
+            "gpu_filter_size": int(self.device.gpu_filter_size),
+        }
+
+    def _scale_px(self, px: tuple[float, float]) -> tuple[float, float]:
+        return (float(px[0]) * int(self.device.gpu_bin_y), float(px[1]) * int(self.device.gpu_bin_x))
+
+    async def _flush_preview_publishes(self) -> None:
+        if self._publish_tasks:
+            await asyncio.gather(*self._publish_tasks.values(), return_exceptions=True)
+
+    async def _emit_preview_sync(self, frame: np.ndarray) -> None:
+        await self._flush_preview_publishes()
+        await self._previewer.submit_frame_and_wait(frame, self._frame_idx, valid_bits=self._valid_bits())
+        self._frame_idx += 1
+        await self._flush_preview_publishes()
+
+    @describe(label="Arm Capture")
+    async def arm_capture(
+        self,
+        num_frames: int = 1,
+        trigger_mode: TriggerMode = TriggerMode.ON,
+        trigger_polarity: TriggerPolarity = TriggerPolarity.RISING_EDGE,
+    ) -> None:
+        if self._mode != CameraMode.IDLE:
+            raise RuntimeError(f"Cannot arm capture: camera in {self._mode} mode")
+        await self._run_sync(
+            self.device.start, frame_count=num_frames, trigger_mode=trigger_mode, trigger_polarity=trigger_polarity
+        )
+
+    @describe(label="Capture Raw Frames")
+    async def capture_frames_raw(self, num_frames: int = 1, *, slot_key: str = "snapshot") -> int:
+        def _grab_all() -> np.ndarray:
+            first = self.device.grab_frame_owned()
+            if num_frames == 1:
+                return first[np.newaxis]
+            buf = np.empty((num_frames, *first.shape), dtype=first.dtype)
+            buf[0] = first
+            for i in range(1, num_frames):
+                self.device.grab_frame(out=buf[i])
+            return buf
+
+        try:
+            if num_frames <= 0:
+                return 0
+            self._diag_buffers[slot_key] = await self._run_sync(_grab_all)
+            return num_frames
+        finally:
+            with suppress(Exception):
+                await self._run_sync(self._stop_and_free)
+
+    @describe(label="Process Snapshot")
+    async def process_snapshot(
+        self,
+        *,
+        slot_key: str = "snapshot",
+        save_path: str | None = None,
+        pixel_size_um: tuple[float, float] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SnapshotFrameInfo:
+        stack = self._diag_buffers.pop(slot_key, None)
+        if stack is None or stack.shape[0] < 1:
+            raise RuntimeError(f"No raw snapshot frame in slot {slot_key!r} on camera {self.device.uid}")
+        raw = stack[-1]
+
+        def _bin_and_stats() -> tuple[np.ndarray, dict[str, float]]:
+            f = self.device.apply_gpu_binning_2d(raw)
+            return f, {
+                "min_adu": float(np.min(f)),
+                "max_adu": float(np.max(f)),
+                "mean_adu": round(float(np.mean(f, dtype=np.float32)), 2),
+                "std_adu": round(float(np.std(f, dtype=np.float32)), 2),
+            }
+
+        frame, stats = await self._run_sync(_bin_and_stats)
+        eff_px = self._scale_px(pixel_size_um) if pixel_size_um else None
+        saved_str: str | None = None
+        if save_path is not None:
+            saved_path, _ = await asyncio.gather(
+                self._run_sync(write_tiff_2d, save_path, frame, pixel_size_um=eff_px, metadata=metadata),
+                self._emit_preview_sync(frame),
+            )
+            saved_str = str(saved_path)
+        else:
+            await self._emit_preview_sync(frame)
+
+        return SnapshotFrameInfo.model_validate(
+            {
+                "camera_id": self.device.uid,
+                "width": int(frame.shape[1]),
+                "height": int(frame.shape[0]),
+                "dtype": str(frame.dtype),
+                "saved_path": saved_str,
+                **stats,
+                **self._gpu_meta(),
+            }
+        )
+
+    @describe(label="Analyze SNR Buffer")
+    async def analyze_snr_buffer(
+        self,
+        *,
+        output_dir: str,
+        channel_id: str,
+        profile_id: str,
+        pixel_size_um: tuple[float, float],
+        exposure_ms: float,
+    ) -> "CameraSnrAnalysis":
+        from vxl.instrument.snr import compute_camera_snr_diagnostics  # noqa: PLC0415
+
+        sig_stack = self._diag_buffers.pop("signal", None)
+        dark_stack = self._diag_buffers.pop("dark", None)
+        if sig_stack is None:
+            raise RuntimeError(f"No signal frames buffered on camera {self.device.uid}")
+        if self.device.has_gpu_binning:
+            raw_sig, raw_dark = sig_stack, dark_stack
+            sig_stack, dark_stack = await self._run_sync(
+                lambda: (
+                    self.device.apply_gpu_binning_3d(raw_sig),
+                    self.device.apply_gpu_binning_3d(raw_dark) if raw_dark is not None else None,
+                )
+            )
+        _, analysis = await asyncio.gather(
+            self._emit_preview_sync(sig_stack[-1]),
+            self._run_sync(
+                compute_camera_snr_diagnostics,
+                sig_stack,
+                dark_frames=dark_stack,
+                camera_id=self.device.uid,
+                channel_id=channel_id,
+                profile_id=profile_id,
+                valid_bits=int(self._valid_bits()),
+                exposure_time_ms=exposure_ms,
+                pixel_size_um=self._scale_px(pixel_size_um),
+                output_dir=output_dir,
+                **self._gpu_meta(),
+            ),
+        )
+        return analysis
 
     @describe(label="Check Writable")
     async def check_writable(self, storage: StorageSpec) -> StorageStatus:
@@ -362,18 +546,23 @@ class CameraController(DeviceController["Camera"]):
         # the Storage; the config is purely the dataset spec.
         dest = self._system.resolve_storage(storage, subpath)
         frame = self.device.frame_size_px
+        out_frame = self.device.output_frame_size_px
         eff_px = self.device.effective_pixel_size_um(magnification)
         vy, vx = voxel_size_yx if voxel_size_yx is not None else (eff_px.y, eff_px.x)
+        bin_kwargs = self.device.gpu_binning_kwargs
         cfg = WriterConfig(
             **settings.model_dump(),
-            volume_shape=UIVec3D(z=num_frames, y=frame.y, x=frame.x),
-            voxel_size=UVec3D(z=z_step, y=vy, x=vx),
+            volume_shape=UIVec3D(z=num_frames, y=out_frame.y, x=out_frame.x),
+            voxel_size=UVec3D(z=z_step, y=vy * bin_kwargs["bin_y"], x=vx * bin_kwargs["bin_x"]),
             dtype=self.device.pixel_type,
             origin=origin,
             shear_xz=shear_xz,
             shear_yz=shear_yz,
             channel_label=channel_label,
             channel_color=channel_color,
+            **bin_kwargs,
+            raw_frame_y=frame.y,
+            raw_frame_x=frame.x,
             darkfield=darkfield,
         )
 
@@ -574,11 +763,7 @@ class CameraController(DeviceController["Camera"]):
             for _ in range(num_frames):
                 frame = await self._capture_into_writer(writer)
                 try:
-                    self._previewer.submit_frame(
-                        frame,
-                        self._frame_idx,
-                        valid_bits=PIXEL_FMT_TO_VALID_BITS[cast("PixelFormat", str(self.device.pixel_format))],
-                    )
+                    self._previewer.submit_frame(frame, self._frame_idx, valid_bits=self._valid_bits())
                 except Exception:
                     frame.close()
                     raise
@@ -634,6 +819,82 @@ class Camera(Device):
     trigger_polarity: TriggerPolarity = TriggerPolarity.RISING_EDGE
 
     _buffer_allocated = False
+    _gpu_bin_y: int = 1
+    _gpu_bin_x: int = 1
+    _gpu_bin_mode: BinningMode = BinningMode.MEAN
+    _gpu_pre_filter: PreFilterType = PreFilterType.NONE
+    _gpu_filter_size: int = 3
+
+    @numeric_int(options=GPU_BINNING_OPTIONS)
+    @describe(label="GPU Bin Y", desc="Software/GPU rectangular binning factor along Y (rows).", stream=True)
+    def gpu_bin_y(self) -> int:
+        return self._gpu_bin_y
+
+    @gpu_bin_y.setter
+    def gpu_bin_y(self, value: int) -> None:
+        self._gpu_bin_y = int(value)
+
+    @numeric_int(options=GPU_BINNING_OPTIONS)
+    @describe(label="GPU Bin X", desc="Software/GPU rectangular binning factor along X (columns).", stream=True)
+    def gpu_bin_x(self) -> int:
+        return self._gpu_bin_x
+
+    @gpu_bin_x.setter
+    def gpu_bin_x(self, value: int) -> None:
+        self._gpu_bin_x = int(value)
+
+    @enumerated(options=GPU_BIN_MODE_OPTIONS)
+    @describe(label="GPU Bin Mode", desc="Reduction mode for GPU rectangular (Y x X) binning.", stream=True)
+    def gpu_bin_mode(self) -> str:
+        return self._gpu_bin_mode.value
+
+    @gpu_bin_mode.setter
+    def gpu_bin_mode(self, value: str) -> None:
+        self._gpu_bin_mode = BinningMode(str(value).lower())
+
+    @enumerated(options=GPU_FILTER_OPTIONS)
+    @describe(label="GPU Pre-Filter", desc="2D spatial filter applied prior to GPU rectangular binning.", stream=True)
+    def gpu_pre_filter(self) -> str:
+        return self._gpu_pre_filter.value
+
+    @gpu_pre_filter.setter
+    def gpu_pre_filter(self, value: str) -> None:
+        self._gpu_pre_filter = PreFilterType(str(value).lower())
+
+    @numeric_int(options=GPU_FILTER_SIZE_OPTIONS)
+    @describe(label="GPU Filter Size", desc="Kernel size (3 or 5) for GPU pre-filter.", stream=True)
+    def gpu_filter_size(self) -> int:
+        return self._gpu_filter_size
+
+    @gpu_filter_size.setter
+    def gpu_filter_size(self, value: int) -> None:
+        self._gpu_filter_size = int(value)
+
+    @property
+    @describe(label="Output Frame Size", units="px", stream=True)
+    def output_frame_size_px(self) -> IVec2D:
+        raw = self.frame_size_px
+        return IVec2D(y=max(1, raw.y // self._gpu_bin_y), x=max(1, raw.x // self._gpu_bin_x))
+
+    @property
+    def has_gpu_binning(self) -> bool:
+        return self._gpu_bin_y > 1 or self._gpu_bin_x > 1 or self._gpu_pre_filter is not PreFilterType.NONE
+
+    @property
+    def gpu_binning_kwargs(self) -> dict[str, Any]:
+        return {
+            "bin_y": self._gpu_bin_y,
+            "bin_x": self._gpu_bin_x,
+            "bin_mode": self._gpu_bin_mode,
+            "pre_filter": self._gpu_pre_filter,
+            "filter_size": self._gpu_filter_size,
+        }
+
+    def apply_gpu_binning_2d(self, frame: np.ndarray) -> np.ndarray:
+        return filter_and_bin_2d(frame, **self.gpu_binning_kwargs) if self.has_gpu_binning else frame
+
+    def apply_gpu_binning_3d(self, stack: np.ndarray) -> np.ndarray:
+        return filter_and_bin_volume(stack, **self.gpu_binning_kwargs) if self.has_gpu_binning else stack
 
     @property
     @abstractmethod

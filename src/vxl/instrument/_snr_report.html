@@ -1,0 +1,62 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Voxel SNR &amp; Photobleaching Report — $report_id</title>
+  <style>
+    :root { color-scheme: dark; --bg: #09090b; --card: #121216; --card-alt: #18181d; --border: #27272a; --text: #f4f4f5; --muted: #a1a1aa; }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 24px 32px 48px; background: var(--bg); color: var(--text); font: 13px/1.45 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif; }
+    header.report-header { display: flex; flex-wrap: wrap; justify-content: space-between; align-items: flex-start; gap: 16px; padding-bottom: 18px; margin-bottom: 24px; border-bottom: 1px solid var(--border); }
+    h1, h2 { margin: 0 0 4px; font-weight: 600; }
+    h1 { margin-bottom: 6px; font-size: 20px; letter-spacing: -0.01em; }
+    h2 { font-size: 16px; }
+    h2 .sub { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
+    .meta-line { margin: 0; color: var(--muted); font-size: 12px; }
+    .badges { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .badge, .kpi-card, .map-card, .chart-card, .metrics-table { background: var(--card-alt); border: 1px solid var(--border); border-radius: 8px; }
+    .badge { display: inline-flex; align-items: center; padding: 4px 10px; border-radius: 999px; font-size: 11px; font-weight: 500; }
+    .badge-laser { border-color: #0284c7; background: rgba(2, 132, 199, 0.15); color: #7dd3fc; }
+    .cam-section { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 28px; }
+    .cam-header, .kpi-card, .map-card, .chart-card { display: flex; flex-direction: column; }
+    .cam-header { gap: 14px; margin-bottom: 18px; }
+    .kpi-strip, .map-grid, .charts-grid, .tables-grid { display: grid; gap: 14px; }
+    .kpi-strip { grid-template-columns: repeat(auto-fit, minmax(185px, 1fr)); gap: 10px; }
+    .kpi-card, .map-card, .chart-card { padding: 10px 12px; gap: 8px; }
+    .kpi-card { gap: 2px; }
+    .kpi-card.highlight { border-color: rgba(56, 189, 248, 0.45); background: rgba(56, 189, 248, 0.06); }
+    .kpi-label, .kpi-sub, .map-caption { font-size: 11px; color: var(--muted); }
+    .kpi-val { font-size: 18px; font-weight: 600; }
+    .kpi-val, .kpi-sub, .map-caption, .metrics-table { font-variant-numeric: tabular-nums; }
+    .map-grid, .charts-grid { margin-bottom: 18px; }
+    .map-grid { grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); }
+    .charts-grid { grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); }
+    .tables-grid { grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+    .map-title, .chart-title { font-size: 12px; font-weight: 600; display: flex; justify-content: space-between; align-items: center; }
+    .tag { font-size: 10px; font-weight: 500; padding: 1px 7px; border-radius: 4px; background: #27272a; color: #d4d4d8; }
+    .map-card img { width: 100%; height: auto; max-height: 300px; object-fit: contain; background: #050507; border-radius: 4px; border: 1px solid #1f1f23; }
+    .chart-svg { width: 100%; height: auto; display: block; }
+    .empty-chart { padding: 36px 12px; text-align: center; color: var(--muted); font-size: 12px; }
+    .metrics-table { width: 100%; border-collapse: collapse; overflow: hidden; }
+    .metrics-table th { text-align: left; padding: 8px 12px; background: #1f1f26; font-size: 12px; border-bottom: 1px solid var(--border); }
+    .metrics-table td { padding: 6px 12px; border-bottom: 1px solid #222228; font-size: 12px; }
+    .metrics-table td:first-child { color: var(--muted); }
+    .metrics-table td:last-child { text-align: right; }
+    code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11.5px; color: #e4e4e7; }
+  </style>
+</head>
+<body>
+  <header class="report-header">
+    <div>
+      <h1>Stationary SNR, Photobleaching &amp; Image Quality Diagnostics</h1>
+      <p class="meta-line">
+        Instrument: <strong>$instrument_name</strong> &bull; Profile: <code>$profile_id</code> &bull;
+        Position: <strong>$xyz_str</strong> &bull; Captured: <strong>$captured_str</strong>
+      </p>
+    </div>
+    <div class="badges"><span class="badge">Static Sample Mode</span> $laser_badges</div>
+  </header>
+  $cam_sections
+</body>
+</html>
